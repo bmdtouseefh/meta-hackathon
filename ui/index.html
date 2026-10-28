@@ -1,0 +1,95 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Rose — VM agent</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<script>
+  tailwind.config = { darkMode: 'class' };
+  const theme = localStorage.getItem('rose-theme')
+    || (matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light');
+  if (theme === 'dark') document.documentElement.classList.add('dark');
+  function toggleTheme() {
+    const dark = document.documentElement.classList.toggle('dark');
+    localStorage.setItem('rose-theme', dark ? 'dark' : 'light');
+  }
+  function toggleDesktop() {
+    document.getElementById('desk-panel').classList.toggle('hidden');
+  }
+  function toggleSetup(open) {
+    document.getElementById('setup-modal').classList.toggle('hidden', !open);
+    if (open) setTimeout(() => document.getElementById('api-key').focus(), 50);
+  }
+</script>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body class="bg-white text-neutral-900 dark:bg-neutral-900 dark:text-neutral-100 font-sans m-0 text-sm min-h-screen flex flex-col">
+
+<header class="flex flex-wrap items-center gap-2 px-[2%] py-2 border-b border-neutral-200 dark:border-neutral-800">
+  <span class="font-bold text-lg">🌌 Rose</span>
+  <span id="status-dot" class="inline-block w-3 h-3 rounded-full bg-neutral-400"></span>
+  <span id="status-text" class="text-sm">connecting…</span>
+  <span class="flex-1"></span>
+  <span id="backend-text" class="text-xs text-neutral-500"></span>
+  <button onclick="toggleTheme()" class="px-2 py-1 rounded border border-neutral-300 dark:border-neutral-700" title="toggle light/dark">◐</button>
+  <button onclick="toggleSetup(true)" class="px-3 py-1 rounded border border-neutral-300 dark:border-neutral-700" title="Setup: API keys &amp; brain">⚙ Setup</button>
+  <button onclick="toggleDesktop()" class="px-3 py-1 rounded border border-neutral-300 dark:border-neutral-700">🖥 Desktop</button>
+  <button id="stop" disabled title="Kill switch lands with the agent loop (M2)" class="px-3 py-1 rounded bg-red-700 text-white disabled:opacity-50">■ Stop</button>
+</header>
+
+<!-- setup modal: keys live server-side only, never persisted, never in traces -->
+<div id="setup-modal" class="hidden fixed inset-0 z-10 flex items-center justify-center p-[4%] bg-black/50">
+  <div class="w-full max-w-[min(28rem,94%)] rounded-2xl border border-neutral-200 dark:border-neutral-700 bg-white dark:bg-neutral-900 p-[5%]">
+    <h2 class="font-semibold text-base mb-1">⚙ Setup</h2>
+    <p class="text-xs text-neutral-500 mt-0">Keys are kept in server memory for this session only — never written to disk, logs, or traces.</p>
+    <label class="font-semibold text-sm block mt-3 mb-1" for="api-key">Muse API key</label>
+    <input id="api-key" type="password" autocomplete="off" placeholder="sk-…" class="w-full px-3 py-2 rounded-xl border border-neutral-300 dark:border-neutral-600 bg-transparent text-sm">
+    <div class="text-xs mt-1"><span id="key-state" class="text-red-500 font-semibold">missing</span> · brain: <span class="font-semibold">muse</span> (fake needs no key)</div>
+    <div class="flex flex-wrap justify-end gap-2 mt-4">
+      <button onclick="clearKey()" class="px-4 py-2 rounded-xl border border-neutral-300 dark:border-neutral-600">Clear</button>
+      <button onclick="toggleSetup(false)" class="px-4 py-2 rounded-xl border border-neutral-300 dark:border-neutral-600">Cancel</button>
+      <button onclick="saveKey()" class="px-5 py-2 rounded-xl bg-[#0064E0] text-white font-semibold">Save</button>
+    </div>
+  </div>
+</div>
+
+<div class="flex flex-1 min-h-0">
+  <!-- conversation: the main thing -->
+  <main class="flex-1 flex flex-col min-h-[60vh]">
+    <div id="thread" class="w-full max-w-[min(46rem,92%)] mx-auto flex-1 overflow-y-auto flex flex-col gap-4 py-[2%]">
+      <div class="self-start max-w-[90%] text-sm text-neutral-500">Type a goal below and hit Enter. Rose narrates each step here and pauses for approval before anything irreversible.</div>
+      <div id="live-tail" class="contents"></div>
+    </div>
+
+    <!-- composer: the primary control -->
+    <div class="border-t border-neutral-200 dark:border-neutral-800">
+      <div class="w-full max-w-[min(46rem,92%)] mx-auto py-[1.5%]">
+        <div class="flex items-end gap-2 rounded-2xl border-2 border-neutral-300 dark:border-neutral-600 focus-within:border-[#0064E0] px-[2%] py-2 bg-white dark:bg-neutral-950">
+          <textarea id="composer" rows="2" placeholder="Tell Rose what to do…" class="flex-1 bg-transparent outline-none resize-none text-sm max-h-[30vh]"></textarea>
+          <button class="px-2 py-1 rounded text-xs text-neutral-500" disabled title="Voice arrives in Phase 2">🎙</button>
+          <button onclick="send()" class="px-5 py-2 rounded-xl bg-[#0064E0] text-white font-semibold flex-none">Run</button>
+        </div>
+        <div id="queue-note" class="text-xs text-neutral-500 mt-1">Single-step prototype: each Run does one observe→decide→act cycle (full loop lands in M2).</div>
+      </div>
+    </div>
+  </main>
+
+  <!-- desktop: secondary, toggleable -->
+  <aside id="desk-panel" class="hidden lg:block w-[38%] border-l border-neutral-200 dark:border-neutral-800 p-[1%] overflow-y-auto">
+    <div class="flex items-center justify-between mb-1">
+      <span class="font-semibold text-sm">Live desktop <span id="display-name" class="text-xs text-neutral-500 font-normal"></span></span>
+      <span class="text-xs px-2 py-0.5 rounded bg-red-700 text-white font-semibold">VIEW-ONLY</span>
+    </div>
+    <div class="rounded-lg overflow-hidden border border-neutral-200 dark:border-neutral-700 bg-neutral-950">
+      <img id="frame" alt="live desktop" class="w-full hidden">
+      <div id="frame-note" class="text-xs text-neutral-500 p-3">waiting for backend frames…</div>
+    </div>
+    <p class="text-xs text-neutral-500 mt-1">Exactly what Rose sees. Take Control routes input through the same audited path (T1.4).</p>
+    <button disabled title="Take Control lands in T1.4 (lease)" class="mt-1 w-full px-3 py-2 rounded border border-neutral-300 dark:border-neutral-700 font-semibold disabled:opacity-50">Take Control</button>
+  </aside>
+</div>
+
+<script src="/app.js"></script>
+</body>
+</html>

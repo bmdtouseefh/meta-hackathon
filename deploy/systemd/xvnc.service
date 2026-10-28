@@ -1,0 +1,17 @@
+[Unit]
+Description=TigerVNC Xvnc for Rose (XFCE, DISPLAY :1)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+Environment=DISPLAY=:1
+# NOTE: no VNC password by design - socket binds localhost only and the
+# SSH/Tailscale tunnel is the perimeter (architecture.html section 2).
+ExecStart=/usr/bin/vncserver :1 -geometry 1600x900 -depth 24 -localhost -SecurityTypes None -fg
+ExecStop=/usr/bin/vncserver -kill :1
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,16 @@
+[Unit]
+Description=rosed - Rose agent daemon (one Rust binary)
+After=xvnc.service
+Wants=xvnc.service
+
+[Service]
+Type=simple
+Environment=DISPLAY=:1
+# Default for .deb installs (/usr/bin/rosed). `rosed install` rewrites this
+# to the exact binary it runs from, so source builds work too.
+ExecStart=/usr/bin/rosed
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=default.target

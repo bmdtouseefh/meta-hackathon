@@ -1,0 +1,199 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Rose — UI draft: chat-first</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<script>
+  tailwind.config = { darkMode: 'class' };
+  const theme = localStorage.getItem('rose-theme')
+    || (matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light');
+  if (theme === 'dark') document.documentElement.classList.add('dark');
+  function toggleTheme() {
+    const dark = document.documentElement.classList.toggle('dark');
+    localStorage.setItem('rose-theme', dark ? 'dark' : 'light');
+  }
+  function toggleDesktop() {
+    document.getElementById('desk-panel').classList.toggle('hidden');
+  }
+</script>
+<style>
+  .t-display { font-size: 1.125rem; line-height: 1.4; font-weight: 700; }
+  .t-head    { font-size: 0.9375rem; line-height: 1.45; font-weight: 600; }
+  .t-body    { font-size: 0.875rem;  line-height: 1.5;  font-weight: 400; }
+  .t-caption { font-size: 0.75rem;   line-height: 1.5;  font-weight: 400; }
+  .thumb { width: 100%; aspect-ratio: 16 / 9; border-radius: 0.375rem; }
+  #desktop-svg { width: 100%; height: auto; display: block; }
+  .chat-col { max-width: min(46rem, 92%); margin-inline: auto; }
+  .msg-rose { background: var(--tw-bg-opacity, 1); }
+  textarea { field-sizing: content; }
+</style>
+</head>
+<body class="bg-white text-neutral-900 dark:bg-neutral-900 dark:text-neutral-100 font-sans m-0 t-body min-h-screen flex flex-col">
+
+<div class="flex flex-wrap items-center gap-2 px-[2%] py-1 t-caption bg-amber-100 dark:bg-amber-950 text-amber-900 dark:text-amber-200">
+  <span class="font-semibold">DRAFT PREVIEW — chat-first:</span>
+  <span class="opacity-70">type below and hit Enter — mock Rose replies, then asks approval (all client-side mock)</span>
+  <span class="flex-1"></span>
+  <button onclick="toggleTheme()" class="px-2 py-0.5 rounded border border-amber-400">◐ theme</button>
+</div>
+
+<header class="flex flex-wrap items-center gap-[0.75%] px-[2%] py-2 border-b border-neutral-200 dark:border-neutral-800">
+  <span class="t-display">🌌 Rose</span>
+  <span id="status-dot" class="inline-block w-3 h-3 rounded-full bg-green-600"></span>
+  <span id="status-text" class="t-body">Running · step 4/40 · :1</span>
+  <span class="flex-1"></span>
+  <button onclick="toggleSetup(true)" class="px-3 py-1 rounded border border-neutral-300 dark:border-neutral-700" title="Setup: API keys & brain">⚙ Setup</button>
+  <button onclick="toggleDesktop()" class="px-3 py-1 rounded border border-neutral-300 dark:border-neutral-700">🖥 Desktop</button>
+  <button class="px-3 py-1 rounded bg-red-700 text-white font-semibold">■ Stop</button>
+</header>
+
+<div class="flex flex-1 min-h-0">
+  <!-- conversation: the main thing -->
+  <main class="flex-1 flex flex-col min-h-[60vh]">
+    <div id="thread" class="chat-col w-full flex-1 overflow-y-auto flex flex-col gap-[1rem] py-[2%]">
+      <!-- goal -->
+      <div class="self-end max-w-[85%] px-[2%] py-2 rounded-2xl rounded-br-sm bg-[#0064E0] text-white">
+        Pay the March invoice from Example Ltd
+      </div>
+      <!-- narration -->
+      <div class="self-start max-w-[90%] flex gap-2">
+        <span class="flex-none">🌌</span>
+        <div class="px-[2%] py-2 rounded-2xl rounded-tl-sm bg-neutral-100 dark:bg-neutral-800">
+          Portal's open, I can see the March invoices. Heading for <strong>INV-2041 · $42.00</strong>.
+        </div>
+      </div>
+      <!-- verified step -->
+      <div class="self-start w-full max-w-[90%] flex gap-2">
+        <span class="flex-none text-green-600 font-bold">✓</span>
+        <div class="flex-1 px-[2%] py-2 rounded-2xl rounded-tl-sm border border-neutral-200 dark:border-neutral-700">
+          <div class="t-head">Step 5 · Clicked “Invoices” <span class="t-caption text-neutral-500 font-normal">(812, 240)</span></div>
+          <div class="t-caption text-neutral-500">postcondition met: heading ‘Invoices’ visible · 1.2s</div>
+        </div>
+      </div>
+      <!-- approval: inline, where the conversation already is -->
+      <div class="self-start w-full max-w-[90%] flex gap-2">
+        <span class="flex-none text-amber-500 font-bold text-lg">●</span>
+        <div class="flex-1 p-[2%] rounded-2xl rounded-tl-sm border-2 border-amber-500 bg-amber-50 dark:bg-amber-950">
+          <div class="t-head">Step 7 needs approval — Click “Pay now” ($42.00)</div>
+          <div class="my-2 w-3/4"><svg class="thumb" viewBox="0 0 160 90"><rect width="160" height="90" fill="#2b3038"/><rect x="30" y="20" width="100" height="26" rx="3" fill="#f5f5f5"/><circle cx="118" cy="58" r="10" fill="none" stroke="#e88aa5" stroke-width="3"/></svg></div>
+          <div class="flex flex-wrap gap-2">
+            <button onclick="resolveApproval(true)" class="px-4 py-1.5 rounded bg-green-700 text-white font-semibold">Approve</button>
+            <button onclick="resolveApproval(false)" class="px-4 py-1.5 rounded bg-red-700 text-white font-semibold">Deny</button>
+            <button class="px-4 py-1.5 rounded border border-neutral-300 dark:border-neutral-600">Take over</button>
+          </div>
+        </div>
+      </div>
+      <div id="live-tail" class="contents"></div>
+    </div>
+
+    <!-- composer: the primary control -->
+    <div class="border-t border-neutral-200 dark:border-neutral-800">
+      <div class="chat-col w-full py-[1.5%]">
+        <div class="flex items-end gap-2 rounded-2xl border-2 border-neutral-300 dark:border-neutral-600 focus-within:border-[#0064E0] px-[2%] py-2 bg-white dark:bg-neutral-950">
+          <textarea id="composer" rows="2" placeholder="Tell Rose what to do…"
+            class="flex-1 bg-transparent outline-none resize-none t-body max-h-[30vh]"></textarea>
+          <button class="px-2 py-1 rounded t-caption text-neutral-500" disabled title="Voice arrives in Phase 2">🎙</button>
+          <button onclick="send()" class="px-5 py-2 rounded-xl bg-[#0064E0] text-white font-semibold flex-none">Run</button>
+        </div>
+        <div class="t-caption text-neutral-500 mt-1">Enter to run · new instructions queue while a run is active · recent: Export March invoices ✓ · Move PDFs ✓</div>
+      </div>
+    </div>
+  </main>
+
+<!-- setup modal: keys live server-side only, never persisted, never in traces -->
+<div id="setup-modal" class="hidden fixed inset-0 z-10 flex items-center justify-center p-[4%] bg-black/50" onclick="if(event.target===this)toggleSetup(false)">
+  <div class="w-full max-w-[min(28rem,94%)] rounded-2xl border border-neutral-200 dark:border-neutral-700 bg-white dark:bg-neutral-900 p-[5%]">
+    <h2 class="t-display mb-1">⚙ Setup</h2>
+    <p class="t-caption text-neutral-500 mt-0">Keys are kept in server memory for this session only — never written to disk, logs, or traces.</p>
+    <label class="t-head block mt-3 mb-1" for="api-key">Muse API key</label>
+    <input id="api-key" type="password" autocomplete="off" placeholder="sk-…"
+      class="w-full px-3 py-2 rounded-xl border border-neutral-300 dark:border-neutral-600 bg-transparent t-body">
+    <div class="t-caption mt-1"><span id="key-state" class="text-red-500 font-semibold">missing</span> · brain: <span class="font-semibold">muse</span> (fake needs no key)</div>
+    <div class="flex flex-wrap justify-end gap-2 mt-4">
+      <button onclick="clearKey()" class="px-4 py-2 rounded-xl border border-neutral-300 dark:border-neutral-600">Clear</button>
+      <button onclick="toggleSetup(false)" class="px-4 py-2 rounded-xl border border-neutral-300 dark:border-neutral-600">Cancel</button>
+          <button onclick="saveKey()" class="px-5 py-2 rounded-xl bg-[#0064E0] text-white font-semibold">Save</button>
+    </div>
+  </div>
+</div>
+
+  <!-- desktop: secondary, toggleable -->
+  <aside id="desk-panel" class="hidden lg:block w-[38%] border-l border-neutral-200 dark:border-neutral-800 p-[1%] overflow-y-auto">
+    <div class="flex items-center justify-between mb-1">
+      <span class="t-head">Live desktop · :1</span>
+      <span class="t-caption px-2 py-0.5 rounded bg-red-700 text-white font-semibold">VIEW-ONLY</span>
+    </div>
+    <div class="rounded-lg overflow-hidden border border-neutral-200 dark:border-neutral-700">
+      <svg id="desktop-svg" viewBox="0 0 1600 900">
+        <rect width="1600" height="900" fill="#3a4048"/>
+        <rect width="1600" height="36" fill="#1b1e24"/>
+        <rect x="120" y="80" width="1360" height="740" rx="8" fill="#202124"/>
+        <rect x="120" y="80" width="1360" height="64" rx="8" fill="#35363a"/>
+        <rect x="120" y="144" width="1360" height="676" fill="#ffffff"/>
+        <rect x="170" y="180" width="220" height="26" rx="3" fill="#1a73e8"/>
+        <rect x="170" y="280" width="1260" height="44" fill="#f1f3f4"/>
+        <rect x="170" y="330" width="1260" height="40" fill="#ffffff"/>
+        <rect x="1210" y="330" width="130" height="36" rx="4" fill="#1a73e8"/>
+        <circle cx="1275" cy="348" r="34" fill="none" stroke="#e88aa5" stroke-width="5"/>
+        <rect y="864" width="1600" height="36" fill="#1b1e24"/>
+      </svg>
+    </div>
+    <p class="t-caption text-neutral-500 mt-1">Exactly what Rose sees. Take Control routes your input through the same audited path.</p>
+    <button class="mt-1 w-full px-3 py-2 rounded border border-neutral-300 dark:border-neutral-700 font-semibold">Take Control</button>
+  </aside>
+</div>
+
+<script>
+function toggleSetup(open) {
+  document.getElementById('setup-modal').classList.toggle('hidden', !open);
+  if (open) setTimeout(() => document.getElementById('api-key').focus(), 50);
+}
+function saveKey() {
+  const v = document.getElementById('api-key').value.trim();
+  const st = document.getElementById('key-state');
+  if (!v) { st.textContent = 'missing'; st.className = 'text-red-500 font-semibold'; return; }
+  document.getElementById('api-key').value = ''; // never linger in the DOM
+  st.textContent = 'set for this session';
+  st.className = 'text-green-600 font-semibold';
+  toggleSetup(false);
+  bubble('API key saved for this session — server memory only, nothing written to disk.');
+}
+function clearKey() {
+  document.getElementById('api-key').value = '';
+  const st = document.getElementById('key-state');
+  st.textContent = 'missing';
+  st.className = 'text-red-500 font-semibold';
+}
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape') toggleSetup(false);
+});
+const thread = () => document.getElementById('live-tail');
+function bubble(html, mine) {
+  const d = document.createElement('div');
+  d.className = mine
+    ? 'self-end max-w-[85%] px-[2%] py-2 rounded-2xl rounded-br-sm bg-[#0064E0] text-white'
+    : 'self-start max-w-[90%] flex gap-2';
+  d.innerHTML = mine ? html : `<span class="flex-none">🌌</span><div class="px-[2%] py-2 rounded-2xl rounded-tl-sm bg-neutral-100 dark:bg-neutral-800">${html}</div>`;
+  thread().appendChild(d);
+  d.scrollIntoView({ block: 'nearest' });
+}
+function send() {
+  const box = document.getElementById('composer');
+  const v = box.value.trim();
+  if (!v) return;
+  bubble(v.replace(/</g, '&lt;'), true);
+  box.value = '';
+  setTimeout(() => bubble(`On it — starting <strong>${v.replace(/</g, '&lt;')}</strong>. I'll narrate each step here and pause for approval before anything irreversible.`), 600);
+  setTimeout(() => bubble(`Step 1 · Screenshot taken, grounding targets…`), 1600);
+}
+function resolveApproval(ok) {
+  bubble(ok ? 'Approved — continuing the run.' : 'Denied — run aborted, desktop untouched.');
+}
+document.getElementById('composer').addEventListener('keydown', e => {
+  if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); }
+});
+</script>
+</body>
+</html>

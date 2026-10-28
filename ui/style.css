@@ -1,0 +1,4 @@
+/* Tailwind covers layout; only true customs live here. */
+#frame { image-rendering: auto; }
+#status-dot.running { background: #0f7b4d; }
+#status-dot.waiting { background: #9a6206; }

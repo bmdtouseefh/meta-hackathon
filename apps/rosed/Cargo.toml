@@ -1,0 +1,32 @@
+[package]
+name = "rosed"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+default = ["desktop-x11", "web-ui", "models-meta"]
+desktop-x11 = []
+web-ui = []
+models-meta = []
+video = []
+skills = []
+
+[dependencies]
+rose-core = { path = "../../crates/rose-core" }
+rose-desktop-fake = { path = "../../crates/rose-desktop-fake" }
+rose-desktop-x11 = { path = "../../crates/rose-desktop-x11" }
+rose-models = { path = "../../crates/rose-models" }
+rose-web = { path = "../../crates/rose-web" }
+anyhow = "1"
+async-trait = "0.1"
+clap = { version = "4", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread"] }
+toml = "0.8"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[[bin]]
+name = "rosed"
+path = "src/main.rs"

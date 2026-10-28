@@ -1,0 +1,12 @@
+[package]
+name = "rose-desktop-fake"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+rose-core = { path = "../rose-core" }
+async-trait = "0.1"
+chrono = { version = "0.4", features = ["serde"] }
+image = { version = "0.25", features = ["jpeg"] }
+tokio = { version = "1", features = ["macros", "rt", "sync"] }

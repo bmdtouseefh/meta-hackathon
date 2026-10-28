@@ -1,0 +1,281 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Rose — Architecture v5</title>
+<style>
+:root{color-scheme:light dark;--bg:#fff;--ink:#191919;--muted:#5d6672;--line:#e3e3e0;--card:#f7f7f5;--accent:#b03a5b;--ok:#0f7b4d;--warn:#9a6206;--bad:#b3362b}
+@media(prefers-color-scheme:dark){:root{--bg:#131314;--ink:#e9e9e9;--muted:#a3a3ad;--line:#2b2b2e;--card:#1b1b1d;--accent:#e88aa5;--ok:#4cc38a;--warn:#e0a63f;--bad:#ff7a6e}}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font:400 1rem/1.65 system-ui,-apple-system,"Segoe UI",sans-serif}
+main{max-width:58rem;margin:0 auto;padding:1.5rem 1rem 4rem}
+h1{font-size:2rem;line-height:1.2;margin:.2rem 0 .6rem}h2{font-size:1.35rem;margin-top:2.6rem;border-bottom:1px solid var(--line);padding-bottom:.3rem}h3{font-size:1.08rem;margin-top:1.6rem}
+p,li{max-width:68ch}.muted{color:var(--muted)}.small{font-size:.88rem}
+ul.toc{list-style:none;padding:0;display:flex;flex-wrap:wrap;gap:.4rem}ul.toc a{border:1px solid var(--line);border-radius:2rem;padding:.2rem .8rem;text-decoration:none;color:var(--ink);font-size:.85rem;background:var(--card)}
+table{display:block;overflow-x:auto;border-collapse:collapse;font-size:.9rem;width:100%}th,td{text-align:left;padding:.5rem .6rem;border-bottom:1px solid var(--line);vertical-align:top}th{background:var(--card)}
+pre{overflow-x:auto;background:var(--card);border:1px solid var(--line);border-radius:.5rem;padding:1rem;font-size:.82rem;line-height:1.5}
+code{font-size:.9em;background:var(--card);padding:.05rem .3rem;border-radius:.25rem}pre code{background:none;padding:0}
+.callout{border:1px solid var(--line);border-left:4px solid var(--accent);border-radius:.5rem;padding:.7rem 1rem;background:var(--card);margin:1rem 0}
+.callout.bad{border-left-color:var(--bad)}.callout.ok{border-left-color:var(--ok)}
+.flow{display:flex;flex-wrap:wrap;align-items:stretch;gap:.45rem;margin:1rem 0}
+.flow .box{flex:1 1 8.5rem;border:1px solid var(--line);background:var(--card);border-radius:.6rem;padding:.6rem .7rem;font-size:.86rem;line-height:1.45}
+.flow .box b{display:block;font-size:.9rem}
+.flow .arr{align-self:center;color:var(--muted);font-weight:700}
+.tag{display:inline-block;border:1px solid var(--line);border-radius:2rem;padding:.02rem .55rem;font-size:.75rem;background:var(--card);white-space:nowrap}
+.yes{color:var(--ok);font-weight:700}.no{color:var(--bad);font-weight:700}.later{color:var(--warn);font-weight:700}
+.kicker{color:var(--accent);font-weight:700;letter-spacing:.06em;text-transform:uppercase;font-size:.8rem}
+.wire{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:.78rem;line-height:1.45;white-space:pre}
+</style>
+</head>
+<body><main>
+
+<p class="kicker">Architecture v5 · supersedes v2–v4</p>
+<p class="muted small">Building this? Read <a href="IMPLEMENTATION.md"><code>IMPLEMENTATION.md</code></a> — modular crate layout, contracts, task order, and acceptance tests for coding agents.</p>
+<h1>Rose — the VM agent 🌌</h1>
+<p>An AI agent that lives on its own Ubuntu VM (locally or on EC2), <strong>uses the computer like you do</strong> — sees the XFCE screen, moves the mouse, types — performs your instructions, and learns repeatable tasks from <strong>narrated video recordings</strong>. The agent is <strong>Rose</strong>; the service that runs it is <strong><code>rosed</code></strong>.</p>
+
+<div class="callout">
+<strong>Settled decisions (this revision)</strong>
+<ul>
+<li><strong>Desktop-only control for the prototype.</strong> One X11 screenshot + input loop drives <em>everything</em> — Chromium (most workflows are web UIs anyway), native apps, dialogs, file pickers. No separate browser controller, no CDP layer in v1.</li>
+<li><span class="no">No third-party agent frameworks</span> (browser-use, Cua, OpenAdapt, UI-TARS, Playwright-agents, etc.). Everything that decides or acts is first-party code. A CDP/browser backend may be added <em>later, behind the same interface</em>, only if measured pixel-reliability demands it (§9).</li>
+<li><strong>One stack everywhere:</strong> Ubuntu Server → XFCE running on <strong>TigerVNC Xvnc (<code>DISPLAY=:1</code>)</strong> — identical on a local VM and EC2 (§2). No VM snapshots, no golden images, no Docker.</li>
+<li><strong><code>rosed</code> = one Rust binary.</strong> X11 controller, agent loop, Governor, Web UI, API, SQLite state — single static binary under <code>systemd --user</code>. Python returns only as the offline video worker in Phase 2 (§7).</li>
+<li><strong>Interface = a single-page Web UI</strong> (§5): instruction in, live desktop + step timeline out, approvals and takeover inline.</li>
+<li><strong>Models: Meta AI only.</strong> Phase 1 uses one: <strong>Muse Spark 1.3 (Contributor tier)</strong> — screenshot in, one JSON action out. Muse Voice and SAM 3.1 arrive in Phase 2+.</li>
+</ul>
+</div>
+
+<ul class="toc">
+<li><a href="#s1">1 Overview</a></li><li><a href="#s2">2 Platform &amp; setup</a></li><li><a href="#s3">3 rosed (Rust)</a></li><li><a href="#s4">4 Agent loop</a></li><li><a href="#s5">5 Web UI</a></li><li><a href="#s6">6 Phases</a></li><li><a href="#s7">7 Video → Skill</a></li><li><a href="#s8">8 Skill execution</a></li><li><a href="#s9">9 Safety &amp; later</a></li><li><a href="#s10">10 Roadmap</a></li><li><a href="#s11">11 Risks</a></li>
+</ul>
+
+<h2 id="s1">1. System overview</h2>
+<div class="flow">
+  <div class="box"><b>You</b>Browser / phone, private network (Tailscale / SSH tunnel)</div><span class="arr">→</span>
+  <div class="box"><b>Rose Web UI</b>Instruction · live desktop · timeline · approvals</div><span class="arr">→</span>
+  <div class="box"><b>rosed</b>(Rust, on the VM) Loop · Governor · runs · SQLite</div><span class="arr">→</span>
+  <div class="box"><b>X11 desktop</b>XFCE on Xvnc <code>:1</code> — Chromium + apps</div>
+</div>
+<div class="flow">
+  <div class="box"><b>Muse Spark 1.3</b>Contributor tier · the Phase 1 brain (one call per step)</div>
+  <div class="box"><b>Muse Voice</b>Voice in/out · narration ASR</div>
+  <div class="box"><b>SAM 3.1</b>Target masks · video click tracking</div>
+  <div class="box"><b>Storage (on VM)</b>SQLite + artifact files (runs, frames, videos)</div>
+</div>
+<p class="muted">There is no separate control-plane host in v1. <code>rosed</code> on the VM serves the UI, runs the agent, and stores everything. If that ever needs to split, the UI↔rosed API is the seam — but don't build for it now.</p>
+
+<h3>How Rose sees and acts (the only mechanism in v1)</h3>
+<pre><code>observe() -> { screenshot, elements: [{id, label, bounds, confidence}],  // vision-derived
+               active_window, screen_size }                             // from X11/EWMH
+
+act({ target: element_id | {x, y},
+      action: "click" | "double_click" | "type" | "press_key" |
+              "scroll" | "drag" | "wait",
+      text? }) -> { ok, error? }</code></pre>
+<ul>
+<li><strong>Capture:</strong> X11 GetImage of the Xvnc root window, encoded JPEG. Fixed resolution (1600×900) so coordinates are stable.</li>
+<li><strong>Coordinates:</strong> in Phase 1 the model looks at the screenshot and replies with the click point directly (fixed 1600×900 screen, so pixel coordinates are stable). No element-extraction system yet — the next screenshot is how Rose sees whether it worked. SAM 3.1 precision grounding is added in Phase 2/3 for learned skills.</li>
+<li><strong>Input:</strong> XTEST synthetic pointer/keyboard (works on every X11 app). Human takeover sends input through the <em>same</em> path with <code>actor:"human"</code> — one input channel, one audit log.</li>
+<li><strong>One atomic action per <code>act()</code></strong> — gated, logged, verified individually. No blind batched clicking. This is what makes runs debuggable and (later) replayable.</li>
+</ul>
+
+<h2 id="s2">2. Platform &amp; setup — identical on VM and EC2</h2>
+<table>
+<tr><th>Piece</th><th>Choice</th><th>Why</th></tr>
+<tr><td>Base OS</td><td>Ubuntu Server (fresh install / EC2 AMI)</td><td>Boring, identical everywhere. No custom images.</td></tr>
+<tr><td>Desktop</td><td>XFCE on <strong>TigerVNC Xvnc</strong>, <code>DISPLAY=:1</code>, fixed 1600×900×24</td><td>Xvnc is the X server + remote desktop in one: no physical display needed (EC2), agents talk plain X11, and a human can always VNC in <em>even if <code>rosed</code> is down</em> (bootstrap/recovery door). Xvfb rejected: human access would depend on our newest streaming code being alive.</td></tr>
+<tr><td>Browser</td><td>Google Chrome <code>.deb</code> (or Chromium), persistent profile</td><td>Ubuntu's Chromium is a Snap — painful on servers. Pixel control doesn't care about brand. Launch flags: <code>--disable-gpu --disable-dev-shm-usage</code>. Human logs into sites once <em>via VNC or the Rose live view</em>; Rose reuses the session, never passwords.</td></tr>
+<tr><td>Session</td><td><code>systemd --user</code> services + lingering: Xvnc/XFCE first, then <code>rosed</code> with <code>DISPLAY=:1</code></td><td><code>rosed</code> must share the desktop session (X display, D-Bus). Screen lock/saver/blanking off. Lock screen detected → Rose waits for human.</td></tr>
+<tr><td>Access</td><td>VNC and Rose UI bind <strong>localhost</strong>; reached via Tailscale or SSH tunnel</td><td><span class="no">Never</span> expose VNC (5901) or the UI publicly — EC2 security group stays closed. The tunnel is the security boundary; VNC auth alone is weak.</td></tr>
+<tr><td>State</td><td>SQLite (bundled in the binary) + files under <code>~/.local/share/rose/</code></td><td>No Postgres/Redis/Docker to install or babysit. Backup = copy the directory.</td></tr>
+</table>
+
+<h3>Setup script (the entire install story)</h3>
+<pre><code># fresh Ubuntu Server (VM or EC2), one idempotent script:
+sudo apt update
+sudo apt install -y xfce4 tigervnc-standalone-server dbus-x11 \
+                    x11-xserver-utils ffmpeg fonts-liberation curl
+sudo dpkg -i google-chrome-stable_current_amd64.deb ; sudo apt -f install -y
+
+# desktop: ~/.vnc/xstartup -> dbus-launch startxfce4 ; fixed geometry, no saver
+# rosed:   install binary to ~/.local/bin/rosed + config (Meta API keys)
+#          systemctl --user enable --now xvnc.service rosed.service
+
+# result: open https://&lt;vm&gt; (via Tailscale/tunnel) -> Rose UI</code></pre>
+<p class="muted">Rerunnable, no image building, no snapshots. "Reset the machine" = rerun the script; "clean state" = reinstall Chrome profile + rerun. Deliberately not more than this.</p>
+
+<h2 id="s3">3. <code>rosed</code> — one Rust binary</h2>
+<p>Chosen because the on-VM component is a long-lived daemon doing X11, streaming, HTTP/WebSocket, and policy enforcement — the "if it compiles, it works, ship one binary" profile. (<code>x11rb</code> provides capture/XTEST/EWMH; Tokio for concurrency; model calls are HTTPS+JSON, so Rust costs nothing on the AI side. Prompts live in reloadable files — tuning them never needs a recompile. Go was rejected: weaker X11 ecosystem, no compensating win.)</p>
+<table>
+<tr><th>Module (in the one binary)</th><th>Responsibility</th></tr>
+<tr><td><code>x11-controller</code></td><td>Capture, XTEST input (click/type/key/scroll/drag), active-window info, coordinate mapping. The only module that touches the desktop.</td></tr>
+<tr><td><code>agent-loop</code></td><td>§4 loop (screenshot → model → action → screenshot); budgets; Stop handling.</td></tr>
+<tr><td><code>governor</code></td><td>Deterministic policy gate before every action (§4): approvals, allowlists, redaction, budgets, kill switch. Pure rules, <em>no LLM</em> — a model never approves its own action.</td></tr>
+<tr><td><code>web</code></td><td>Embedded static UI (no Node build step), HTTP API, WebSocket event/frame stream.</td></tr>
+<tr><td><code>store</code></td><td>SQLite: tasks, runs, steps, skills; artifact files (frames, downloads, recordings).</td></tr>
+<tr><td>Python video worker <span class="tag">Phase 2, invoked by rosed</span></td><td>Offline pipeline (§7): ffmpeg + frame analysis + Muse Voice/Spark/SAM calls. Exploratory CV glue lives here, off the always-on path — the one place Python's speed of iteration wins.</td></tr>
+</table>
+<p><strong>API surface (UI and any future CLI share it):</strong> <code>POST /tasks</code> · <code>POST /tasks/:id/stop</code> · <code>POST /runs/:id/approve|deny</code> · <code>POST /desktop/takeover|handback</code> · <code>WS /events</code> (run steps, approvals, status) · <code>WS /desktop/frames</code> (live view + human input when holding the lease). Session-token auth; localhost + tunnel is the perimeter.</p>
+
+<h2 id="s4">4. Agent loop + Governor</h2>
+<div class="flow">
+  <div class="box"><b>1 · Observe</b>Frame + vision elements; redact secrets</div><span class="arr">→</span>
+  <div class="box"><b>2 · Decide</b>Muse Spark: intent + postcondition</div><span class="arr">→</span>
+  <div class="box"><b>3 · Ground</b>Model point (Phase 1)</div><span class="arr">→</span>
+  <div class="box"><b>4 · Gate</b>Governor: approve? allowed? budget?</div><span class="arr">→</span>
+  <div class="box"><b>5 · Act</b>One atomic <code>act()</code></div><span class="arr">→</span>
+  <div class="box"><b>6 · Verify</b>New frame → Muse Spark verdict</div>
+</div>
+<table>
+<tr><th>#</th><th>What happens</th><th>On failure</th></tr>
+<tr><td>1</td><td>Screenshot + candidate elements; password/OTP regions masked in-VM before any frame reaches a model.</td><td>Login/CAPTCHA screen detected → <code>waiting_human</code>.</td></tr>
+<tr><td>2</td><td>Muse Spark gets goal + run history + observation → structured next step (intent, action, expected postcondition, risk class). Stepwise, not one giant upfront plan. Skill runs: next DSL step with parameters bound (§8).</td><td>Ambiguous → Rose asks a clarifying question in the UI.</td></tr>
+<tr><td>3</td><td>Phase 1: Muse Spark returns the coordinates in its action reply. (Phase 3 adds SAM-refined grounding for skills.)</td><td>Model says it cannot find the target → it scrolls or replies <code>fail</code>; no blind guessing.</td></tr>
+<tr><td>4</td><td><strong>Governor</strong> (deterministic): irreversible (Submit/Send/Pay/Delete)? URL/app allowlist? step/time/spend budget left?</td><td>Approval needed → run pauses, UI (later phone push) shows context frame. Denied → run aborts.</td></tr>
+<tr><td>5</td><td>Exactly one <code>act()</code> via XTEST.</td><td>Input error → re-observe; never blind-retry a write.</td></tr>
+<tr><td>6</td><td>Short settle, save the new frame + step card to the timeline. There is no separate verifier call in Phase 1: on the <em>next</em> loop, the model sees this frame and judges whether its last action worked before choosing the next one.</td><td>Model reports it is stuck → a few retries with different actions → <code>waiting_human</code> (you take over; the correction is logged).</td></tr>
+</table>
+
+<h3>Run states</h3>
+<div class="flow">
+  <div class="box"><b>queued</b></div><span class="arr">→</span><div class="box"><b>running</b></div><span class="arr">⇄</span>
+  <div class="box"><b>waiting_approval</b></div><span class="arr">⇄</span><div class="box"><b>waiting_human</b></div><span class="arr">⇄</span>
+  <div class="box"><b>recovering</b></div><span class="arr">→</span><div class="box"><b>succeeded / failed / cancelled</b></div>
+</div>
+<p><strong>Control lease:</strong> exactly one driver — Rose <em>or</em> you (via Rose live view input, or a directly connected VNC client). Takeover lands at the next atomic-action boundary; a connected VNC client auto-pauses Rose; hand-back forces a fresh observation. <strong>Progress = verified steps</strong>, never attempted clicks. Kill switch halts input within the current action and releases the lease.</p>
+
+<h2 id="s5">5. The Web UI (the agent interface, v1)</h2>
+<p class="wire">┌────────────────────────────────────────────────────────────────┐
+│ 🌌 Rose    ● Idle    DISPLAY :1     [Take Control] [■ Stop]    │
+├──────────────────────────────────────┬─────────────────────────┤
+│                                      │ Current Run             │
+│          LIVE DESKTOP VIEW           │ ✓ Open billing portal   │
+│          (XFCE / Chromium)           │ ✓ Go to Invoices        │
+│                                      │ ● Clicking “Export”…    │
+│                                      │ ○ Verify CSV download   │
+├──────────────────────────────────────┴─────────────────────────┤
+│ Instruction: [ Export March invoices to CSV           ] [Run]  │
+│              [🎙 later]   [Recent runs ▾]                      │
+└────────────────────────────────────────────────────────────────┘</p>
+<table>
+<tr><th>Element</th><th>Function</th></tr>
+<tr><td><strong>Instruction box</strong></td><td>Plain-language task (“Download the latest invoice”, “Move these PDFs into the Finance folder”). Enter = run. Text first; Muse Voice push-to-talk added once the text path works. While a run is active, new instructions queue.</td></tr>
+<tr><td><strong>Live desktop view</strong></td><td>The Xvnc frame stream from <code>rosed</code> — exactly what Rose sees. View-only while Rose drives.</td></tr>
+<tr><td><strong>Take Control / Hand Back</strong></td><td>Your pointer/keys go through the same input path (<code>actor:"human"</code>) for logins, OTP, CAPTCHA, or rescuing a stuck run. Hand Back → Rose re-observes before continuing.</td></tr>
+<tr><td><strong>Run timeline</strong></td><td>Live step cards: intent, target, before/after frame thumbs, verdict, retries. Rose narrates actions (“Looking for Export…”), not raw chain-of-thought.</td></tr>
+<tr><td><strong>Approval banner</strong></td><td>Gated actions pause here with the context frame: Approve / Deny / Take over.</td></tr>
+<tr><td><strong>Stop</strong></td><td>Kill switch (also an API call). Always visible.</td></tr>
+<tr><td><strong>Recent runs</strong></td><td>History: instruction, outcome, step trace, artifacts (e.g. downloaded CSV).</td></tr>
+</table>
+<p class="muted">One page, one run at a time (one desktop). Deliberately absent in v1: Skill Studio (Phase 2 tab), settings maze, multi-run dashboard.</p>
+
+<h2 id="s6">6. Phases</h2>
+<table>
+<tr><th>Phase</th><th>Delivers</th><th>Not in it</th></tr>
+<tr><td><strong>1 — Rose works (prototype)</strong></td><td>§2 platform, <code>rosed</code> (§3), loop + Governor (§4), Web UI (§5). Instructions executed on the real desktop via pixels.</td><td>Video, skills, scheduling, CDP backend.</td></tr>
+<tr><td><strong>2 — Narrated video → Skill</strong></td><td>Upload in UI → Python pipeline (§7) → draft Skill → timeline review (Skill Studio tab). Skills are reviewed data.</td><td>Auto-execution; high-confidence silent-video learning.</td></tr>
+<tr><td><strong>3 — Rose uses Skills</strong></td><td>Skill-as-tool; semantic + deterministic replay; repair → Skill v+1; scheduling (§8).</td><td>Multi-VM, multi-user.</td></tr>
+</table>
+
+<h2 id="s7">7. Phase 2 — narrated video → Skill</h2>
+<p>You record yourself doing a task <strong>while narrating it</strong> (“filter by March — this changes monthly — then Export, CSV”). Narration is the primary semantic signal: intent, step names, and which values are variables come from the <strong>Muse Voice</strong> transcript, timestamp-aligned to the screen. Vision only answers <em>where exactly</em> and <em>what changed</em>.</p>
+<div class="flow">
+  <div class="box"><b>Upload</b>video + audio</div><span class="arr">→</span>
+  <div class="box"><b>Extract</b>audio + keyframes (ffmpeg)</div><span class="arr">→</span>
+  <div class="box"><b>Muse Voice</b>timestamped transcript</div><span class="arr">→</span>
+  <div class="box"><b>Event detection</b>(Python, classical) frame-diff · cursor · clicks · typing</div><span class="arr">→</span>
+  <div class="box"><b>Alignment</b>narration ↔ events</div><span class="arr">→</span>
+  <div class="box"><b>Grounding</b>Muse Spark labels · SAM 3.1 tracks clicked element</div><span class="arr">→</span>
+  <div class="box"><b>Muse Spark</b>Skill DSL draft</div><span class="arr">→</span>
+  <div class="box"><b>Skill Studio</b>you review on the timeline</div>
+</div>
+<ul>
+<li>Event detection is deliberately classical (cursor dwell + localised change ≲300&nbsp;ms = click candidate; text growth = typing). It proposes; Muse Spark decides semantics. Narration/screen disagreements are surfaced in Studio, never silently resolved.</li>
+<li>Synthesis: literals the narration marks as changeable → <code>{{parameters}}</code> (recorded value = default); secret-looking input → <code>human_input</code> placeholders, never stored; probable demonstrator mistakes flagged for deletion.</li>
+<li>Every step keeps <code>evidence: {video_ts, narration_quote, target_crop}</code> and a confidence score driving Studio highlighting + confirm-at-replay defaults. Timestamp granularity from Muse Voice (word vs segment) sets alignment precision — open decision (§11).</li>
+<li>The pipeline replays naturally onto Phase 1: recordings are pixels, Rose acts on pixels — same surface, no second execution model.</li>
+</ul>
+
+<h2 id="s8">8. Phase 3 — skill execution</h2>
+<p>A published Skill is exposed to the planner as <strong>one tool</strong> (<code>skill.export_invoices(month=…)</code>) beside raw <code>observe/act</code>; retrieval starts as keyword + Muse Spark rerank over skill descriptions.</p>
+<table>
+<tr><th>Mode</th><th>How it runs</th></tr>
+<tr><td><strong>Semantic replay</strong> (universal)</td><td>The §4 loop executes the DSL, re-grounding every step live from vision. Works day one of Phase 3; tolerates moved UI via planner escalation within budget.</td></tr>
+<tr><td><strong>Deterministic replay</strong> (fast path)</td><td><code>rosed</code> already logs every <code>act()</code> with its target descriptor (§4 traces). A verified run's trace is replayed with new parameter values at ~zero model calls, <strong>halting at the first mismatch</strong>; uncertain writes are never auto-retried (“check the record” outcome for the human).</td></tr>
+<tr><td><strong>Repair</strong></td><td>Halted step → semantic retry of its <em>intent</em> under the same approvals → proposed <strong>Skill v+1</strong> diff, human-approved. Skills are never silently rewritten.</td></tr>
+</table>
+<p><strong>Read-back verification:</strong> postconditions check the real record (downloaded file on disk, new list row, confirmation number) — not an on-screen “Saved ✓” toast. Scheduling (cron/webhook → task from a Skill) is a thin add-on once replay is trustworthy.</p>
+<pre><code>skill: export-invoices
+version: 3
+source: { recording: rec_abc123, reviewed_by: human }
+parameters:
+  month:      { type: month, default: "previous" }
+  output_dir: { type: path,  default: "~/Downloads/invoices" }
+preconditions:
+  - browser_logged_in: billing.example.com     # unmet -> waiting_human
+steps:
+  - intent: "Open the billing portal"
+    evidence: { video_ts: "00:12", narration: "I'm opening the billing portal" }
+    action: navigate_via_desktop               # open Chrome, type URL
+    postcondition: "billing portal visible"
+  - intent: "Go to Invoices"
+    evidence: { video_ts: "00:31", narration: "go to Invoices" }
+    action: click
+    locator: { visual: { anchor_text: "Invoices", near: "top navigation" } }
+    postcondition: "heading 'Invoices' visible"
+  - intent: "Set the month filter"
+    evidence: { video_ts: "01:05", narration: "filter by month - changes every time" }
+    action: select_or_click
+    locator: { visual: { anchor_text: "Month" } }
+    args: { value: "{{ month }}" }
+    postcondition: "rows for {{ month }} visible"
+  - intent: "Download the CSV"
+    evidence: { video_ts: "01:40", narration: "Export, then CSV" }
+    action: click
+    locator: { visual: { anchor_text: "Export CSV" } }
+    approval: required
+    postcondition: "new .csv exists in {{ output_dir }}"   # read-back
+outputs: { file: "{{ output_dir }}/*.csv (newest)" }
+on_failure: halt_and_ask</code></pre>
+
+<h2 id="s9">9. Safety &amp; what comes later</h2>
+<table>
+<tr><th>Risk</th><th>Mitigation</th></tr>
+<tr><td>Privileged desktop session</td><td>Dedicated VM = blast radius; allowlists; reinstall = clean state.</td></tr>
+<tr><td>Prompt injection from screen content</td><td>Observations are data, never instructions; planner forbids obeying on-screen instructions; cross-policy actions still hit the Governor + approval. (Unsolved in general — the gate is the defence.)</td></tr>
+<tr><td>Secrets</td><td>Logins live in the browser profile; Rose uses the session. Frames redacted in-VM; traces store parameter slots, not secrets; recordings/traces sensitive at rest.</td></tr>
+<tr><td>Irreversible / confidently-wrong actions</td><td>Approval gates; halt-on-mismatch; uncertain writes = “check the record”, never auto-retried; read-back postconditions.</td></tr>
+<tr><td>Runaway / cost</td><td>Kill switch, per-run step/time/spend budgets, one run at a time.</td></tr>
+<tr><td>Exposure</td><td>Localhost + Tailscale/SSH only; session auth; full audit trace per run.</td></tr>
+</table>
+<p><strong>Later, only on evidence:</strong> <span class="later">CDP/browser backend</span> behind the same <code>observe()/act()</code> — if the measured pixel-step failure rate on your real workflows is too high, <code>observe()</code> for a Chromium window starts returning structural elements and everything else (loop, Governor, DSL, UI) stays untouched. Also later: voice-first interaction, phone push approvals, richer live view. None of it is in the prototype's way.</p>
+
+<h2 id="s10">10. Roadmap with exit tests</h2>
+<h3>Phase 1 — Rose works</h3>
+<ol>
+<li>Setup script on a fresh Ubuntu Server (VM <em>and</em> an EC2 instance) → XFCE/Xvnc + Chrome + <code>rosed</code>; human first-login via VNC.</li>
+<li><strong>Hands test (no LLM):</strong> UI streams frames; clicking/typing in the live view drives the desktop. Proves capture+input+lease before any model is attached.</li>
+<li>Agent loop + Governor; Web UI per §5. (SAM arrives in Phase 2.)</li>
+</ol>
+<p><strong>Exit:</strong> <em>“Download the latest invoice from the portal I'm logged into”</em> + <em>“Create a folder and move Downloads' PDFs into it”</em> + 6–8 more of your real tasks complete from the Web UI at ≥80% success, ≤1 approval each on gated steps; Stop halts input &lt;1&nbsp;s; takeover/hand-back mid-run works; every step shows before/after evidence.</p>
+<h3>Phase 2 — narrated video → Skill</h3>
+<p><strong>Exit:</strong> a 3–5&nbsp;min narrated recording yields a draft needing ≤5&nbsp;min of correction; every step links to its video moment + narration line; changeable values correctly parameterised in the common cases.</p>
+<h3>Phase 3 — Rose uses Skills</h3>
+<p><strong>Exit:</strong> <em>“Export the invoices for March”</em> (never recorded) runs end-to-end; a deliberately renamed button halts <em>before</em> any write with a repair proposal; an unchanged skill's repeat run uses ~zero planner calls in deterministic mode.</p>
+
+<h2 id="s11">11. Risks &amp; open decisions</h2>
+<table>
+<tr><th>Item</th><th>Position</th></tr>
+<tr><td>Pixel grounding reliability (wrong look-alike click)</td><td>The known cost of desktop-only. Contained by: fixed 1600×900, maximised windows/100% zoom, verify-on-next-screenshot with re-try (SAM refinement joins in Phase 2/3). Measured in the Phase 1 exit set; the CDP escape hatch (§9) exists if the number is bad.</td></tr>
+<tr><td>Muse Voice timestamp granularity</td><td>Confirm word- vs segment-level; sets Phase 2 alignment precision. Blocks final Phase 2 design, not Phase 1.</td></tr>
+<tr><td>Vision cost per step</td><td>Every step is a frame → Muse Spark call. Budgets in the Governor; candidate-element caching within a screen is an optimisation only if spend demands it.</td></tr>
+<tr><td>Deterministic trace format</td><td>Design in Phase 3 from real Phase 1 traces, not upfront.</td></tr>
+<tr><td>Chrome vs Chromium on Ubuntu</td><td>Chrome <code>.deb</code> default (Snap pain). Revisit only if a hard Chromium requirement appears.</td></tr>
+</table>
+
+<p class="muted small">Glossary — <strong>Rose:</strong> the agent. <strong><code>rosed</code>:</strong> its Rust service (one binary, <code>systemd --user</code>). <strong>Governor:</strong> deterministic policy gate before every action. <strong>Lease:</strong> single-driver token (Rose or human). <strong>Skill:</strong> reviewed, parameterised, evidence-linked procedure (§8). <strong>Read-back:</strong> verify in the record, not from a toast.</p>
+
+</main>
+</body>
+</html>
