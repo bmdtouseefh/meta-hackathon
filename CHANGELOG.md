@@ -50,3 +50,6 @@ One line per completed task (IMPLEMENTATION.md, section 11). No secrets, no real
 - 2026-10-28 dep notes: `x11rb 0.13 + xtest` (x11); `tracing 0.1` (web/rosed).
 - 2026-10-30 feat: SoM overlay grounding for 4 CPU / 4 GB RAM — new `grounding-worker/` sidecar (classical-CV contour parser, no ML weights, FastAPI POST /parse -> elements + annotated JPEG, RSS <500 MB, ~70 ms/frame) with the OmniParser V2 contract so V2 weights (icon_detect_v3 MIT + icon_caption MIT) can swap in later with no Rust changes; Rust: new `GroundingConfig` + `rose-models::GroundingClient` (same-idx sub-call, never a step), `spark.rs` parses `{"element": N}`, stepper sends annotated JPEG and resolves element->point in-step with unknown-id replan; prompt teaches badge-picking with x,y fallback; config `[grounding]` (default omniparser); `grounding.service` unit + setup.sh install. Prompt change logged per rule 8.
 - 2026-10-30 release: workspace version 0.1.18 (ships grounding-worker + unit in .deb; deploy uses uv venv on the VM).
+- 2026-10-30 release: workspace version 0.1.19 (grounding v2: OCR text targets, grounded-frame trace files, tesseract-ocr on VM).
+- 2026-10-30 merge: ui/clean-redesign into main (rail sidebar, theme variables) + grounding v2.
+- 2026-10-30 release: workspace version 0.1.20 (merge ui redesign + SoM grounding v2).
