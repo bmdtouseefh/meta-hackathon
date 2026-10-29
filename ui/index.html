@@ -21,6 +21,11 @@
     document.getElementById('setup-modal').classList.toggle('hidden', !open);
     if (open) setTimeout(() => document.getElementById('api-key').focus(), 50);
   }
+  function toggleRuns() {
+    const p = document.getElementById('chat-sidebar');
+    p.classList.toggle('hidden');
+    if (!p.classList.contains('hidden')) refreshChats();
+  }
 </script>
 <link rel="stylesheet" href="/style.css">
 </head>
@@ -34,8 +39,9 @@
   <span id="backend-text" class="text-xs text-neutral-500"></span>
   <button onclick="toggleTheme()" class="px-2 py-1 rounded border border-neutral-300 dark:border-neutral-700" title="toggle light/dark">◐</button>
   <button onclick="toggleSetup(true)" class="px-3 py-1 rounded border border-neutral-300 dark:border-neutral-700" title="Setup: API keys &amp; brain">⚙ Setup</button>
+  <button onclick="toggleRuns()" class="px-3 py-1 rounded border border-neutral-300 dark:border-neutral-700" title="Show or hide the chat list">☰ Chats</button>
   <button onclick="toggleDesktop()" class="px-3 py-1 rounded border border-neutral-300 dark:border-neutral-700">🖥 Desktop</button>
-  <button id="stop" disabled title="Kill switch lands with the agent loop (M2)" class="px-3 py-1 rounded bg-red-700 text-white disabled:opacity-50">■ Stop</button>
+  <button id="stop" onclick="stopRun()" disabled title="Stop the current run at its next checkpoint" class="px-3 py-1 rounded bg-red-700 text-white font-semibold disabled:opacity-50">■ Stop</button>
 </header>
 
 <!-- setup modal: keys live server-side only, never persisted, never in traces -->
@@ -55,6 +61,17 @@
 </div>
 
 <div class="flex flex-1 min-h-0">
+  <!-- chats: one entry per run, persisted server-side -->
+  <aside id="chat-sidebar" class="w-[26%] lg:w-[22%] flex-none flex flex-col min-h-0 border-r border-neutral-200 dark:border-neutral-800">
+    <div class="px-[6%] py-2 flex flex-col gap-2 border-b border-neutral-200 dark:border-neutral-800">
+      <button onclick="newChat()" class="w-full px-3 py-2 rounded-xl bg-[#0064E0] text-white font-semibold text-sm" title="Start a new chat">＋ New chat</button>
+      <input id="chat-search" type="search" placeholder="Search chats…" oninput="refreshChats()" class="w-full px-3 py-1.5 rounded-xl border border-neutral-300 dark:border-neutral-600 bg-transparent text-sm" aria-label="Search chats">
+    </div>
+    <div id="chat-list" class="flex-1 overflow-y-auto flex flex-col gap-1 p-[3%]">
+      <div class="text-xs text-neutral-500">loading…</div>
+    </div>
+  </aside>
+
   <!-- conversation: the main thing -->
   <main class="flex-1 flex flex-col min-h-[60vh]">
     <div id="thread" class="w-full max-w-[min(46rem,92%)] mx-auto flex-1 overflow-y-auto flex flex-col gap-4 py-[2%]">
@@ -70,7 +87,7 @@
           <button class="px-2 py-1 rounded text-xs text-neutral-500" disabled title="Voice arrives in Phase 2">🎙</button>
           <button onclick="send()" class="px-5 py-2 rounded-xl bg-[#0064E0] text-white font-semibold flex-none">Run</button>
         </div>
-        <div id="queue-note" class="text-xs text-neutral-500 mt-1">Single-step prototype: each Run does one observe→decide→act cycle (full loop lands in M2).</div>
+        <div id="queue-note" class="text-xs text-neutral-500 mt-1">Rose replies with a short summary when a run ends. Step-by-step feedback streams live under Details in the run card — minimize it any time, or expand it later to inspect a run.</div>
       </div>
     </div>
   </main>

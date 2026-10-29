@@ -12,10 +12,39 @@ use serde::Deserialize;
 /// The §6 reply: one JSON object, nothing else.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ModelReply {
-    Act { action: Action, say: String },
-    Done { say: String },
-    Ask { say: String },
-    Fail { say: String },
+    Act {
+        action: Action,
+        say: String,
+        /// After a `Type`, also press Return in the same decision.
+        /// Typing into a field and submitting it is one human gesture;
+        /// as separate replies it burned a whole screenshot+brain
+        /// round-trip (and a step) just to press Enter. The loop still
+        /// dispatches two atomic `act()` calls, verified together on
+        /// the next screenshot.
+        enter_after: bool,
+    },
+    /// Run a shell command natively (`text` is the command). For
+    /// anything a command line can do directly — launching apps,
+    /// files, processes — instead of driving a terminal by pixels.
+    Shell {
+        command: String,
+        say: String,
+    },
+    /// Text-mode reply: "I need to see the desktop before deciding."
+    /// Only meaningful from a text (no-screenshot) call; the loop then
+    /// takes a screenshot and asks again with vision.
+    Look {
+        say: String,
+    },
+    Done {
+        say: String,
+    },
+    Ask {
+        say: String,
+    },
+    Fail {
+        say: String,
+    },
 }
 
 #[derive(Debug, Deserialize)]
@@ -26,7 +55,19 @@ struct RawReply {
     y: Option<u32>,
     text: Option<String>,
     dy: Option<i32>,
+    ms: Option<u32>,
+    enter: Option<bool>,
     say: Option<String>,
+}
+
+/// Split a chord the prompt advertises ("ctrl+l", "ctrl+shift+t") into the
+/// separate key tokens the X11 backend expects (["ctrl", "l"], ...).
+/// A single key name passes through untouched.
+fn split_chord(text: &str) -> Vec<String> {
+    text.split('+')
+        .map(|k| k.trim().to_string())
+        .filter(|k| !k.is_empty())
+        .collect()
 }
 
 /// Parse one model reply. Pure: unit-tested with fixtures, no network.
@@ -45,32 +86,70 @@ pub fn parse_reply(text: &str) -> Result<ModelReply> {
         "act" => {
             let action = raw.action.as_deref().unwrap_or("");
             match action {
-                "click" => {
+                "click" | "double_click" => {
                     let (x, y) = match (raw.x, raw.y) {
                         (Some(x), Some(y)) => (x, y),
-                        _ => return Err(RoseError::Model("click needs x and y".to_string())),
+                        _ => {
+                            return Err(RoseError::Model(
+                                "click/double_click needs x and y".to_string(),
+                            ))
+                        }
+                    };
+                    let target = Target::Point { x, y };
+                    let action = if action == "click" {
+                        Action::Click {
+                            target,
+                            button: MouseButton::Left,
+                        }
+                    } else {
+                        // Desktop icons only *select* on a single click; they
+                        // launch on a double-click. Without this variant the
+                        // model could never open one, however well it aimed.
+                        Action::DoubleClick { target }
                     };
                     Ok(ModelReply::Act {
-                        action: Action::Click {
-                            target: Target::Point { x, y },
-                            button: MouseButton::Left,
-                        },
+                        action,
                         say,
+                        enter_after: false,
                     })
                 }
+                "wait" => Ok(ModelReply::Act {
+                    action: Action::Wait {
+                        ms: raw.ms.unwrap_or(1_500).clamp(100, 10_000),
+                    },
+                    say,
+                    enter_after: false,
+                }),
                 "type" => match raw.text {
                     Some(text) => Ok(ModelReply::Act {
                         action: Action::Type { text },
                         say,
+                        enter_after: raw.enter.unwrap_or(false),
                     }),
                     None => Err(RoseError::Model("type needs text".to_string())),
                 },
                 "key" => match raw.text {
+                    // The prompt tells the model to emit chords as one
+                    // string ("ctrl+l"); the backend wants separate tokens.
+                    // Wrapping the whole string as one key made every chord
+                    // fail with "unknown key" after the model had replied.
                     Some(text) => Ok(ModelReply::Act {
-                        action: Action::PressKey { keys: vec![text] },
+                        action: Action::PressKey {
+                            keys: split_chord(&text),
+                        },
                         say,
+                        enter_after: false,
                     }),
                     None => Err(RoseError::Model("key needs text".to_string())),
+                },
+                "look" => Ok(ModelReply::Look { say }),
+                "shell" => match raw.text {
+                    Some(command) if !command.trim().is_empty() => {
+                        Ok(ModelReply::Shell { command, say })
+                    }
+                    _ => Err(RoseError::Model(
+                        "shell needs text (the command)".to_string(),
+                    )),
                 },
                 "scroll" => Ok(ModelReply::Act {
                     action: Action::Scroll {
@@ -80,6 +159,7 @@ pub fn parse_reply(text: &str) -> Result<ModelReply> {
                         dy: raw.dy.unwrap_or(-600),
                     },
                     say,
+                    enter_after: false,
                 }),
                 other => Err(RoseError::Model(format!("unknown action {other:?}"))),
             }
@@ -133,30 +213,78 @@ impl MuseClient {
             .join("\n")
     }
 
+    /// Text-only step instructions: no screenshot is attached, so the
+    /// model must not invent pixel actions. Shell-first; `look` is the
+    /// only way to get a screenshot.
+    const TEXT_MODE: &'static str = "\n\n# This step: TEXT ONLY (no screenshot attached)\n\
+        You cannot see the desktop this step. Do not emit click/double_click/type/key/scroll — you have nothing to aim at.\n\
+        Decide from the goal and history (including shell outputs) alone:\n\
+        - If the goal (or its next step) can be done from the shell, reply \"shell\". \
+        Opening/launching an app or a URL is ALWAYS a shell step (e.g. setsid google-chrome 'URL' &): never ask to look just to find its icon.\n\
+        - If shell output in the history already proves the goal is complete, reply \"done\".\n\
+        - Only if the next step genuinely requires seeing and operating the GUI (clicking a control in an already-open app), reply {\"status\":\"act\",\"action\":\"look\",\"say\":\"I need to see the desktop to ...\"} and a screenshot will be taken for your next reply.\n";
+
     /// Goal + short history + current JPEG -> one JSON action.
-    /// Bad reply: one retry, then a clear error (never panic on model output).
     pub async fn next_action(
         &self,
         goal: &str,
         history: &[StepSummary],
         jpeg: &[u8],
     ) -> Result<ModelReply> {
-        let image_b64 = base64::engine::general_purpose::STANDARD.encode(jpeg);
-        let user_text = format!(
-            "Goal: {goal}\nPrevious actions (most recent last):\n{}\nCurrent screenshot attached (1600x900). Reply with ONE JSON object only.",
-            Self::history_text(history)
-        );
+        self.call(goal, history, Some(jpeg)).await
+    }
+
+    /// Goal + short history, NO screenshot -> one JSON action.
+    /// Shell steps run on this path, so a command-line task never
+    /// pays for a screenshot capture or a vision call per step.
+    pub async fn next_action_text(
+        &self,
+        goal: &str,
+        history: &[StepSummary],
+    ) -> Result<ModelReply> {
+        self.call(goal, history, None).await
+    }
+
+    /// Bad reply: one retry, then a clear error (never panic on model output).
+    async fn call(
+        &self,
+        goal: &str,
+        history: &[StepSummary],
+        jpeg: Option<&[u8]>,
+    ) -> Result<ModelReply> {
+        let (user_text, developer, image_part) = match jpeg {
+            Some(jpeg) => {
+                let image_b64 = base64::engine::general_purpose::STANDARD.encode(jpeg);
+                (
+                    format!(
+                        "Goal: {goal}\nPrevious actions (most recent last):\n{}\nCurrent screenshot attached (1600x900). Reply with ONE JSON object only.",
+                        Self::history_text(history)
+                    ),
+                    BRAIN_PROMPT.to_string(),
+                    Some(serde_json::json!({ "type": "image_url", "image_url": {
+                        "url": format!("data:image/jpeg;base64,{image_b64}")
+                    }})),
+                )
+            }
+            None => (
+                format!(
+                    "Goal: {goal}\nPrevious actions and shell outputs (most recent last):\n{}\nNo screenshot is attached this step. Reply with ONE JSON object only.",
+                    Self::history_text(history)
+                ),
+                format!("{BRAIN_PROMPT}{}", Self::TEXT_MODE),
+                None,
+            ),
+        };
+        let mut content = vec![serde_json::json!({ "type": "text", "text": user_text })];
+        if let Some(part) = image_part {
+            content.push(part);
+        }
         let body = serde_json::json!({
             "model": self.model,
             "response_format": { "type": "json_object" },
             "messages": [
-                { "role": "developer", "content": BRAIN_PROMPT },
-                { "role": "user", "content": [
-                    { "type": "text", "text": user_text },
-                    { "type": "image_url", "image_url": {
-                        "url": format!("data:image/jpeg;base64,{image_b64}")
-                    }},
-                ]},
+                { "role": "developer", "content": developer },
+                { "role": "user", "content": content },
             ],
         });
 
@@ -241,7 +369,7 @@ mod tests {
         )
         .expect("click");
         assert!(matches!(click, ModelReply::Act { .. }));
-        if let ModelReply::Act { action, say } = click {
+        if let ModelReply::Act { action, say, .. } = click {
             assert_eq!(
                 action,
                 Action::Click {
@@ -298,6 +426,91 @@ mod tests {
         } else {
             panic!("want scroll");
         }
+    }
+
+    #[test]
+    fn parses_double_click_wait_and_key_chords() {
+        let d = parse_reply(
+            r#"{"status":"act","action":"double_click","x":120,"y":200,"say":"Opening Chrome"}"#,
+        )
+        .expect("double_click");
+        assert!(matches!(
+            d,
+            ModelReply::Act {
+                action: Action::DoubleClick {
+                    target: Target::Point { x: 120, y: 200 }
+                },
+                ..
+            }
+        ));
+        let w = parse_reply(r#"{"status":"act","action":"wait","ms":3000,"say":"Waiting"}"#)
+            .expect("wait");
+        assert!(matches!(
+            w,
+            ModelReply::Act {
+                action: Action::Wait { ms: 3000 },
+                ..
+            }
+        ));
+        // Chords arrive as one "ctrl+l" string but act as two key tokens.
+        let k = parse_reply(r#"{"status":"act","action":"key","text":"ctrl+l","say":"k"}"#)
+            .expect("chord");
+        assert!(matches!(
+            k,
+            ModelReply::Act {
+                action: Action::PressKey { keys },
+                ..
+            } if keys == vec!["ctrl".to_string(), "l".to_string()]
+        ));
+        assert_eq!(split_chord("Return"), vec!["Return".to_string()]);
+        assert_eq!(
+            split_chord(" ctrl + shift + t "),
+            vec!["ctrl".to_string(), "shift".to_string(), "t".to_string()]
+        );
+    }
+
+    #[test]
+    fn parses_look_requests() {
+        let l = parse_reply(r#"{"status":"act","action":"look","say":"Need to see it"}"#)
+            .expect("look");
+        assert!(matches!(l, ModelReply::Look { .. }));
+    }
+
+    #[test]
+    fn parses_shell_commands() {
+        let s = parse_reply(
+            r#"{"status":"act","action":"shell","text":"ls ~/Downloads","say":"Listing"}"#,
+        )
+        .expect("shell");
+        assert!(matches!(
+            s,
+            ModelReply::Shell { command, .. } if command == "ls ~/Downloads"
+        ));
+        assert!(parse_reply(r#"{"status":"act","action":"shell","say":"no cmd"}"#).is_err());
+    }
+
+    #[test]
+    fn type_can_carry_enter_after() {
+        let t = parse_reply(
+            r#"{"status":"act","action":"type","text":"example.com","enter":true,"say":"Going"}"#,
+        )
+        .expect("type+enter");
+        assert!(matches!(
+            t,
+            ModelReply::Act {
+                enter_after: true,
+                ..
+            }
+        ));
+        let plain = parse_reply(r#"{"status":"act","action":"type","text":"x","say":"t"}"#)
+            .expect("plain type");
+        assert!(matches!(
+            plain,
+            ModelReply::Act {
+                enter_after: false,
+                ..
+            }
+        ));
     }
 
     #[test]

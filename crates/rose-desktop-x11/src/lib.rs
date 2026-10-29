@@ -99,6 +99,13 @@ fn scroll_presses(dy: i32) -> (u8, u32) {
     (button, reps)
 }
 
+/// Clamp a model point into the real screen. Models hallucinate outside the
+/// box (e.g. y=973 on a 900-tall screen); clicking there silently misses,
+/// so clamp loudly instead of trusting the coordinates.
+fn clamp_point(x: u32, y: u32, w: u32, h: u32) -> (u32, u32) {
+    (x.min(w.saturating_sub(1)), y.min(h.saturating_sub(1)))
+}
+
 // ---------- blocking X11 work (runs inside spawn_blocking) ----------
 
 struct Session {
@@ -203,6 +210,14 @@ impl Session {
 
     fn shift_keycode(&self) -> Result<u8> {
         Ok(self.keycode_for(0xffe1)?.0)
+    }
+
+    fn geometry(&self) -> Result<(u32, u32)> {
+        let g = xproto::get_geometry(&self.conn, self.root)
+            .map_err(|e| RoseError::Desktop(format!("geometry: {e}")))?
+            .reply()
+            .map_err(|e| RoseError::Desktop(format!("geometry: {e}")))?;
+        Ok((g.width as u32, g.height as u32))
     }
 }
 
@@ -319,19 +334,38 @@ fn active_window_blocking(
 
 fn act_blocking(display: &str, action: &Action) -> Result<()> {
     let session = Session::open(display)?;
+    let (gw, gh) = session.geometry()?;
+    let point = |target: &Target| -> Result<(u32, u32)> {
+        let (x, y) = point_of(target)?;
+        let (cx, cy) = clamp_point(x, y, gw, gh);
+        if (cx, cy) != (x, y) {
+            tracing::warn!(got = %format!("{x},{y}"), clamped = %format!("{cx},{cy}"),
+                screen = %format!("{gw}x{gh}"), "model point outside screen; clamped");
+        }
+        Ok((cx, cy))
+    };
+    // Settle delays: a motion+press+release with zero gap can land before
+    // the panel/toolkit has registered the pointer move, so the click is
+    // delivered but ignored. Human-speed gaps (~50ms) are cheap insurance.
+    let settle = || std::thread::sleep(std::time::Duration::from_millis(70));
+    let hold = || std::thread::sleep(std::time::Duration::from_millis(50));
     match action {
         Action::Click { target, button } => {
-            let (x, y) = point_of(target)?;
+            let (x, y) = point(target)?;
             session.motion(x, y)?;
+            settle();
             let b = mouse_button_number(*button);
             session.press(b, false)?;
+            hold();
             session.release(b, false)?;
         }
         Action::DoubleClick { target } => {
-            let (x, y) = point_of(target)?;
+            let (x, y) = point(target)?;
             session.motion(x, y)?;
+            settle();
             for _ in 0..2 {
                 session.press(1, false)?;
+                hold();
                 session.release(1, false)?;
                 std::thread::sleep(std::time::Duration::from_millis(60));
             }
@@ -371,8 +405,9 @@ fn act_blocking(display: &str, action: &Action) -> Result<()> {
             }
         }
         Action::Scroll { target, dy } => {
-            let (x, y) = point_of(target)?;
+            let (x, y) = point(target)?;
             session.motion(x, y)?;
+            settle();
             let (button, reps) = scroll_presses(*dy);
             for _ in 0..reps {
                 session.press(button, false)?;
@@ -380,8 +415,8 @@ fn act_blocking(display: &str, action: &Action) -> Result<()> {
             }
         }
         Action::Drag { from, to } => {
-            let (x0, y0) = point_of(from)?;
-            let (x1, y1) = point_of(to)?;
+            let (x0, y0) = point(from)?;
+            let (x1, y1) = point(to)?;
             session.motion(x0, y0)?;
             session.press(1, false)?;
             session.motion(x1, y1)?;
@@ -471,6 +506,14 @@ mod tests {
         assert_eq!(keysym_for_token("€"), None); // outside Latin-1: unsupported
         assert!(is_modifier_token("Shift"));
         assert!(!is_modifier_token("Return"));
+    }
+
+    #[test]
+    fn clamp_keeps_points_on_screen() {
+        assert_eq!(clamp_point(100, 100, 1600, 900), (100, 100));
+        // The 2026-10-28 miss: model aimed y=973 on a 900-tall screen.
+        assert_eq!(clamp_point(515, 973, 1600, 900), (515, 899));
+        assert_eq!(clamp_point(0, 0, 1600, 900), (0, 0));
     }
 
     #[test]

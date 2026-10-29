@@ -11,15 +11,20 @@ pub struct FakeBrain {
 }
 
 impl FakeBrain {
-    /// A scripted click-type-done run: click (10,10), type, done.
+    /// A scripted look-click-done run: the text brain asks to see
+    /// the desktop, then clicks (10,10), then is done.
     pub fn demo() -> Self {
         Self::scripted(vec![
+            ModelReply::Look {
+                say: "I need to see the desktop".to_string(),
+            },
             ModelReply::Act {
                 action: Action::Click {
                     target: Target::Point { x: 10, y: 10 },
                     button: MouseButton::Left,
                 },
                 say: "Clicking the first cell".to_string(),
+                enter_after: false,
             },
             ModelReply::Done {
                 say: "Demo complete".to_string(),
@@ -32,6 +37,16 @@ impl FakeBrain {
             script: Mutex::new(replies),
             calls: Mutex::new(Vec::new()),
         }
+    }
+
+    /// Text-mode decisions draw from the same script: a scripted
+    /// shell run is how text steps are regression-tested end to end.
+    pub async fn next_action_text(
+        &self,
+        goal: &str,
+        history: &[StepSummary],
+    ) -> Result<ModelReply> {
+        self.next_action(goal, history, &[]).await
     }
 
     pub async fn next_action(
@@ -65,10 +80,12 @@ mod tests {
     #[tokio::test]
     async fn replays_script_in_order() {
         let brain = FakeBrain::demo();
-        let r1 = brain.next_action("g", &[], &[]).await.expect("r1");
-        assert!(matches!(r1, ModelReply::Act { .. }));
+        let r1 = brain.next_action_text("g", &[]).await.expect("r1");
+        assert!(matches!(r1, ModelReply::Look { .. }));
         let r2 = brain.next_action("g", &[], &[]).await.expect("r2");
-        assert!(matches!(r2, ModelReply::Done { .. }));
-        assert_eq!(brain.call_count(), 2);
+        assert!(matches!(r2, ModelReply::Act { .. }));
+        let r3 = brain.next_action_text("g", &[]).await.expect("r3");
+        assert!(matches!(r3, ModelReply::Done { .. }));
+        assert_eq!(brain.call_count(), 3);
     }
 }
