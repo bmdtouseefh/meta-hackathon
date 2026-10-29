@@ -137,6 +137,10 @@ impl rose_web::TraceSource for TraceAdapter {
         std::fs::read(self.store.frame_path(run_id, step)?).ok()
     }
 
+    async fn grounded_frame(&self, run_id: &str, step: u32) -> Option<Vec<u8>> {
+        std::fs::read(self.store.grounded_frame_path(run_id, step)?).ok()
+    }
+
     async fn chat(&self, limit: u32) -> Vec<serde_json::Value> {
         self.store
             .chat(limit)

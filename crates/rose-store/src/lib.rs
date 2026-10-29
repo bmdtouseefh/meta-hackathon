@@ -331,6 +331,16 @@ impl TraceStore {
         path.is_file().then_some(path)
     }
 
+    pub fn grounded_frame_path(&self, run_id: &str, step: u32) -> Option<PathBuf> {
+        if !valid_run_id(run_id) {
+            return None;
+        }
+        let path = self
+            .frames_dir(run_id)
+            .join(format!("step-{step:03}-grounded.jpg"));
+        path.is_file().then_some(path)
+    }
+
     /// All events of one run, in order. `None` for unknown/bad ids.
     pub fn events(&self, run_id: &str) -> Option<Vec<serde_json::Value>> {
         if !valid_run_id(run_id) {

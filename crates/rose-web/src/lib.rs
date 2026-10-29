@@ -95,6 +95,13 @@ pub trait TraceSource: Send + Sync {
     async fn run(&self, run_id: &str) -> Option<serde_json::Value>;
     /// The screenshot the brain decided on at `step`, if saved.
     async fn frame(&self, run_id: &str, step: u32) -> Option<Vec<u8>>;
+    /// The SoM-annotated screenshot (boxes + badges) the brain actually
+    /// saw at `step`, if grounding was on. Defaults to `None` so older
+    /// runs and test doubles without overlays keep working.
+    async fn grounded_frame(&self, run_id: &str, step: u32) -> Option<Vec<u8>> {
+        let _ = (run_id, step);
+        None
+    }
     /// Persisted chat history (user goals + assistant replies),
     /// oldest first, as JSON values.
     async fn chat(&self, limit: u32) -> Vec<serde_json::Value> {
@@ -193,6 +200,10 @@ pub fn router(state: AppState) -> Router {
         .route("/api/runs", get(api_runs))
         .route("/api/runs/{id}", get(api_run))
         .route("/api/runs/{id}/frames/{step}", get(api_run_frame))
+        .route(
+            "/api/runs/{id}/frames/{step}/grounded",
+            get(api_run_grounded_frame),
+        )
         .with_state(state)
 }
 
@@ -510,6 +521,34 @@ async fn api_run(
             None => (
                 StatusCode::NOT_FOUND,
                 Json(serde_json::json!({"error": "unknown run"})),
+            )
+                .into_response(),
+        },
+    }
+}
+
+async fn api_run_grounded_frame(
+    axum::extract::State(s): axum::extract::State<AppState>,
+    axum::extract::Path((id, step)): axum::extract::Path<(String, u32)>,
+) -> impl IntoResponse {
+    match &s.traces {
+        None => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"error": "trace store not configured"})),
+        )
+            .into_response(),
+        Some(t) => match t.grounded_frame(&id, step).await {
+            Some(bytes) => (
+                [
+                    (header::CONTENT_TYPE, "image/jpeg"),
+                    (header::CACHE_CONTROL, "no-store"),
+                ],
+                bytes,
+            )
+                .into_response(),
+            None => (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": "no overlay for this step"})),
             )
                 .into_response(),
         },
@@ -858,6 +897,10 @@ mod tests {
         assert!(head.contains("200 OK"), "{head}");
         assert_eq!(body, vec![0xff, 0xd8, 0xff, 0xd9]);
         let (head, _) = get(port, "/api/runs/run-1/frames/9").await;
+        assert!(head.contains("404"), "{head}");
+        // No overlay saved in the stub store: grounded frame is 404, but
+        // the route exists (proves wiring without a fixture image).
+        let (head, _) = get(port, "/api/runs/run-1/frames/2/grounded").await;
         assert!(head.contains("404"), "{head}");
     }
 

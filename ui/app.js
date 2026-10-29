@@ -173,7 +173,7 @@ function renderEvent(card, ev) {
         a.target = "_blank";
         a.rel = "noopener";
         a.className = "text-xs underline opacity-80";
-        a.textContent = "🖼 View the screenshot the brain saw";
+        a.textContent = "🖼 View the raw screenshot";
         row.appendChild(a);
       }
       const hist = ev.history && ev.history.length ? ev.history.join(" → ") : "(empty — first step)";
@@ -192,6 +192,28 @@ function renderEvent(card, ev) {
     case "vision_requested":
       line(row, `👀 Brain needs the desktop for this: ${ev.say} — taking a screenshot…`, "text-sm");
       break;
+    case "grounded": {
+      const n = ev.elements || 0;
+      const ms = ev.ms != null ? ` in ${ev.ms}ms` : "";
+      if (n > 0) {
+        line(row, `🎯 Overlay: ${n} numbered element${n === 1 ? "" : "s"}${ms} — brain picks a number, no pixel guessing`, "text-sm");
+        if (ev.labels && ev.labels.length) {
+          line(row, ev.labels.join(" · "), "text-xs font-mono opacity-80");
+        }
+        if (ev.frame && ev.run_id) {
+          const a = document.createElement("a");
+          a.href = `/api/runs/${encodeURIComponent(ev.run_id)}/frames/${ev.step}/grounded`;
+          a.target = "_blank";
+          a.rel = "noopener";
+          a.className = "text-xs underline opacity-80";
+          a.textContent = "🎯 View the annotated screenshot the brain saw";
+          row.appendChild(a);
+        }
+      } else {
+        line(row, `🎯 Overlay: no elements found${ms} — falling back to raw pixels`, "text-sm opacity-70");
+      }
+      break;
+    }
     case "planned":
       line(row, `🧠 Plan: ${ev.say}`, "text-sm font-medium");
       line(row, `→ Will do: ${ev.action} (brain took ${ev.brain_ms}ms)`, "text-sm font-mono");
