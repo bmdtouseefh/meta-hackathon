@@ -53,3 +53,5 @@ One line per completed task (IMPLEMENTATION.md, section 11). No secrets, no real
 - 2026-10-30 release: workspace version 0.1.19 (grounding v2: OCR text targets, grounded-frame trace files, tesseract-ocr on VM).
 - 2026-10-30 merge: ui/clean-redesign into main (rail sidebar, theme variables) + grounding v2.
 - 2026-10-30 release: workspace version 0.1.20 (merge ui redesign + SoM grounding v2).
+- 2026-10-30 grounding v3: PSM 11 + own row clustering (Tesseract line grouping merged toolbar rows into oblivion), chrome quota (top band keeps 10 slots so tabs/address/toolbar survive the score cap), containment suppression (icon blobs inside text lines dropped), cap 32. Verified on a real TradingView frame: "Indicators" badges correctly.
+- 2026-10-30 release: workspace version 0.1.21 (SoM grounding v3).
