@@ -478,6 +478,32 @@ fn default_muse_model() -> String {
     "muse-spark-1.3-contributor".to_string()
 }
 
+fn default_grounding_endpoint() -> String {
+    "http://127.0.0.1:8791".to_string()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GroundingConfig {
+    /// "omniparser" (grounding-worker sidecar) | "off" | "fake".
+    #[serde(default = "default_grounding_backend")]
+    pub backend: String,
+    /// Sidecar base URL (POST {endpoint}/parse, GET {endpoint}/health).
+    #[serde(default = "default_grounding_endpoint")]
+    pub endpoint: String,
+    /// Minimum element confidence to offer to the brain (0-1000 scale
+    /// uses 0..1000 ints in JSON; stored here as 0..100 for TOML).
+    #[serde(default = "default_grounding_min_conf")]
+    pub min_conf: u32,
+}
+
+fn default_grounding_backend() -> String {
+    "off".to_string()
+}
+
+fn default_grounding_min_conf() -> u32 {
+    5
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DataConfig {
     pub dir: String,
@@ -488,8 +514,20 @@ pub struct RoseConfig {
     pub server: ServerConfig,
     pub desktop: DesktopConfig,
     pub models: ModelsConfig,
+    #[serde(default)]
+    pub grounding: GroundingConfig,
     pub policy: Policy,
     pub data: DataConfig,
+}
+
+impl Default for GroundingConfig {
+    fn default() -> Self {
+        Self {
+            backend: default_grounding_backend(),
+            endpoint: default_grounding_endpoint(),
+            min_conf: default_grounding_min_conf(),
+        }
+    }
 }
 
 impl Default for RoseConfig {
@@ -510,6 +548,7 @@ impl Default for RoseConfig {
                 endpoint: default_muse_endpoint(),
                 model: default_muse_model(),
             },
+            grounding: GroundingConfig::default(),
             policy: Policy::default(),
             data: DataConfig {
                 dir: "~/.local/share/rose".to_string(),

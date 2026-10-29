@@ -32,9 +32,13 @@ mkdir -p .pkg-stage/DEBIAN \
 
 cp -f "target/$TARGET/release/rosed" .pkg-stage/usr/bin/rosed
 chmod 755 .pkg-stage/usr/bin/rosed
-cp -f deploy/systemd/xvnc.service deploy/systemd/rosed.service .pkg-stage/usr/lib/systemd/user/
+cp -f deploy/systemd/xvnc.service deploy/systemd/rosed.service deploy/systemd/grounding.service .pkg-stage/usr/lib/systemd/user/
 chmod 644 .pkg-stage/usr/lib/systemd/user/*.service
 cp -f config/rose.example.toml .pkg-stage/usr/share/doc/rose/
+# Lite SoM grounding sidecar (no ML weights): unit runs it from here.
+mkdir -p .pkg-stage/usr/share/rose/grounding-worker
+cp -f grounding-worker/app.py grounding-worker/detector.py grounding-worker/requirements.txt grounding-worker/README.md .pkg-stage/usr/share/rose/grounding-worker/
+chmod 644 .pkg-stage/usr/share/rose/grounding-worker/*
 cat > .pkg-stage/usr/share/doc/rose/copyright <<'EOF'
 Rose - AI agent for an Ubuntu VM (XFCE over TigerVNC).
 Upstream: see repository. License: MIT OR Apache-2.0.

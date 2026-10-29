@@ -23,6 +23,18 @@ endpoint = "https://api.meta.ai/v1"
 # Contributor tier: low cost, one call per step.
 model = "muse-spark-1.3-contributor"
 
+[grounding]
+# SoM overlay parser: "omniparser" (grounding-worker sidecar) | "off" (raw
+# screenshots + legacy x,y clicks) | "fake" reserved for tests.
+# Lite contour parser runs on 4 CPU / 4 GB RAM (<500 MB RSS). Full
+# OmniParser V2 weights (icon_detect_v3 MIT + icon_caption MIT) can replace
+# the sidecar later behind the same POST /parse contract — no Rust changes.
+backend = "omniparser"
+endpoint = "http://127.0.0.1:8791"
+# Minimum element confidence 0..100; below this the overlay id is hidden
+# from the brain and the step falls back to raw pixels.
+min_conf = 5
+
 [policy]
 max_steps = 40
 max_minutes = 15

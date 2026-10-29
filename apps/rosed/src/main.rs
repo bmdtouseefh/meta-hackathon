@@ -9,10 +9,10 @@ mod shell;
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
 use clap::{Parser, Subcommand};
-use rose_core::{Action, Actor, DesktopBackend, Policy, RoseConfig, StepSummary, Target};
+use rose_core::{Action, Actor, DesktopBackend, Element, Policy, RoseConfig, StepSummary, Target};
 use rose_desktop_fake::FakeDesktop;
 use rose_desktop_x11::X11Desktop;
-use rose_models::{FakeBrain, ModelReply, MuseClient};
+use rose_models::{resolve_element, FakeBrain, GroundingClient, ModelReply, MuseClient};
 use rose_store::TraceStore;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -308,6 +308,9 @@ struct Stepper {
     env_key: Option<String>,
     endpoint: String,
     model: String,
+    grounding_backend: String,
+    grounding_endpoint: String,
+    grounding_min_conf: u32,
     policy: Policy,
     traces: Arc<TraceStore>,
     shell: shell::ShellRunner,
@@ -577,6 +580,7 @@ impl rose_web::StepRunner for Stepper {
         while idx < self.policy.max_steps {
             check_stop!(idx, acted);
             let mut seen_frame: Option<rose_core::Frame> = None;
+            let mut seen_elements: Option<Vec<Element>> = None;
             let brain_ms: u64;
             let reply = if !vision {
                 emit!(serde_json::json!({
@@ -717,6 +721,38 @@ impl rose_web::StepRunner for Stepper {
                 emit!(serde_json::json!({
                     "type": "thinking", "step": idx, "mode": "vision",
                 }));
+                // SoM grounding (same idx, never a separate step): parse the
+                // raw frame into numbered elements, send the *annotated* JPEG
+                // to the brain so it picks `element: N` instead of guessing
+                // x,y. A dead sidecar falls back to the raw screenshot.
+                let mut brain_jpeg = frame.jpeg.clone();
+                let mut grounded: Option<Vec<Element>> = None;
+                if self.grounding_backend == "omniparser" {
+                    match GroundingClient::new(&self.grounding_endpoint, self.grounding_min_conf) {
+                        Ok(client) => {
+                            let g_started = std::time::Instant::now();
+                            let overlay_opt =
+                                unless_stopped(&self.stop_flag, client.parse(&frame.jpeg))
+                                    .await
+                                    .flatten();
+                            if let Some(overlay) = overlay_opt {
+                                let ms = g_started.elapsed().as_millis() as u64;
+                                emit!(serde_json::json!({
+                                    "type": "grounded", "step": idx,
+                                    "elements": overlay.elements.len(),
+                                    "ms": ms, "parse_ms": overlay.parse_ms,
+                                }));
+                                if !overlay.elements.is_empty() {
+                                    brain_jpeg = overlay.annotated_jpeg.clone();
+                                    grounded = Some(overlay.elements);
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!(error = %e, "bad grounding config, using raw screenshot");
+                        }
+                    }
+                }
                 let brain_started = std::time::Instant::now();
                 // Awaited through unless_stopped: pressing Stop while the
                 // brain thinks abandons the call instead of acting on a
@@ -725,7 +761,7 @@ impl rose_web::StepRunner for Stepper {
                     match self.brain {
                         BrainSvc::Fake => self
                             .fake
-                            .next_action(goal, &history, &frame.jpeg)
+                            .next_action(goal, &history, &brain_jpeg)
                             .await
                             .map_err(|e| e.to_string()),
                         BrainSvc::Muse => match self
@@ -740,7 +776,7 @@ impl rose_web::StepRunner for Stepper {
                                     .map_err(|e| e.to_string())
                             }) {
                             Ok(client) => client
-                                .next_action(goal, &history, &frame.jpeg)
+                                .next_action(goal, &history, &brain_jpeg)
                                 .await
                                 .map_err(|e| e.to_string()),
                             Err(e) => Err(e),
@@ -764,6 +800,7 @@ impl rose_web::StepRunner for Stepper {
                 };
                 brain_ms = brain_started.elapsed().as_millis() as u64;
                 seen_frame = Some(frame);
+                seen_elements = grounded;
                 vision_reply
             };
             match reply {
@@ -791,6 +828,92 @@ impl rose_web::StepRunner for Stepper {
                     let frame = seen_frame
                         .take()
                         .expect("GUI actions are only handled after a vision step");
+                    // Same-idx SoM resolution: the brain picked `element: N`
+                    // from this step's overlay. Map it to a click point now.
+                    // Unknown ids replan (never blind-click); pixel replies
+                    // pass through untouched for fallback runs.
+                    let mut action = action;
+                    if let Some(elements) = seen_elements.take() {
+                        let resolve = |t: &Target| -> Option<Target> {
+                            match t {
+                                Target::Element(id) => resolve_element(&elements, &id.0)
+                                    .map(|(x, y)| Target::Point { x, y }),
+                                p => Some(p.clone()),
+                            }
+                        };
+                        let resolved = match &action {
+                            Action::Click { target, button } => {
+                                resolve(target).map(|target| Action::Click {
+                                    target,
+                                    button: *button,
+                                })
+                            }
+                            Action::DoubleClick { target } => {
+                                resolve(target).map(|target| Action::DoubleClick { target })
+                            }
+                            Action::Scroll { target, dy } => {
+                                resolve(target).map(|target| Action::Scroll { target, dy: *dy })
+                            }
+                            Action::Drag { from, to } => match (resolve(from), resolve(to)) {
+                                (Some(from), Some(to)) => Some(Action::Drag { from, to }),
+                                _ => None,
+                            },
+                            _ => Some(action.clone()),
+                        };
+                        match resolved {
+                            Some(a) => action = a,
+                            None => {
+                                let msg = "I picked an element number that is not on screen; choosing a different target".to_string();
+                                emit!(serde_json::json!({
+                                    "type": "rejected", "step": idx,
+                                    "action": describe_action(&action), "say": msg,
+                                }));
+                                history.push(StepSummary {
+                                    idx,
+                                    intent: format!(
+                                        "REJECTED unknown element in {}",
+                                        describe_action(&action)
+                                    ),
+                                    say: msg,
+                                });
+                                idx += 1;
+                                continue;
+                            }
+                        }
+                    } else {
+                        // Grounding was off (or the sidecar was down) and the
+                        // brain still replied `element: N`: nothing to map it
+                        // through, so replan with pixels instead of acting.
+                        let has_element = match &action {
+                            Action::Click { target, .. }
+                            | Action::DoubleClick { target }
+                            | Action::Scroll { target, .. } => {
+                                matches!(target, Target::Element(_))
+                            }
+                            Action::Drag { from, to } => {
+                                matches!(from, Target::Element(_))
+                                    || matches!(to, Target::Element(_))
+                            }
+                            _ => false,
+                        };
+                        if has_element {
+                            let msg = "I picked an element number but grounding is off; reply with x,y pixels instead".to_string();
+                            emit!(serde_json::json!({
+                                "type": "rejected", "step": idx,
+                                "action": describe_action(&action), "say": msg,
+                            }));
+                            history.push(StepSummary {
+                                idx,
+                                intent: format!(
+                                    "REJECTED element without overlay in {}",
+                                    describe_action(&action)
+                                ),
+                                say: msg,
+                            });
+                            idx += 1;
+                            continue;
+                        }
+                    }
                     mode_switches = 0;
                     let mut action_text = describe_action(&action);
                     if enter_after {
@@ -1299,6 +1422,9 @@ async fn main() -> Result<()> {
         env_key: services.api_keys.muse_api_key.clone(),
         endpoint: services.config.models.endpoint.clone(),
         model: services.config.models.model.clone(),
+        grounding_backend: services.config.grounding.backend.clone(),
+        grounding_endpoint: services.config.grounding.endpoint.clone(),
+        grounding_min_conf: services.config.grounding.min_conf,
         policy: services.config.policy.clone(),
         traces: Arc::clone(&services.traces),
         shell: shell::ShellRunner::new(services.config.desktop.display.clone()),
@@ -1409,6 +1535,9 @@ mod tests {
             env_key: None,
             endpoint: "https://api.meta.ai/v1".to_string(),
             model: "muse-spark-1.3-contributor".to_string(),
+            grounding_backend: "off".to_string(),
+            grounding_endpoint: "http://127.0.0.1:8791".to_string(),
+            grounding_min_conf: 5,
             policy: Policy::default(),
             traces: test_traces(),
             shell: shell::ShellRunner::new(":fake"),

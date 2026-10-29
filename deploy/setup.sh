@@ -272,7 +272,7 @@ EOF
   fi
 
   step "9/9 systemd --user units + lingering"
-  for unit in xvnc rosed; do
+  for unit in xvnc rosed grounding; do
     if [ ! -f "$SCRIPT_DIR/systemd/$unit.service" ]; then
       fail "missing $SCRIPT_DIR/systemd/$unit.service"
       fail "you copied setup.sh without its sibling systemd/ dir - copy the whole deploy/ folder, preserving structure:"
@@ -284,6 +284,7 @@ EOF
   mkdir -p "$HOME/.config/systemd/user"
   cp -f "$SCRIPT_DIR/systemd/xvnc.service" "$HOME/.config/systemd/user/xvnc.service"
   cp -f "$SCRIPT_DIR/systemd/rosed.service" "$HOME/.config/systemd/user/rosed.service"
+  cp -f "$SCRIPT_DIR/systemd/grounding.service" "$HOME/.config/systemd/user/grounding.service"
   ok "installed user units"
   run_step "9/9 daemon-reload" systemctl --user daemon-reload
   # Stale locks from a killed run make vncserver exit 1 on restart. Clean first.
@@ -299,6 +300,22 @@ EOF
     fi
   else
     warn "skipping rosed.service start (binary not installed yet)"
+  fi
+  step "10/10 grounding-worker (lite SoM parser, 4 CPU / 4 GB)"
+  if have python3 && [ -f "$REPO_ROOT/grounding-worker/requirements.txt" ]; then
+    export PATH="$HOME/.local/bin:$PATH"
+    have uv || curl -LsSf https://astral.sh/uv/install.sh | sh
+    export PATH="$HOME/.local/bin:$PATH"
+    VENV="$HOME/.local/share/rose/grounding-venv"
+    info "\$ uv venv + uv pip install -r grounding-worker/requirements.txt"
+    if uv venv "$VENV" 2>&1 | tee -a "$LOG_FILE" | sed 's/^/  | /' \
+      && uv pip install --python "$VENV/bin/python" -r "$REPO_ROOT/grounding-worker/requirements.txt" 2>&1 | tee -a "$LOG_FILE" | sed 's/^/  | /'; then
+      run_step "10/10 enable+start grounding" systemctl --user enable --now grounding.service
+    else
+      warn "grounding-worker uv install failed - grounding backend stays off (config grounding.backend)"
+    fi
+  else
+    warn "skipping grounding-worker (no python3 or no grounding-worker/requirements.txt)"
   fi
 
   say ""

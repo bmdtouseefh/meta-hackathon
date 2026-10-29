@@ -5,7 +5,9 @@
 //! lives in [`spark`]; [`fake`] is the scripted test double.
 
 pub mod fake;
+pub mod grounding;
 pub mod spark;
 
 pub use fake::FakeBrain;
+pub use grounding::{resolve_element, GroundedOverlay, GroundingClient};
 pub use spark::{ModelReply, MuseClient};

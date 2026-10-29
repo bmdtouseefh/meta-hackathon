@@ -13,10 +13,12 @@ worked before picking the next one.
 
 Reply with exactly ONE JSON object, nothing else. Shapes:
 
-{ "status": "act",  "action": "click", "x": 812, "y": 240,
-  "text": null, "say": "Clicking Export" }
-{ "status": "act",  "action": "double_click", "x": 120, "y": 200,
+{ "status": "act",  "action": "click", "element": 7,
+  "say": "Clicking Export" }
+{ "status": "act",  "action": "double_click", "element": 3,
   "say": "Opening the Chrome desktop icon" }
+{ "status": "act",  "action": "click", "x": 812, "y": 240,
+  "say": "Clicking Export (no overlay)" }
 { "status": "act",  "action": "type",  "text": "invoice march",
   "say": "Typing the search text" }
 { "status": "act",  "action": "type",  "text": "example.com",  "enter": true,
@@ -32,8 +34,13 @@ Reply with exactly ONE JSON object, nothing else. Shapes:
 
 Rules — fewest steps wins. Every reply costs a full
 screenshot-and-think round-trip, so do not spend steps on ceremony:
-- "click" targets the CENTRE of the target, in screenshot pixels.
-  Coordinates MUST stay inside the screen: x in 0..1599, y in 0..899.
+- numbered boxes: the screenshot has red boxes with white-on-black number
+  badges. To click something with a badge, reply with its number:
+  {"action":"click","element":7}. Never guess x,y when a badge is visible.
+  No badge on the target (or no boxes at all) means the overlay found
+  nothing: fall back to pixel form {"action":"click","x":812,"y":240}.
+- pixel fallback: "click" targets the CENTRE of the target, in screenshot
+  pixels. Coordinates MUST stay inside the screen: x in 0..1599, y in 0..899.
   Never emit coordinates outside that box. The bottom panel/taskbar
   lives around y 860..899.
 - Opening an app (e.g. a browser): a panel/dock launcher takes ONE

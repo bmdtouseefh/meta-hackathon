@@ -1,0 +1,276 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Rose — clean draft</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<script>
+  tailwind.config = { darkMode: 'class' };
+  const stored = localStorage.getItem('rose-theme')
+    || (matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light');
+  if (stored === 'dark') document.documentElement.classList.add('dark');
+  function toggleTheme() {
+    const dark = document.documentElement.classList.toggle('dark');
+    localStorage.setItem('rose-theme', dark ? 'dark' : 'light');
+  }
+  function toggleDesktop() {
+    // Shows / hides the live-desktop panel (right side, view-only).
+    document.getElementById('desk-panel').classList.toggle('hidden');
+  }
+  function toggleSetup(open) {
+    const m = document.getElementById('setup-modal');
+    m.classList.toggle('hidden', !open);
+    m.classList.toggle('flex', !!open);
+    if (open) setTimeout(() => document.getElementById('api-key')?.focus(), 50);
+  }
+  function toggleRuns() {
+    // Rail mode: sidebar collapses to a slim strip, the ☰ stays exactly
+    // where it was (top-left, above New chat). Nothing unmounts.
+    document.getElementById('chat-sidebar').classList.toggle('rail');
+  }
+</script>
+<style>
+  /* — Automated theme wrapper: light + dark via CSS vars — */
+  :root {
+    --bg: #f7f7f8;
+    --ink: #1a1a1e;
+    --muted: #6f6f78;
+    --card: #ffffff;
+    --line: #e5e5ea;
+    --accent: #0064E0;
+    --accent-ink: #ffffff;
+    --bubble-rose: #ffffff;
+    --bubble-mine: #0064E0;
+    --shadow: 0 1px 2px rgba(0,0,0,.06);
+  }
+  .dark {
+    --bg: #131316;
+    --ink: #ececef;
+    --muted: #a1a1aa;
+    --card: #1c1c21;
+    --line: #2c2c33;
+    --accent: #4f8cff;
+    --accent-ink: #ffffff;
+    --bubble-rose: #1c1c21;
+    --bubble-mine: #4f8cff;
+    --shadow: 0 1px 2px rgba(0,0,0,.4);
+  }
+  html, body { height: 100%; overscroll-behavior: none; }
+  body { overflow: hidden; background: var(--bg); color: var(--ink); }
+  .card { background: var(--card); border: 1px solid var(--line); box-shadow: var(--shadow); }
+  .muted { color: var(--muted); }
+  .btn-accent { background: var(--accent); color: var(--accent-ink); transition: filter .12s ease; }
+  .btn-accent:hover { filter: brightness(1.08); }
+  .btn-ghost { border: 1px solid var(--line); background: var(--card); transition: background .12s ease; }
+  .btn-ghost:hover { background: var(--line); }
+  .bubble-mine { background: var(--bubble-mine); color: #fff; }
+  .bubble-rose { background: var(--bubble-rose); border: 1px solid var(--line); }
+  #thread, #chat-list, #desk-panel { overscroll-behavior: contain; }
+  #thread { scrollbar-gutter: stable; }
+  /* Sidebar rail mode: collapse to a slim strip, ☰ stays put top-left */
+  #chat-sidebar { transition: width .18s ease; }
+  aside#chat-sidebar.rail { width: 3.5rem; }
+  #chat-sidebar.rail .rail-hide { display: none; }
+  #chat-sidebar.rail .rail-top { padding: .75rem .5rem 0; }
+  .thin-scroll::-webkit-scrollbar { width: .45rem; }
+  .thin-scroll::-webkit-scrollbar-thumb { background: var(--line); border-radius: 999px; }
+  /* Typographic scale: hierarchy through weight, fluid sizes */
+  .t-display { font-weight: 700; font-size: clamp(1.05rem, 1rem + .6vw, 1.25rem); line-height: 1.3; letter-spacing: -.01em; }
+  .t-title { font-weight: 650; font-size: clamp(.92rem, .88rem + .3vw, 1rem); line-height: 1.4; }
+  .t-body { font-weight: 400; font-size: clamp(.875rem, .84rem + .2vw, .94rem); line-height: 1.55; }
+  .t-caption { font-weight: 500; font-size: clamp(.72rem, .7rem + .15vw, .78rem); line-height: 1.5; }
+</style>
+</head>
+
+<body class="t-body m-0 flex h-[100dvh] flex-col overflow-hidden font-sans">
+
+<!-- ══ header: fixed ══ -->
+<header class="z-10 flex-none border-b py-2" style="border-color:var(--line);background:var(--card)">
+  <div class="flex w-full flex-wrap items-center gap-2 px-2">
+    <span class="t-display">Rose</span>
+    <span id="status-pill" aria-hidden="true" class="flex items-center gap-2 rounded-full border px-3 py-1" style="display:none;border-color:var(--line)">
+      <span id="status-dot" class="inline-block size-2 rounded-full bg-emerald-500"></span>
+      <span id="status-text" class="t-caption">connecting…</span>
+    </span>
+    <span class="flex-1"></span>
+    <span id="backend-text" class="muted t-caption hidden sm:block"></span>
+    <button onclick="toggleTheme()" title="Toggle light/dark" class="btn-ghost rounded-lg px-2.5 py-1.5">◐</button>
+    <button onclick="toggleSetup(true)" title="Setup: API keys and brain" class="btn-ghost rounded-lg px-3 py-1.5">Setup</button>
+    <button onclick="toggleDesktop()" title="Show or hide the live desktop preview (right panel, view-only)" class="btn-ghost rounded-lg px-3 py-1.5">Desktop</button>
+    <button id="stop" onclick="window.stopRun && stopRun()" disabled title="Stop the current run" class="rounded-lg bg-red-600 px-3.5 py-1.5 font-semibold text-white disabled:opacity-40">Stop</button>
+  </div>
+</header>
+
+<!-- ══ app shell: full-bleed, fixed height, only #thread scrolls the story ══ -->
+<div class="z-10 flex min-h-0 w-full flex-1 gap-px overflow-hidden" style="background:var(--line)">
+
+  <!-- chat history sidebar -->
+  <aside id="chat-sidebar" class="card flex w-[clamp(12rem,15%,16rem)] flex-none flex-col overflow-hidden rounded-none min-h-0" style="border:0">
+    <div class="rail-top flex-none p-3">
+      <div class="flex items-center">
+        <button onclick="toggleRuns()" title="Collapse chat history" class="btn-ghost rounded-lg px-2.5 py-1.5">☰</button>
+      </div>
+      <button onclick="newChat()" title="Start a new chat"
+        class="rail-hide btn-accent mt-2 w-full rounded-lg px-3 py-2 text-sm font-semibold">New chat</button>
+      <input id="chat-search" type="search" placeholder="Search chats…" oninput="refreshChats()"
+        class="rail-hide mt-2 w-full rounded-lg border bg-transparent px-3 py-1.5 text-sm outline-none" style="border-color:var(--line)" aria-label="Search chats">
+    </div>
+    <div class="rail-hide muted t-caption flex-none px-3 pb-1">History</div>
+    <div id="chat-list" class="rail-hide thin-scroll flex min-h-0 flex-1 flex-col gap-1 overflow-y-auto p-3 pt-1" role="list">
+      <div class="muted text-xs">loading…</div>
+    </div>
+  </aside>
+
+  <!-- conversation: equal half with the desktop panel, layout-contained so sidebar toggles can't reflow it -->
+  <main class="card flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden rounded-none" style="border:0;contain:layout style">
+    <div class="flex-none border-b px-5 py-4" style="border-color:var(--line)">
+      <div class="mx-auto w-full max-w-[42rem]">
+        <div class="t-title">What should Rose do?</div>
+        <div class="muted text-sm">Describe the goal — Rose narrates each step and pauses before anything irreversible.</div>
+      </div>
+    </div>
+
+    <!-- THE scroll area: fixed 42rem measure, centered — sidebar state can't move it -->
+    <div id="thread" class="thin-scroll mx-auto flex min-h-0 w-full max-w-[42rem] flex-1 flex-col gap-4 overflow-y-auto px-4 py-6">
+      <div id="live-tail" class="contents"></div>
+    </div>
+
+    <!-- composer: fixed -->
+    <div class="flex-none border-t px-5 py-4" style="border-color:var(--line)">
+      <div class="mx-auto flex w-full max-w-[42rem] items-end gap-2 rounded-xl border px-3 py-2" style="border-color:var(--line);background:var(--bg)">
+        <textarea id="composer" rows="2" placeholder="Tell Rose what to do…"
+          class="max-h-[30vh] min-h-[2.75rem] w-full flex-1 resize-none bg-transparent text-sm outline-none placeholder:opacity-60"></textarea>
+        <button onclick="window.send ? send() : mockSend()" class="btn-accent flex-none rounded-lg px-5 py-2 font-semibold">Run</button>
+      </div>
+      <div id="queue-note" class="muted mx-auto mt-1.5 w-full max-w-[42rem] text-xs">Rose replies with a short summary when a run ends — expand Details for the step-by-step trail.</div>
+    </div>
+  </main>
+
+  <!-- desktop: equal half with the chat, live view-only, toggled by the Desktop button -->
+  <aside id="desk-panel" class="card flex min-h-0 min-w-0 flex-1 flex-col overflow-y-auto rounded-none p-5" style="border:0;contain:layout style">
+    <div class="mb-2 flex items-center justify-between">
+      <span class="t-title">Live desktop <span id="display-name" class="muted text-xs font-medium"></span></span>
+      <span class="rounded bg-red-600 px-2 py-0.5 text-xs font-semibold text-white">VIEW-ONLY</span>
+    </div>
+    <div class="overflow-hidden rounded-lg border bg-black" style="border-color:var(--line)">
+      <img id="frame" alt="live desktop" class="hidden w-full">
+      <div id="frame-note" class="muted p-4 text-center text-xs">Waiting for backend frames…</div>
+    </div>
+    <p class="muted mt-2 text-xs">Exactly what Rose sees. Take Control routes input through the same audited path (T1.4).</p>
+    <button disabled title="Take Control lands in T1.4 (lease)" class="btn-ghost mt-2 w-full rounded-lg px-3 py-2 font-semibold opacity-60">Take Control</button>
+  </aside>
+</div>
+
+<!-- setup modal -->
+<div id="setup-modal" class="fixed inset-0 z-20 hidden items-center justify-center bg-black/50 p-4">
+  <div class="card w-full max-w-[min(28rem,94%)] rounded-xl p-6">
+    <h2 class="t-display">Setup</h2>
+    <p class="muted mt-1 text-xs">Keys live in server memory for this session only — never written to disk, logs, or traces.</p>
+    <label class="t-title mt-4 block text-sm" for="api-key">Muse API key</label>
+    <input id="api-key" type="password" autocomplete="off" placeholder="sk-…"
+      class="mt-1 w-full rounded-lg border bg-transparent px-3 py-2 text-sm outline-none" style="border-color:var(--line)">
+    <div class="mt-1.5 text-xs"><span id="key-state" class="font-semibold text-red-500">missing</span> <span class="muted">· brain: <span class="font-semibold">muse</span> (fake needs no key)</span></div>
+    <div class="mt-4 flex flex-wrap justify-end gap-2">
+      <button onclick="window.clearKey ? clearKey() : null" class="btn-ghost rounded-lg px-4 py-2 font-semibold">Clear</button>
+      <button onclick="toggleSetup(false)" class="btn-ghost rounded-lg px-4 py-2 font-semibold">Cancel</button>
+      <button onclick="window.saveKey ? saveKey() : toggleSetup(false)" class="btn-accent rounded-lg px-5 py-2 font-semibold">Save</button>
+    </div>
+  </div>
+</div>
+
+<script>
+  // Preview mock so the draft is clickable without a backend.
+  // Real wiring: replace this block with <script src="/app.js"><\/script> — IDs match.
+  document.getElementById('setup-modal').addEventListener('click', e => {
+    if (e.target.id === 'setup-modal') toggleSetup(false);
+  });
+  const MOCK_CHATS = [
+    { id: 'c1', title: 'Pay the March invoice', state: 'done', turns: 3, steps: 7, when: 'today' },
+    { id: 'c2', title: 'Export March invoices', state: 'done', turns: 2, steps: 5, when: 'yesterday' },
+    { id: 'c3', title: 'Move PDFs to folder', state: 'waiting_approval', turns: 1, steps: 4, when: 'yesterday' },
+    { id: 'c4', title: 'Check calendar invites', state: 'failed', turns: 1, steps: 2, when: 'last week' },
+  ];
+  const STATE_ICON = { done: '✓', finished: '✓', failed: '✗', stopped: '■', waiting_approval: '●', running: '▶' };
+  let selectedChat = 'c1';
+  function refreshChats() {
+    const list = document.getElementById('chat-list');
+    const q = (document.getElementById('chat-search')?.value || '').toLowerCase();
+    list.replaceChildren();
+    const chats = MOCK_CHATS.filter(c => !q || c.title.toLowerCase().includes(q));
+    if (!chats.length) {
+      const d = document.createElement('div');
+      d.className = 'muted px-2 py-3 text-center text-xs';
+      d.textContent = q ? 'No chats match your search.' : 'No chats yet — start one with New chat.';
+      list.appendChild(d);
+      return;
+    }
+    for (const chat of chats) {
+      const active = chat.id === selectedChat;
+      const item = document.createElement('button');
+      item.type = 'button';
+      item.setAttribute('role', 'listitem');
+      item.className = 'w-full rounded-lg px-3 py-2 text-left ' + (active ? 'text-white' : '');
+      item.style.cssText = active
+        ? 'background:var(--accent)'
+        : 'border:1px solid var(--line);background:transparent';
+      const title = document.createElement('div');
+      title.className = 'text-sm font-semibold leading-snug';
+      title.textContent = `${STATE_ICON[chat.state] || '•'} ${chat.title}`;
+      const meta = document.createElement('div');
+      meta.className = 'text-xs ' + (active ? 'opacity-80' : 'muted');
+      meta.textContent = `${chat.turns} turn${chat.turns === 1 ? '' : 's'} · ${chat.steps} steps · ${chat.when}`;
+      item.append(title, meta);
+      item.onclick = () => openChat(chat.id);
+      list.appendChild(item);
+    }
+  }
+  function openChat(id) {
+    selectedChat = id;
+    document.getElementById('live-tail').replaceChildren();
+    const chat = MOCK_CHATS.find(c => c.id === id);
+    mockBubble(chat ? chat.title : 'New chat', true);
+    mockBubble('This is a preview of that conversation.', false);
+    refreshChats();
+  }
+  function newChat() {
+    selectedChat = null;
+    document.getElementById('live-tail').replaceChildren();
+    mockBubble('New conversation started. What should Rose do?', false);
+    refreshChats();
+    document.getElementById('composer')?.focus();
+  }
+  function mockBubble(text, mine) {
+    const tail = document.getElementById('live-tail');
+    const d = document.createElement('div');
+    if (mine) {
+      d.className = 'bubble-mine self-end max-w-[85%] rounded-2xl rounded-br-md px-3.5 py-2 text-sm';
+      d.textContent = text;
+    } else {
+      d.className = 'bubble-rose self-start max-w-[90%] rounded-2xl rounded-tl-md px-3.5 py-2 text-sm';
+      d.textContent = text;
+    }
+    tail.appendChild(d);
+    d.scrollIntoView({ block: 'nearest' });
+  }
+  function mockSend() {
+    const box = document.getElementById('composer');
+    const v = box.value.trim();
+    if (!v) return;
+    mockBubble(v, true);
+    box.value = '';
+    setTimeout(() => mockBubble('Working on: ' + v.slice(0, 80), false), 500);
+  }
+  document.getElementById('composer').addEventListener('keydown', e => {
+    if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); (window.send || mockSend)(); }
+  });
+  document.addEventListener('keydown', e => { if (e.key === 'Escape') toggleSetup(false); });
+  if (matchMedia('(max-width: 1023px)').matches) document.getElementById('desk-panel').classList.add('hidden');
+  refreshChats();
+  mockBubble('Pay the March invoice from Example Ltd', true);
+  mockBubble('The March invoices are visible. Heading for INV-2041 · $42.00.', false);
+  document.getElementById('status-text').textContent = 'Idle · :1 · brain=muse';
+  document.getElementById('backend-text').textContent = 'clean draft · preview only';
+</script>
+</body>
+</html>

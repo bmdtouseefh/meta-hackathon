@@ -1,0 +1,11 @@
+fastapi==0.115.*
+uvicorn==0.30.*
+# NOTE: lower bounds need cp314 wheels (VM runs Python 3.14).
+pillow>=11.3
+opencv-python-headless>=4.11
+numpy>=2.0
+# NOTE: no torch / transformers / ultralytics here on purpose.
+# This lite parser runs on 4 CPU / 4 GB RAM (RSS < 500 MB, ~200-500 ms
+# per 1600x900 frame). Full OmniParser V2 weights need ~6-8 GB + GPU;
+# when that hardware exists, swap this service for the V2 weights
+# behind the same POST /parse contract — no Rust changes needed.

@@ -1,0 +1,19 @@
+[Unit]
+Description=rose-grounding - lite SoM overlay parser (127.0.0.1:8791)
+After=network.target
+
+[Service]
+Type=simple
+# Lite contour parser: <500 MB RSS on 4 CPU / 4 GB RAM.
+# Full OmniParser V2 weights can replace grounding-worker/ later behind the
+# same POST /parse contract.
+WorkingDirectory=/usr/share/rose/grounding-worker
+Environment=OMP_NUM_THREADS=2
+Environment=OPENBLAS_NUM_THREADS=2
+# uv venv (per-user, PEP 668 clean). Deploy/setup creates it at install.
+ExecStart=%h/.local/share/rose/grounding-venv/bin/python -m uvicorn app:app --host 127.0.0.1 --port 8791 --workers 1
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=default.target

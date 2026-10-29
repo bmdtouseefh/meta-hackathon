@@ -6,7 +6,7 @@
 //! retry 429/5xx with backoff, never retry 400.
 
 use base64::Engine;
-use rose_core::{Action, MouseButton, Result, RoseError, StepSummary, Target};
+use rose_core::{Action, ElementId, MouseButton, Result, RoseError, StepSummary, Target};
 use serde::Deserialize;
 
 /// The §6 reply: one JSON object, nothing else.
@@ -53,6 +53,7 @@ struct RawReply {
     action: Option<String>,
     x: Option<u32>,
     y: Option<u32>,
+    element: Option<serde_json::Value>,
     text: Option<String>,
     dy: Option<i32>,
     ms: Option<u32>,
@@ -87,15 +88,31 @@ pub fn parse_reply(text: &str) -> Result<ModelReply> {
             let action = raw.action.as_deref().unwrap_or("");
             match action {
                 "click" | "double_click" => {
-                    let (x, y) = match (raw.x, raw.y) {
-                        (Some(x), Some(y)) => (x, y),
-                        _ => {
-                            return Err(RoseError::Model(
-                                "click/double_click needs x and y".to_string(),
-                            ))
+                    // SoM path (preferred when grounding overlay is on):
+                    // {"action":"click","element":7}. Legacy pixel path
+                    // ({"x":812,"y":240}) still parses for fallback runs.
+                    let target = match &raw.element {
+                        Some(v) => {
+                            let s = if let Some(n) = v.as_u64() {
+                                n.to_string()
+                            } else if let Some(s) = v.as_str() {
+                                s.to_string()
+                            } else {
+                                return Err(RoseError::Model(
+                                    "click element must be a number or string".to_string(),
+                                ));
+                            };
+                            Target::Element(ElementId(s))
                         }
+                        None => match (raw.x, raw.y) {
+                            (Some(x), Some(y)) => Target::Point { x, y },
+                            _ => {
+                                return Err(RoseError::Model(
+                                    "click/double_click needs element or x and y".to_string(),
+                                ))
+                            }
+                        },
                     };
-                    let target = Target::Point { x, y };
                     let action = if action == "click" {
                         Action::Click {
                             target,
@@ -391,6 +408,39 @@ mod tests {
             parse_reply(r#"{"status":"fail","say":"Nope"}"#).unwrap(),
             ModelReply::Fail { .. }
         ));
+    }
+
+    #[test]
+    fn parses_element_clicks() {
+        // SoM path: the brain picks an overlay number, Rust maps it later.
+        let e =
+            parse_reply(r#"{"status":"act","action":"click","element":7,"say":"Clicking Export"}"#)
+                .expect("element click");
+        if let ModelReply::Act { action, .. } = e {
+            assert_eq!(
+                action,
+                Action::Click {
+                    target: Target::Element(ElementId("7".to_string())),
+                    button: MouseButton::Left,
+                }
+            );
+        } else {
+            panic!("want act");
+        }
+        let s = parse_reply(
+            r#"{"status":"act","action":"double_click","element":"e-3","say":"Opening"}"#,
+        )
+        .expect("element double_click");
+        assert!(matches!(
+            s,
+            ModelReply::Act {
+                action: Action::DoubleClick { .. },
+                ..
+            }
+        ));
+        // Legacy pixels still parse for fallback runs.
+        assert!(parse_reply(r#"{"status":"act","action":"click","x":1,"y":2,"say":"p"}"#).is_ok());
+        assert!(parse_reply(r#"{"status":"act","action":"click","say":"no target"}"#).is_err());
     }
 
     #[test]
