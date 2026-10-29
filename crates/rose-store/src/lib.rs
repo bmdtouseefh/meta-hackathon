@@ -674,6 +674,15 @@ impl TraceRun {
         std::fs::write(self.root.join(&self.run_id).join(&name), jpeg)?;
         Ok(name)
     }
+
+    /// Save the SoM-annotated screenshot the brain actually decided on
+    /// (red boxes + number badges). Raw `step-NNN.jpg` stays untouched so
+    /// replays can show both; the `grounded` event references this file.
+    pub fn save_grounded_frame(&self, step: u32, jpeg: &[u8]) -> std::io::Result<String> {
+        let name = format!("step-{step:03}-grounded.jpg");
+        std::fs::write(self.root.join(&self.run_id).join(&name), jpeg)?;
+        Ok(name)
+    }
 }
 
 #[cfg(test)]

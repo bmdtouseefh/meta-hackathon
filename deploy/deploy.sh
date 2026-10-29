@@ -38,21 +38,27 @@ echo "-- grounding-worker deps + unit (lite SoM parser, 4 CPU / 4 GB, uv venv)"
 export PATH="$HOME/.local/bin:$PATH"
 command -v uv >/dev/null 2>&1 || curl -LsSf https://astral.sh/uv/install.sh | sh
 export PATH="$HOME/.local/bin:$PATH"
+sudo apt install -y tesseract-ocr tesseract-ocr-eng
 VENV="$HOME/.local/share/rose/grounding-venv"
 uv venv "$VENV" 2>/dev/null || true
 uv pip install --python "$VENV/bin/python" -r /usr/share/rose/grounding-worker/requirements.txt
 cp -f /usr/lib/systemd/user/grounding.service ~/.config/systemd/user/grounding.service
 # Existing config.toml is never overwritten by rosed install, so enable the
-# overlay here (idempotent): add [grounding] or flip backend to omniparser.
+# overlay here (idempotent). Section-aware: only touch [grounding].
 python3 - <<'PY'
-import pathlib
+import pathlib, re
 p = pathlib.Path.home() / ".config/rose/config.toml"
 text = p.read_text() if p.exists() else ""
-if "[grounding]" not in text:
+m = re.search(r"(?m)^\[grounding\][^\[]*", text)
+if m is None:
     text += '\n[grounding]\nbackend = "omniparser"\nendpoint = "http://127.0.0.1:8791"\nmin_conf = 5\n'
 else:
-    import re
-    text = re.sub(r'^backend\s*=\s*"[^"]*"', 'backend = "omniparser"', text, count=1, flags=re.M)
+    block = m.group(0)
+    if re.search(r'(?m)^backend\s*=', block):
+        block = re.sub(r'(?m)^backend\s*=.*', 'backend = "omniparser"', block, count=1)
+    else:
+        block = block.rstrip("\n") + '\nbackend = "omniparser"\n'
+    text = text[:m.start()] + block + text[m.end():]
 p.parent.mkdir(parents=True, exist_ok=True)
 p.write_text(text)
 PY

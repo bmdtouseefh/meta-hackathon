@@ -186,7 +186,8 @@ cmd_install() {
   run_step "1/9 apt packages (install)" sudo apt install -y \
     xfce4 tigervnc-standalone-server dbus-x11 x11-xserver-utils \
     ffmpeg fonts-liberation fonts-dejavu curl git \
-    build-essential pkg-config libssl-dev sqlite3
+    build-essential pkg-config libssl-dev sqlite3 \
+    tesseract-ocr tesseract-ocr-eng
 
   step "2/9 Google Chrome (.deb, not snap)"
   if have google-chrome; then
