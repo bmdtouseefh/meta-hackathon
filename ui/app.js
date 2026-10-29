@@ -5,11 +5,11 @@ const threadEl = () => document.getElementById("live-tail");
 function bubble(html, mine) {
   const d = document.createElement("div");
   if (mine) {
-    d.className = "self-end max-w-[85%] px-[2%] py-2 rounded-2xl rounded-br-sm bg-[#0064E0] text-white";
+    d.className = "bubble-mine self-end max-w-[85%] px-[2%] py-2 rounded-2xl rounded-br-sm";
     d.textContent = html;
   } else {
     d.className = "self-start max-w-[90%] flex gap-2";
-    d.innerHTML = `<span class="flex-none">🌌</span><div class="px-[2%] py-2 rounded-2xl rounded-tl-sm bg-neutral-100 dark:bg-neutral-800">${html}</div>`;
+    d.innerHTML = `<span class="flex-none">🌌</span><div class="bubble-rose px-[2%] py-2 rounded-2xl rounded-tl-sm">${html}</div>`;
   }
   threadEl().appendChild(d);
   d.scrollIntoView({ block: "nearest" });
@@ -67,7 +67,7 @@ function sayBubble(text) {
   icon.textContent = "🌌";
   const body = document.createElement("div");
   body.className =
-    "px-[2%] py-2 rounded-2xl rounded-tl-sm bg-neutral-100 dark:bg-neutral-800";
+    "bubble-rose px-[2%] py-2 rounded-2xl rounded-tl-sm";
   body.textContent = text;
   d.append(icon, body);
   threadEl().appendChild(d);
@@ -84,7 +84,7 @@ function createRunCard(goal) {
   wrap.className = "self-start w-full max-w-[90%] flex gap-2";
   const card = document.createElement("div");
   card.className =
-    "flex-1 px-[2%] py-2 rounded-2xl rounded-tl-sm bg-neutral-100 dark:bg-neutral-800";
+    "bubble-rose flex-1 px-[2%] py-2 rounded-2xl rounded-tl-sm";
   const head = document.createElement("div");
   head.className = "font-semibold text-sm flex items-center gap-2";
   const dot = document.createElement("span");
@@ -101,7 +101,7 @@ function createRunCard(goal) {
   // chose a state themselves) so the chat stays readable.
   const toggle = document.createElement("button");
   toggle.className =
-    "px-2 py-0.5 rounded border border-neutral-300 dark:border-neutral-600 text-xs font-medium flex-none";
+    "px-2 py-0.5 rounded-lg btn-ghost text-xs font-medium flex-none";
   toggle.type = "button";
   head.append(dot, title, elapsed, spacer, toggle);
   const steps = document.createElement("div");
@@ -430,10 +430,12 @@ async function refreshChats() {
       const active = chat.chat_id === selectedChat;
       const item = document.createElement("div");
       item.className =
-        "group w-full rounded-xl flex items-start gap-1 px-[4%] py-2 " +
+        "group w-full rounded-lg border flex items-start gap-1 px-[4%] py-2 " +
         (active
-          ? "bg-[#0064E0] text-white"
+          ? "text-white"
           : "hover:bg-neutral-100 dark:hover:bg-neutral-800");
+      if (active) item.style.background = "var(--accent)";
+      else item.style.borderColor = "var(--line)";
       const main = document.createElement("button");
       main.type = "button";
       main.className = "flex-1 text-left flex flex-col gap-0.5 min-w-0";

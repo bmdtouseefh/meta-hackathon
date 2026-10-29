@@ -1,5 +1,6 @@
 fastapi==0.115.*
 uvicorn==0.30.*
+pytesseract==0.3.*
 # NOTE: lower bounds need cp314 wheels (VM runs Python 3.14).
 pillow>=11.3
 opencv-python-headless>=4.11

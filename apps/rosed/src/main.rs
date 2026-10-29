@@ -737,10 +737,29 @@ impl rose_web::StepRunner for Stepper {
                                     .flatten();
                             if let Some(overlay) = overlay_opt {
                                 let ms = g_started.elapsed().as_millis() as u64;
+                                // Persist what the brain is about to see so a
+                                // trace replay shows the badges, not just the
+                                // raw frame (`step-NNN.jpg` stays raw).
+                                let grounded_file =
+                                    trace.as_ref().and_then(|run| {
+                                        run.save_grounded_frame(idx, &overlay.annotated_jpeg)
+                                        .map_err(|e| tracing::warn!(run_id = %run_id, error = %e, "grounded frame save failed"))
+                                        .ok()
+                                    });
+                                // First labels help judge overlay quality from
+                                // the trace alone (cap: full list is in the
+                                // sidecar response, not the chat feed).
+                                let labels: Vec<String> = overlay
+                                    .elements
+                                    .iter()
+                                    .take(8)
+                                    .map(|e| format!("{}:{}", e.id.0, e.label))
+                                    .collect();
                                 emit!(serde_json::json!({
                                     "type": "grounded", "step": idx,
                                     "elements": overlay.elements.len(),
                                     "ms": ms, "parse_ms": overlay.parse_ms,
+                                    "frame": grounded_file, "labels": labels,
                                 }));
                                 if !overlay.elements.is_empty() {
                                     brain_jpeg = overlay.annotated_jpeg.clone();

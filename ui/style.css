@@ -1,8 +1,52 @@
-/* Tailwind covers layout; only true customs live here. */
+/* Automated theme wrapper: light + dark via CSS vars. Layout stays in Tailwind. */
+:root {
+  --bg: #f7f7f8;
+  --ink: #1a1a1e;
+  --muted: #6f6f78;
+  --card: #ffffff;
+  --line: #e5e5ea;
+  --accent: #0064E0;
+  --accent-ink: #ffffff;
+  --shadow: 0 1px 2px rgba(0,0,0,.06);
+}
+.dark {
+  --bg: #131316;
+  --ink: #ececef;
+  --muted: #a1a1aa;
+  --card: #1c1c21;
+  --line: #2c2c33;
+  --accent: #4f8cff;
+  --accent-ink: #ffffff;
+  --shadow: 0 1px 2px rgba(0,0,0,.4);
+}
 html, body { height: 100%; overscroll-behavior: none; }
-body { overflow: hidden; }
+body { overflow: hidden; background: var(--bg); color: var(--ink); }
 #thread, #chat-list, #desk-panel { overscroll-behavior: contain; }
 #thread { scrollbar-gutter: stable; }
 #frame { image-rendering: auto; }
 #status-dot.running { background: #0f7b4d; }
 #status-dot.waiting { background: #9a6206; }
+
+.card { background: var(--card); border: 1px solid var(--line); box-shadow: var(--shadow); }
+.muted { color: var(--muted); }
+.btn-accent { background: var(--accent); color: var(--accent-ink); transition: filter .12s ease; }
+.btn-accent:hover { filter: brightness(1.08); }
+.btn-ghost { border: 1px solid var(--line); background: var(--card); transition: background .12s ease; }
+.btn-ghost:hover { background: var(--line); }
+.bubble-mine { background: var(--accent); color: #fff; }
+.bubble-rose { background: var(--card); border: 1px solid var(--line); }
+
+.thin-scroll::-webkit-scrollbar { width: .45rem; }
+.thin-scroll::-webkit-scrollbar-thumb { background: var(--line); border-radius: 999px; }
+
+/* Sidebar rail mode: collapse to a slim strip, ☰ stays put top-left */
+#chat-sidebar { transition: width .18s ease; }
+aside#chat-sidebar.rail { width: 3.5rem; }
+#chat-sidebar.rail .rail-hide { display: none; }
+#chat-sidebar.rail .rail-top { padding: .75rem .5rem 0; }
+
+/* Typographic scale: hierarchy through weight, fluid sizes */
+.t-display { font-weight: 700; font-size: clamp(1.05rem, 1rem + .6vw, 1.25rem); line-height: 1.3; letter-spacing: -.01em; }
+.t-title { font-weight: 650; font-size: clamp(.92rem, .88rem + .3vw, 1rem); line-height: 1.4; }
+.t-body { font-weight: 400; font-size: clamp(.875rem, .84rem + .2vw, .95rem); line-height: 1.55; }
+.t-caption { font-weight: 500; font-size: clamp(.72rem, .7rem + .15vw, .8rem); line-height: 1.5; }

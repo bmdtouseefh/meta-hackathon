@@ -15,6 +15,7 @@
     localStorage.setItem('rose-theme', dark ? 'dark' : 'light');
   }
   function toggleDesktop() {
+    // Shows / hides the live-desktop panel (right side, view-only).
     document.getElementById('desk-panel').classList.toggle('hidden');
   }
   function toggleSetup(open) {
@@ -22,91 +23,110 @@
     if (open) setTimeout(() => document.getElementById('api-key').focus(), 50);
   }
   function toggleRuns() {
-    const p = document.getElementById('chat-sidebar');
-    p.classList.toggle('hidden');
-    if (!p.classList.contains('hidden')) refreshChats();
+    // Rail mode: sidebar collapses to a slim strip, the ☰ stays exactly
+    // where it was (top-left, above New chat). Nothing unmounts.
+    document.getElementById('chat-sidebar').classList.toggle('rail');
   }
 </script>
 <link rel="stylesheet" href="/style.css">
 </head>
-<body class="bg-white text-neutral-900 dark:bg-neutral-900 dark:text-neutral-100 font-sans m-0 text-sm h-screen overflow-hidden flex flex-col overscroll-none">
+<body class="font-sans m-0 text-sm h-[100dvh] overflow-hidden flex flex-col overscroll-none">
 
-<header class="flex-none flex flex-wrap items-center gap-2 px-[2%] py-2 border-b border-neutral-200 dark:border-neutral-800">
-  <span class="font-bold text-lg">🌌 Rose</span>
-  <span id="status-dot" class="inline-block w-3 h-3 rounded-full bg-neutral-400"></span>
-  <span id="status-text" class="text-sm">connecting…</span>
-  <span class="flex-1"></span>
-  <span id="backend-text" class="text-xs text-neutral-500"></span>
-  <button onclick="toggleTheme()" class="px-2 py-1 rounded border border-neutral-300 dark:border-neutral-700" title="toggle light/dark">◐</button>
-  <button onclick="toggleSetup(true)" class="px-3 py-1 rounded border border-neutral-300 dark:border-neutral-700" title="Setup: API keys &amp; brain">⚙ Setup</button>
-  <button onclick="toggleRuns()" class="px-3 py-1 rounded border border-neutral-300 dark:border-neutral-700" title="Show or hide the chat list">☰ Chats</button>
-  <button onclick="toggleDesktop()" class="px-3 py-1 rounded border border-neutral-300 dark:border-neutral-700">🖥 Desktop</button>
-  <button id="stop" onclick="stopRun()" disabled title="Stop the current run at its next checkpoint" class="px-3 py-1 rounded bg-red-700 text-white font-semibold disabled:opacity-50">■ Stop</button>
+<header class="z-10 flex-none border-b py-2" style="border-color:var(--line);background:var(--card)">
+  <div class="flex w-full flex-wrap items-center gap-2 px-2">
+    <span class="t-display">Rose</span>
+    <span id="status-pill" aria-hidden="true" class="flex items-center gap-2 rounded-full border px-3 py-1" style="display:none;border-color:var(--line)">
+      <span id="status-dot" class="inline-block size-2 rounded-full bg-neutral-400"></span>
+      <span id="status-text" class="t-caption">connecting…</span>
+    </span>
+    <span class="flex-1"></span>
+    <span id="backend-text" class="muted t-caption hidden sm:block"></span>
+    <button onclick="toggleTheme()" class="btn-ghost rounded-lg px-2.5 py-1.5" title="toggle light/dark">◐</button>
+    <button onclick="toggleSetup(true)" class="btn-ghost rounded-lg px-3 py-1.5" title="Setup: API keys &amp; brain">Setup</button>
+    <button onclick="toggleDesktop()" class="btn-ghost rounded-lg px-3 py-1.5" title="Show or hide the live desktop preview (right panel, view-only)">Desktop</button>
+    <button id="stop" onclick="stopRun()" disabled title="Stop the current run at its next checkpoint" class="rounded-lg bg-red-600 px-3.5 py-1.5 font-semibold text-white disabled:opacity-40">Stop</button>
+  </div>
 </header>
 
 <!-- setup modal: keys live server-side only, never persisted, never in traces -->
-<div id="setup-modal" class="hidden fixed inset-0 z-10 flex items-center justify-center p-[4%] bg-black/50">
-  <div class="w-full max-w-[min(28rem,94%)] rounded-2xl border border-neutral-200 dark:border-neutral-700 bg-white dark:bg-neutral-900 p-[5%]">
-    <h2 class="font-semibold text-base mb-1">⚙ Setup</h2>
-    <p class="text-xs text-neutral-500 mt-0">Keys are kept in server memory for this session only — never written to disk, logs, or traces.</p>
-    <label class="font-semibold text-sm block mt-3 mb-1" for="api-key">Muse API key</label>
-    <input id="api-key" type="password" autocomplete="off" placeholder="sk-…" class="w-full px-3 py-2 rounded-xl border border-neutral-300 dark:border-neutral-600 bg-transparent text-sm">
-    <div class="text-xs mt-1"><span id="key-state" class="text-red-500 font-semibold">missing</span> · brain: <span class="font-semibold">muse</span> (fake needs no key)</div>
-    <div class="flex flex-wrap justify-end gap-2 mt-4">
-      <button onclick="clearKey()" class="px-4 py-2 rounded-xl border border-neutral-300 dark:border-neutral-600">Clear</button>
-      <button onclick="toggleSetup(false)" class="px-4 py-2 rounded-xl border border-neutral-300 dark:border-neutral-600">Cancel</button>
-      <button onclick="saveKey()" class="px-5 py-2 rounded-xl bg-[#0064E0] text-white font-semibold">Save</button>
+<div id="setup-modal" class="hidden fixed inset-0 z-20 flex items-center justify-center p-4 bg-black/50">
+  <div class="card w-full max-w-[min(28rem,94%)] rounded-xl p-6">
+    <h2 class="t-display">Setup</h2>
+    <p class="muted mt-1 text-xs">Keys are kept in server memory for this session only — never written to disk, logs, or traces.</p>
+    <label class="t-title mt-4 block text-sm" for="api-key">Muse API key</label>
+    <input id="api-key" type="password" autocomplete="off" placeholder="sk-…" class="mt-1 w-full rounded-lg border bg-transparent px-3 py-2 text-sm outline-none" style="border-color:var(--line)">
+    <div class="mt-1.5 text-xs"><span id="key-state" class="font-semibold text-red-500">missing</span> <span class="muted">· brain: <span class="font-semibold">muse</span> (fake needs no key)</span></div>
+    <div class="mt-4 flex flex-wrap justify-end gap-2">
+      <button onclick="clearKey()" class="btn-ghost rounded-lg px-4 py-2 font-semibold">Clear</button>
+      <button onclick="toggleSetup(false)" class="btn-ghost rounded-lg px-4 py-2 font-semibold">Cancel</button>
+      <button onclick="saveKey()" class="btn-accent rounded-lg px-5 py-2 font-semibold">Save</button>
     </div>
   </div>
 </div>
 
-<div class="flex flex-1 min-h-0 overflow-hidden">
-  <!-- chats: one entry per run, persisted server-side -->
-  <aside id="chat-sidebar" class="w-[26%] lg:w-[22%] flex-none flex flex-col min-h-0 overflow-hidden border-r border-neutral-200 dark:border-neutral-800">
-    <div class="flex-none px-[6%] py-2 flex flex-col gap-2 border-b border-neutral-200 dark:border-neutral-800">
-      <button onclick="newChat()" class="w-full px-3 py-2 rounded-xl bg-[#0064E0] text-white font-semibold text-sm" title="Start a new chat">＋ New chat</button>
-      <input id="chat-search" type="search" placeholder="Search chats…" oninput="refreshChats()" class="w-full px-3 py-1.5 rounded-xl border border-neutral-300 dark:border-neutral-600 bg-transparent text-sm" aria-label="Search chats">
+<!-- app shell: full-bleed, fixed height, only #thread scrolls the story -->
+<div class="z-10 flex min-h-0 w-full flex-1 gap-px overflow-hidden" style="background:var(--line)">
+  <!-- chat history sidebar: slim rail, ☰ stays top-left above New chat -->
+  <aside id="chat-sidebar" class="card flex w-[clamp(12rem,15%,16rem)] flex-none flex-col overflow-hidden rounded-none min-h-0" style="border:0">
+    <div class="rail-top flex-none p-3">
+      <div class="flex items-center">
+        <button onclick="toggleRuns()" title="Collapse chat history" class="btn-ghost rounded-lg px-2.5 py-1.5">☰</button>
+      </div>
+      <button onclick="newChat()" title="Start a new chat"
+        class="rail-hide btn-accent mt-2 w-full rounded-lg px-3 py-2 text-sm font-semibold">New chat</button>
+      <input id="chat-search" type="search" placeholder="Search chats…" oninput="refreshChats()"
+        class="rail-hide mt-2 w-full rounded-lg border bg-transparent px-3 py-1.5 text-sm outline-none" style="border-color:var(--line)" aria-label="Search chats">
     </div>
-    <div id="chat-list" class="flex-1 min-h-0 overflow-y-auto flex flex-col gap-1 p-[3%]">
-      <div class="text-xs text-neutral-500">loading…</div>
+    <div class="rail-hide muted t-caption flex-none px-3 pb-1">History</div>
+    <div id="chat-list" class="rail-hide thin-scroll flex min-h-0 flex-1 flex-col gap-1 overflow-y-auto p-3 pt-1" role="list">
+      <div class="muted text-xs">loading…</div>
     </div>
   </aside>
 
-  <!-- conversation: the main thing -->
-  <main class="flex-1 flex flex-col min-h-0 min-w-0 overflow-hidden">
-    <div id="thread" class="w-full max-w-[min(46rem,92%)] mx-auto flex-1 min-h-0 overflow-y-auto flex flex-col gap-4 py-[2%]">
-      <div class="self-start max-w-[90%] text-sm text-neutral-500">Type a goal below and hit Enter. Rose narrates each step here and pauses for approval before anything irreversible.</div>
+  <!-- conversation: equal half with the desktop panel, layout-contained -->
+  <main class="card flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden rounded-none" style="border:0;contain:layout style">
+    <div class="flex-none border-b px-5 py-4" style="border-color:var(--line)">
+      <div class="mx-auto w-full max-w-[42rem]">
+        <div class="t-title">What should Rose do?</div>
+        <div class="muted text-sm">Type a goal below and hit Enter. Rose narrates each step here and pauses for approval before anything irreversible.</div>
+      </div>
+    </div>
+
+    <!-- THE scroll area: fixed 42rem measure, centered -->
+    <div id="thread" class="thin-scroll mx-auto flex min-h-0 w-full max-w-[42rem] flex-1 flex-col gap-4 overflow-y-auto px-4 py-6">
       <div id="live-tail" class="contents"></div>
     </div>
 
-    <!-- composer: the primary control -->
-    <div class="flex-none border-t border-neutral-200 dark:border-neutral-800">
-      <div class="w-full max-w-[min(46rem,92%)] mx-auto py-[1.5%]">
-        <div class="flex items-end gap-2 rounded-2xl border-2 border-neutral-300 dark:border-neutral-600 focus-within:border-[#0064E0] px-[2%] py-2 bg-white dark:bg-neutral-950">
-          <textarea id="composer" rows="2" placeholder="Tell Rose what to do…" class="flex-1 bg-transparent outline-none resize-none text-sm max-h-[30vh]"></textarea>
-          <button class="px-2 py-1 rounded text-xs text-neutral-500" disabled title="Voice arrives in Phase 2">🎙</button>
-          <button onclick="send()" class="px-5 py-2 rounded-xl bg-[#0064E0] text-white font-semibold flex-none">Run</button>
-        </div>
-        <div id="queue-note" class="text-xs text-neutral-500 mt-1">Rose replies with a short summary when a run ends. Step-by-step feedback streams live under Details in the run card — minimize it any time, or expand it later to inspect a run.</div>
+    <!-- composer: the primary control, fixed -->
+    <div class="flex-none border-t px-5 py-4" style="border-color:var(--line)">
+      <div class="mx-auto flex w-full max-w-[42rem] items-end gap-2 rounded-xl border px-3 py-2" style="border-color:var(--line);background:var(--bg)">
+        <textarea id="composer" rows="2" placeholder="Tell Rose what to do…" class="max-h-[30vh] min-h-[2.75rem] w-full flex-1 resize-none bg-transparent text-sm outline-none placeholder:opacity-60"></textarea>
+        <button class="btn-ghost rounded-full px-2.5 py-1.5 text-xs" disabled title="Voice arrives in Phase 2">🎙</button>
+        <button onclick="send()" class="btn-accent flex-none rounded-lg px-5 py-2 font-semibold">Run</button>
       </div>
+      <div id="queue-note" class="muted mx-auto mt-1.5 w-full max-w-[42rem] text-xs">Rose replies with a short summary when a run ends. Step-by-step feedback streams live under Details in the run card — minimize it any time, or expand it later to inspect a run.</div>
     </div>
   </main>
 
-  <!-- desktop: secondary, toggleable -->
-  <aside id="desk-panel" class="hidden lg:block flex-none w-[38%] min-h-0 border-l border-neutral-200 dark:border-neutral-800 p-[1%] overflow-y-auto">
-    <div class="flex items-center justify-between mb-1">
-      <span class="font-semibold text-sm">Live desktop <span id="display-name" class="text-xs text-neutral-500 font-normal"></span></span>
-      <span class="text-xs px-2 py-0.5 rounded bg-red-700 text-white font-semibold">VIEW-ONLY</span>
+  <!-- desktop: equal half with the chat, live view-only, toggled by the Desktop button -->
+  <aside id="desk-panel" class="card flex min-h-0 min-w-0 flex-1 flex-col overflow-y-auto rounded-none p-5" style="border:0;contain:layout style">
+    <div class="mb-2 flex items-center justify-between">
+      <span class="t-title">Live desktop <span id="display-name" class="muted text-xs font-medium"></span></span>
+      <span class="rounded bg-red-600 px-2 py-0.5 text-xs font-semibold text-white">VIEW-ONLY</span>
     </div>
-    <div class="rounded-lg overflow-hidden border border-neutral-200 dark:border-neutral-700 bg-neutral-950">
+    <div class="overflow-hidden rounded-lg border bg-black" style="border-color:var(--line)">
       <img id="frame" alt="live desktop" class="w-full hidden">
-      <div id="frame-note" class="text-xs text-neutral-500 p-3">waiting for backend frames…</div>
+      <div id="frame-note" class="muted p-4 text-center text-xs">waiting for backend frames…</div>
     </div>
-    <p class="text-xs text-neutral-500 mt-1">Exactly what Rose sees. Take Control routes input through the same audited path (T1.4).</p>
-    <button disabled title="Take Control lands in T1.4 (lease)" class="mt-1 w-full px-3 py-2 rounded border border-neutral-300 dark:border-neutral-700 font-semibold disabled:opacity-50">Take Control</button>
+    <p class="muted mt-2 text-xs">Exactly what Rose sees. Take Control routes input through the same audited path (T1.4).</p>
+    <button disabled title="Take Control lands in T1.4 (lease)" class="btn-ghost mt-2 w-full rounded-lg px-3 py-2 font-semibold opacity-60">Take Control</button>
   </aside>
 </div>
 
+<script>
+  // Hide the telescope panel on small screens by default; Desktop brings it back.
+  if (matchMedia('(max-width: 1023px)').matches) document.getElementById('desk-panel').classList.add('hidden');
+</script>
 <script src="/app.js"></script>
 </body>
 </html>

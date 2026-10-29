@@ -1,3 +1,5 @@
 /target/
 /dist/
 setup.log
+grounding-worker/__pycache__/
+*.pyc
