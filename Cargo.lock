@@ -1797,11 +1797,11 @@ dependencies = [
 
 [[package]]
 name = "rose-agent"
-version = "0.1.21"
+version = "0.1.22"
 
 [[package]]
 name = "rose-core"
-version = "0.1.21"
+version = "0.1.22"
 dependencies = [
  "async-trait",
  "chrono",
@@ -1813,7 +1813,7 @@ dependencies = [
 
 [[package]]
 name = "rose-desktop-fake"
-version = "0.1.21"
+version = "0.1.22"
 dependencies = [
  "async-trait",
  "chrono",
@@ -1824,7 +1824,7 @@ dependencies = [
 
 [[package]]
 name = "rose-desktop-x11"
-version = "0.1.21"
+version = "0.1.22"
 dependencies = [
  "async-trait",
  "chrono",
@@ -1837,11 +1837,11 @@ dependencies = [
 
 [[package]]
 name = "rose-governor"
-version = "0.1.21"
+version = "0.1.22"
 
 [[package]]
 name = "rose-models"
-version = "0.1.21"
+version = "0.1.22"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -1855,7 +1855,7 @@ dependencies = [
 
 [[package]]
 name = "rose-store"
-version = "0.1.21"
+version = "0.1.22"
 dependencies = [
  "chrono",
  "rose-core",
@@ -1867,7 +1867,7 @@ dependencies = [
 
 [[package]]
 name = "rose-web"
-version = "0.1.21"
+version = "0.1.22"
 dependencies = [
  "async-trait",
  "axum",
@@ -1880,7 +1880,7 @@ dependencies = [
 
 [[package]]
 name = "rosed"
-version = "0.1.21"
+version = "0.1.22"
 dependencies = [
  "anyhow",
  "async-trait",
