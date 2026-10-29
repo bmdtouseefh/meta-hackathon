@@ -24,7 +24,7 @@ def _synthetic() -> np.ndarray:
 
 def test_finds_boxes():
     els = detect(_synthetic())
-    assert 1 <= len(els) <= 24, els
+    assert 1 <= len(els) <= 32, els
     for el in els:
         assert 0 <= el["x"] < 1600 and 0 <= el["y"] < 900
         assert el["cx"] == el["x"] + el["w"] // 2

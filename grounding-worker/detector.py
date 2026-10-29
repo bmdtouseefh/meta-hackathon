@@ -19,7 +19,13 @@ _MIN_AREA = 300        # ~20x15 px
 _MAX_AREA = 120_000    # ~400x300 px (windows themselves are not targets)
 _MIN_SIDE = 12
 _NMS_IOU = 0.5
-_MAX_ELEMENTS = 24
+# Cap + chrome quota (all in 1600x900 media pixels).
+# Pure-confidence ranking buries browser chrome (tabs, address bar,
+# toolbar) under high-confidence body text — yet chrome is what the
+# agent clicks. So the top band always keeps its own slots.
+_MAX_ELEMENTS = 32
+_TOP_BAND_Y = 170
+_TOP_BAND_SLOTS = 10
 
 # OCR text-line pass (needs the `tesseract` binary + pytesseract).
 # Words Tesseract is unsure about (conf < 30) are dropped; words on the
@@ -237,13 +243,38 @@ def detect(bgr: np.ndarray) -> list[dict]:
     boxes.extend(sboxes)
     scores.extend(sscores)
     icon_labels: list[str | None] = [None] * len(boxes)
+    n_icon = len(boxes)
 
     oboxes, oscores, olabels = _ocr_line_boxes(gray)
+    # Containment suppression: an icon blob mostly inside a text line is
+    # the same control (e.g. watchlist currency glyphs) — the labeled
+    # line wins, the bare "control N" badge would only clutter.
+    keep_icon = [True] * n_icon
+    for i in range(n_icon):
+        ix, iy, iw, ih = boxes[i]
+        for ox, oy, ow, oh in oboxes:
+            inter = max(0, min(ix + iw, ox + ow) - max(ix, ox)) * max(
+                0, min(iy + ih, oy + oh) - max(iy, oy)
+            )
+            if inter > 0.6 * iw * ih:
+                keep_icon[i] = False
+                break
+    boxes = [b for b, k in zip(boxes, keep_icon) if k]
+    scores = [s for s, k in zip(scores, keep_icon) if k]
+    icon_labels = [l for l, k in zip(icon_labels, keep_icon) if k]
     boxes.extend(oboxes)
     scores.extend(oscores)
     icon_labels.extend(olabels)
 
-    kept = _nms(boxes, scores)[:_MAX_ELEMENTS]
+    kept = _nms(boxes, scores)
+    # Chrome quota: the top band (tabs, address bar, toolbar) always
+    # keeps slots — pure-confidence ranking would bury it under
+    # high-confidence body text, yet chrome is what gets clicked.
+    kept.sort(key=lambda i: scores[i], reverse=True)
+    band = [i for i in kept if boxes[i][1] < _TOP_BAND_Y][:_TOP_BAND_SLOTS]
+    rest = [i for i in kept if boxes[i][1] >= _TOP_BAND_Y]
+    rest = rest[: max(0, _MAX_ELEMENTS - len(band))]
+    kept = band + rest
     # Stable IDs: top-to-bottom, left-to-right (panel first, like a user).
     kept.sort(key=lambda i: (boxes[i][1] // 60, boxes[i][0]))
 
