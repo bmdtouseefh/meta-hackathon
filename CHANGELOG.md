@@ -55,3 +55,5 @@ One line per completed task (IMPLEMENTATION.md, section 11). No secrets, no real
 - 2026-10-30 release: workspace version 0.1.20 (merge ui redesign + SoM grounding v2).
 - 2026-10-30 grounding v3: PSM 11 + own row clustering (Tesseract line grouping merged toolbar rows into oblivion), chrome quota (top band keeps 10 slots so tabs/address/toolbar survive the score cap), containment suppression (icon blobs inside text lines dropped), cap 32. Verified on a real TradingView frame: "Indicators" badges correctly.
 - 2026-10-30 release: workspace version 0.1.21 (SoM grounding v3).
+- 2026-10-30 fix: overlay is now visible — `grounded` trace events render in the run card (element count, first labels, link to the annotated JPEG) and `GET /api/runs/:id/frames/:step/grounded` serves it; raw frame link relabeled. Previously the brain saw badges but the trace only kept the raw screenshot.
+- 2026-10-30 release: workspace version 0.1.22 (visible overlay + grounded frame endpoint).
