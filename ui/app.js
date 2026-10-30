@@ -22,14 +22,21 @@ function approvalCard(say, goal, chatId) {
     <div class="flex-1 p-[4%] rounded-2xl rounded-tl-sm border-2 border-amber-500 bg-amber-50 dark:bg-amber-950">
       <div class="font-semibold text-sm">Needs approval — ${say}</div>
       <div class="flex flex-wrap gap-2 mt-2">
-        <button class="px-4 py-1.5 rounded bg-green-700 text-white font-semibold">Approve</button>
+        <button class="px-4 py-1.5 rounded bg-green-700 text-white font-semibold">Approve once</button>
+        <button class="px-4 py-1.5 rounded bg-green-900 text-white font-semibold">Approve all — don't ask again</button>
         <button class="px-4 py-1.5 rounded bg-red-700 text-white font-semibold">Deny</button>
       </div>
     </div>`;
-  const [approve, deny] = d.querySelectorAll("button");
+  const [approve, approveAll, deny] = d.querySelectorAll("button");
   approve.onclick = async () => {
     approve.disabled = true;
-    await runGoal(goal, true, d, chatId);
+    approveAll.disabled = true;
+    await runGoal(goal, true, false, d, chatId);
+  };
+  approveAll.onclick = async () => {
+    approve.disabled = true;
+    approveAll.disabled = true;
+    await runGoal(goal, true, true, d, chatId);
   };
   deny.onclick = () => {
     d.querySelector("div div").innerHTML += `<div class="text-sm text-neutral-500 mt-1">Denied — nothing acted on.</div>`;
@@ -269,6 +276,12 @@ function renderEvent(card, ev) {
     case "approval":
       line(row, `⚠️ Paused for approval: ${ev.say} — ${ev.action}`, "text-sm font-semibold text-amber-600 dark:text-amber-400");
       break;
+    case "resumed":
+      line(row, `▶ ${ev.say}`, "text-sm font-medium text-green-700 dark:text-green-400");
+      break;
+    case "auto_approved":
+      line(row, `✅ Auto-approved (don't ask again): ${ev.say} — ${ev.action}`, "text-sm text-green-700 dark:text-green-400");
+      break;
     case "lease":
       line(row, `⏸ ${ev.say}`, "text-sm font-medium text-amber-600 dark:text-amber-400");
       break;
@@ -324,7 +337,7 @@ function setStopButton(active) {
   btn.textContent = "■ Stop";
 }
 
-async function runGoal(goal, force, approvalEl, chatId = selectedChat) {
+async function runGoal(goal, force, autoApprove, approvalEl, chatId = selectedChat) {
   if (running) {
     bubble("⏳ A run is already in progress — watch it above, or stop it first.");
     return;
@@ -339,7 +352,7 @@ async function runGoal(goal, force, approvalEl, chatId = selectedChat) {
     const r = await fetch("/api/step", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ goal, force, chat_id: chatId }),
+      body: JSON.stringify({ goal, force, auto_approve: autoApprove, chat_id: chatId }),
     });
     if (!r.ok) {
       const j = await r.json().catch(() => ({}));
@@ -594,7 +607,7 @@ function send() {
   // the earlier turns as context.
   bubble(v, true);
   box.value = "";
-  runGoal(v, false, null, selectedChat);
+  runGoal(v, false, false, null, selectedChat);
 }
 
 async function refreshStatus() {
@@ -795,6 +808,610 @@ document.getElementById("setup-modal").addEventListener("click", (e) => {
   if (e.target.id === "setup-modal") toggleSetup(false);
 });
 
+// ---- setup tabs -------------------------------------------------------------
+// Keys pane talks to the real backend (POST /api/keys). Config pane tries
+// GET/PUT /api/config when rosed ships it; until then it degrades to a
+// localStorage draft so the UI is already wired.
+window.lastTab = window.lastTab || "keys";
+function setupTab(which) {
+  window.lastTab = which;
+  const keys = which === "keys";
+  document.getElementById("pane-keys").classList.toggle("hidden", !keys);
+  document.getElementById("pane-config").classList.toggle("hidden", keys);
+  document.getElementById("tab-keys").className =
+    "t-caption rounded-lg px-3 py-1.5 font-semibold " + (keys ? "btn-accent" : "btn-ghost");
+  document.getElementById("tab-config").className =
+    "t-caption rounded-lg px-3 py-1.5 font-semibold " + (!keys ? "btn-accent" : "btn-ghost");
+  if (!keys) loadConfig();
+}
+
+// ---- config management ------------------------------------------------------
+const CFG_FIELDS = ["cfg-bind","cfg-backend","cfg-display","cfg-width","cfg-height","cfg-cdp","cfg-launch","cfg-brain","cfg-model","cfg-endpoint","cfg-steps","cfg-minutes","cfg-calls","cfg-approvals","cfg-datadir"];
+const CFG_DEFAULTS = {};
+function snapshotConfig() {
+  const o = {};
+  CFG_FIELDS.forEach((id) => {
+    const el = document.getElementById(id);
+    if (!el) return;
+    o[id] = el.type === "checkbox" ? el.checked : el.value;
+  });
+  return o;
+}
+function applyConfig(o) {
+  CFG_FIELDS.forEach((id) => {
+    const el = document.getElementById(id);
+    if (!el || o[id] === undefined) return;
+    if (el.type === "checkbox") el.checked = !!o[id];
+    else el.value = o[id];
+  });
+  syncBrainNote();
+}
+function markDirty() {
+  document.getElementById("config-dirty").classList.remove("hidden");
+  document.getElementById("config-msg").textContent =
+    "Unsaved changes — Apply validates locally, then PUT /api/config (or local draft until the backend lands).";
+  syncBrainNote();
+}
+function markClean(msg) {
+  document.getElementById("config-dirty").classList.add("hidden");
+  document.getElementById("config-msg").textContent = msg;
+}
+function syncBrainNote() {
+  const b = document.getElementById("cfg-brain").value;
+  document.getElementById("brain-note").innerHTML =
+    b === "fake"
+      ? "fake brain needs no key — good for offline drafts."
+      : 'muse brain reads the key from Setup → Keys or <span class="font-mono">ROSE_MUSE_API_KEY</span>.';
+}
+function collectConfig() {
+  const v = (id) => document.getElementById(id).value.trim();
+  const c = (id) => document.getElementById(id).checked;
+  return {
+    server: { bind: v("cfg-bind"), allow_remote: c("cfg-allow-remote") },
+    desktop: { backend: v("cfg-backend"), display: v("cfg-display"), width: +v("cfg-width"), height: +v("cfg-height") },
+    cdp: { endpoint: v("cfg-cdp"), launch_if_missing: c("cfg-launch") },
+    models: { brain: v("cfg-brain"), endpoint: v("cfg-endpoint"), model: v("cfg-model") },
+    policy: { max_steps: +v("cfg-steps"), max_minutes: +v("cfg-minutes"), max_model_calls: +v("cfg-calls"), require_approval_for: v("cfg-approvals").split(",").map((s) => s.trim()).filter(Boolean) },
+    data: { dir: v("cfg-datadir") },
+  };
+}
+function configFromBackend(j) {
+  // Accept either flat {cfg-bind: ...} or nested {server:{...},...} shapes.
+  if (!j || typeof j !== "object") return null;
+  if (j["cfg-bind"] !== undefined) return j;
+  const o = {};
+  if (j.server) { if (j.server.bind) o["cfg-bind"] = j.server.bind; if (j.server.allow_remote !== undefined) o["cfg-allow-remote"] = j.server.allow_remote; }
+  if (j.desktop) { if (j.desktop.backend) o["cfg-backend"] = j.desktop.backend; if (j.desktop.display) o["cfg-display"] = j.desktop.display; if (j.desktop.width) o["cfg-width"] = String(j.desktop.width); if (j.desktop.height) o["cfg-height"] = String(j.desktop.height); }
+  if (j.cdp) { if (j.cdp.endpoint) o["cfg-cdp"] = j.cdp.endpoint; if (j.cdp.launch_if_missing !== undefined) o["cfg-launch"] = j.cdp.launch_if_missing; }
+  if (j.models) { if (j.models.brain) o["cfg-brain"] = j.models.brain; if (j.models.model) o["cfg-model"] = j.models.model; if (j.models.endpoint) o["cfg-endpoint"] = j.models.endpoint; }
+  if (j.policy) { if (j.policy.max_steps) o["cfg-steps"] = String(j.policy.max_steps); if (j.policy.max_minutes) o["cfg-minutes"] = String(j.policy.max_minutes); if (j.policy.max_model_calls) o["cfg-calls"] = String(j.policy.max_model_calls); if (j.policy.require_approval_for) o["cfg-approvals"] = (Array.isArray(j.policy.require_approval_for) ? j.policy.require_approval_for : [j.policy.require_approval_for]).join(", "); }
+  if (j.data && j.data.dir) o["cfg-datadir"] = j.data.dir;
+  return Object.keys(o).length ? o : null;
+}
+async function loadConfig() {
+  const src = document.getElementById("config-source");
+  try {
+    const r = await fetch("/api/config", { cache: "no-store" });
+    if (r.ok) {
+      const j = await r.json();
+      const flat = configFromBackend(j.config || j);
+      if (flat) {
+        applyConfig(flat);
+        src.textContent = "rosed (/api/config)";
+        markClean("Loaded from rosed. Real wiring: GET fills this form, PUT applies.");
+        try { localStorage.setItem("rose-config-draft", JSON.stringify(snapshotConfig())); } catch (e) {}
+        return;
+      }
+    }
+    throw new Error(r.status === 404 ? "no /api/config yet" : `HTTP ${r.status}`);
+  } catch (e) {
+    try {
+      const saved = JSON.parse(localStorage.getItem("rose-config-draft") || "null");
+      if (saved) {
+        applyConfig(saved);
+        src.textContent = "local draft (backend has no /api/config yet)";
+        markClean("Backend has no /api/config yet — showing your local draft. Apply saves locally.");
+        return;
+      }
+    } catch (err) {}
+    src.textContent = "defaults (rose.example.toml)";
+    markClean("Backend has no /api/config yet — defaults shown. Apply saves a local draft.");
+  }
+}
+async function saveConfig() {
+  const cfg = collectConfig();
+  const errs = [];
+  if (!/^\S+:\d+$/.test(cfg.server.bind)) errs.push("bind must be host:port");
+  if (!(cfg.desktop.width >= 640 && cfg.desktop.height >= 360)) errs.push("desktop size looks too small");
+  if (!(cfg.policy.max_steps >= 1 && cfg.policy.max_steps <= 200)) errs.push("max_steps 1..200");
+  if (errs.length) {
+    document.getElementById("config-msg").textContent = "⚠️ " + errs.join(" · ");
+    return;
+  }
+  try {
+    const r = await fetch("/api/config", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(cfg),
+    });
+    const j = await r.json().catch(() => ({}));
+    if (r.ok) {
+      document.getElementById("config-source").textContent = j.source || "rosed (/api/config)";
+      if (j.config) {
+        const flat = configFromBackend(j.config);
+        if (flat) applyConfig(flat);
+      }
+      if (j.restart_needed) {
+        markClean("✓ Applied — policy + brain hot-reloaded; backend/display/bind/data need a `rosed` restart.");
+        bubble(`Config applied: backend=<strong>${cfg.desktop.backend}</strong>, brain=<strong>${cfg.models.brain}</strong>, budget=<strong>${cfg.policy.max_steps} steps / ${cfg.policy.max_minutes} min</strong>. Backend/display/bind changes need a <span class="font-mono">rosed</span> restart.`);
+      } else {
+        markClean("✓ Applied — policy + brain hot-reloaded into the next run.");
+        bubble(`Config applied: backend=<strong>${cfg.desktop.backend}</strong>, brain=<strong>${cfg.models.brain}</strong>, budget=<strong>${cfg.policy.max_steps} steps / ${cfg.policy.max_minutes} min</strong>.`);
+      }
+      refreshStatus();
+      return;
+    }
+    const msg = (j && j.error) || `HTTP ${r.status}`;
+    if (r.status === 404) throw new Error("no /api/config yet");
+    document.getElementById("config-msg").textContent = "⚠️ " + msg;
+    return;
+  } catch (e) {
+    if (String(e.message || e).includes("no /api/config")) {
+      try { localStorage.setItem("rose-config-draft", JSON.stringify(snapshotConfig())); } catch (err) {}
+      document.getElementById("config-source").textContent = "local draft (backend has no /api/config yet)";
+      markClean("Saved locally — rosed has no /api/config yet, so nothing was hot-reloaded.");
+      bubble(`Config saved locally (rosed has no <span class="font-mono">/api/config</span> yet): backend=<strong>${cfg.desktop.backend}</strong>, brain=<strong>${cfg.models.brain}</strong>.`);
+    } else {
+      document.getElementById("config-msg").textContent = "⚠️ " + (e.message || e);
+    }
+  }
+}
+function resetConfig() {
+  applyConfig(CFG_DEFAULTS);
+  try { localStorage.removeItem("rose-config-draft"); } catch (e) {}
+  document.getElementById("config-source").textContent = "defaults (rose.example.toml)";
+  markClean("Reset to rose.example.toml defaults.");
+}
+function exportConfig() {
+  const cfg = collectConfig();
+  const toml =
+    `[server]\nbind = "${cfg.server.bind}"\nallow_remote = ${cfg.server.allow_remote}\n\n` +
+    `[desktop]\nbackend = "${cfg.desktop.backend}"\ndisplay = "${cfg.desktop.display}"\nwidth = ${cfg.desktop.width}\nheight = ${cfg.desktop.height}\n\n` +
+    `[cdp]\nendpoint = "${cfg.cdp.endpoint}"\nlaunch_if_missing = ${cfg.cdp.launch_if_missing}\n\n` +
+    `[models]\nbrain = "${cfg.models.brain}"\nendpoint = "${cfg.models.endpoint}"\nmodel = "${cfg.models.model}"\n\n` +
+    `[policy]\nmax_steps = ${cfg.policy.max_steps}\nmax_minutes = ${cfg.policy.max_minutes}\nmax_model_calls = ${cfg.policy.max_model_calls}\n` +
+    `require_approval_for = [${cfg.policy.require_approval_for.map((s) => `"${s}"`).join(", ")}]\n\n` +
+    `[data]\ndir = "${cfg.data.dir}"\n`;
+  if (navigator.clipboard) navigator.clipboard.writeText(toml).then(() => markClean("TOML copied to clipboard.")).catch(() => markClean("Copy failed."));
+}
+
+// ---- video → instructions ---------------------------------------------------
+// Backend: POST /api/videos?filename= (raw bytes) → <data>/videos/<id>/,
+// POST /api/videos/:id/instructions → Spark reads the video natively
+// (frames + narration in one call: no SAM, no separate transcription)
+// and persists the draft to steps.json, PUT :id/draft saves edits.
+// Local object URLs + a clearly-labeled offline mock remain only for when
+// rosed is unreachable — the server never returns mock steps.
+let videos = [];
+let selectedId = null;
+let pipeTimer = null;
+// Offline-mock stages only (no backend): the real path is one Spark call.
+const STAGES = [
+  { key: "read", label: "Reading video file (offline mock)", pct: 30 },
+  { key: "listen", label: "Sampling narration (offline mock)", pct: 60 },
+  { key: "draft", label: "Drafting placeholder steps (offline mock)", pct: 100 },
+];
+function fmtSize(b) {
+  if (b < 1024) return b + " B";
+  if (b < 1048576) return (b / 1024).toFixed(1) + " KB";
+  if (b < 1073741824) return (b / 1048576).toFixed(1) + " MB";
+  return (b / 1073741824).toFixed(2) + " GB";
+}
+function pickVideos(input) { addFiles([...input.files]); input.value = ""; }
+function dropVideos(e) {
+  e.preventDefault();
+  if (e.dataTransfer?.files?.length) addFiles([...e.dataTransfer.files]);
+}
+async function probeVideoBackend() {
+  try {
+    const r = await fetch("/api/videos", { method: "GET", cache: "no-store" });
+    if (r.ok) {
+      document.getElementById("video-backend").textContent = "rosed (/api/videos)";
+      return true;
+    }
+  } catch (e) {}
+  document.getElementById("video-backend").textContent = "local only";
+  return false;
+}
+async function uploadOne(file) {
+  // Raw bytes (no multipart dep on the server): POST /api/videos?filename=.
+  const r = await fetch(`/api/videos?filename=${encodeURIComponent(file.name)}`, {
+    method: "POST",
+    headers: { "Content-Type": file.type || "video/mp4" },
+    body: file,
+  });
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error((j && j.error) || `HTTP ${r.status}`);
+  return j.video;
+}
+/// Generate / Save / Send are always visible under the player; Save and
+/// Send stay disabled until the selected draft actually has steps.
+function updateVideoActions() {
+  const v = selectedVideo();
+  const hasSteps = !!(v && v.steps.length);
+  const gen = document.getElementById("vd-generate");
+  const save = document.getElementById("vd-save");
+  const send = document.getElementById("vd-send");
+  if (gen) gen.disabled = !v || v.status === "working" || v.status === "uploading…";
+  if (save) save.disabled = !hasSteps;
+  if (send) send.disabled = !hasSteps;
+}
+async function addFiles(files) {
+  const vids = files.filter((f) => f.type.startsWith("video/") || /\.(mp4|webm|mov|mkv)$/i.test(f.name));
+  if (!vids.length) { bubble("No video files in that drop — try mp4 / webm / mov."); return; }
+  // Render instantly (local playback URLs), then upload in the background
+  // and patch each entry — a big file over a slow tunnel must not leave
+  // the list empty with no way to act.
+  for (const f of vids) {
+    const entry = {
+      id: "v" + Math.random().toString(36).slice(2, 8),
+      name: f.name, size: f.size || 0, url: URL.createObjectURL(f),
+      serverId: null, status: "uploading…", progress: 0, stage: "Uploading to rosed…", log: [], steps: [],
+      _file: f,
+    };
+    videos.unshift(entry);
+    if (!selectedId) selectedId = entry.id;
+  }
+  renderVideos();
+  selectVideo(selectedId);
+  updateVideoActions();
+  bubble(`${vids.length} video${vids.length === 1 ? "" : "s"} queued — press <strong>Generate instructions</strong> under the desktop to draft agent steps.`);
+  let backendOk = videos.some((v) => v.serverId);
+  for (const entry of videos) {
+    const f = entry._file;
+    if (!f) continue;
+    try {
+      const meta = await uploadOne(f);
+      delete entry._file;
+      backendOk = true;
+      entry.serverId = meta.id;
+      entry.name = meta.name || entry.name;
+      entry.size = meta.size || entry.size;
+      entry.status = meta.status || "queued";
+      entry.stage = "Waiting…";
+      // Server bytes win for playback (survives restarts, shared with rosed).
+      entry.url = `/api/videos/${encodeURIComponent(meta.id)}/file`;
+    } catch (e) {
+      // Keep the local playback + the file itself: Generate retries the
+      // upload when rosed is reachable, otherwise it says why, loudly.
+      const reason = String((e && e.message) || e).slice(0, 160);
+      entry.status = "queued";
+      entry.stage = `Upload failed: ${reason} — press Generate to retry`;
+      bubble(`⚠️ Upload of <strong>${entry.name.replace(/</g, "&lt;")}</strong> failed: ${reason.replace(/</g, "&lt;")}. Press Generate to retry.`);
+    }
+    renderVideos();
+    if (selectedId === entry.id) selectVideo(entry.id);
+    updateVideoActions();
+  }
+  if (backendOk) document.getElementById("video-backend").textContent = "rosed (/api/videos)";
+  probeVideoBackend();
+}
+async function refreshServerVideos() {
+  try {
+    const r = await fetch("/api/videos", { cache: "no-store" });
+    if (!r.ok) return;
+    const j = await r.json();
+    const known = new Set(videos.map((v) => v.serverId));
+    for (const m of j.videos || []) {
+      if (known.has(m.id)) continue;
+      videos.push({
+        id: m.id, serverId: m.id, name: m.name, size: m.size || 0,
+        url: `/api/videos/${encodeURIComponent(m.id)}/file`,
+        status: m.status || "queued", progress: m.status === "ready" ? 100 : 0,
+        stage: m.status === "ready" ? "Draft ready — review below" : "Waiting…",
+        log: [], steps: [],
+      });
+    }
+    if (videos.length && !selectedId) selectedId = videos[0].id;
+    renderVideos();
+    if (selectedId) selectVideo(selectedId);
+  } catch (e) {}
+}
+function selectedVideo() { return videos.find((v) => v.id === selectedId) || null; }
+function renderVideos() {
+  const list = document.getElementById("video-list");
+  if (!list) return;
+  document.getElementById("video-count").textContent = videos.length;
+  document.getElementById("video-empty").style.display = videos.length ? "none" : "";
+  list.replaceChildren();
+  videos.forEach((v) => {
+    const row = document.createElement("div");
+    row.className = "flex cursor-pointer items-center gap-2 rounded-lg border px-2 py-1.5";
+    row.style.borderColor = v.id === selectedId ? "var(--accent)" : "var(--line)";
+    row.onclick = () => selectVideo(v.id);
+    const dot = document.createElement("span");
+    dot.className = "size-2 flex-none rounded-full " + (v.status === "ready" ? "bg-green-600" : v.status === "working" ? "animate-pulse bg-blue-600" : "bg-neutral-400");
+    const meta = document.createElement("div");
+    meta.className = "min-w-0 flex-1";
+    const n = document.createElement("div");
+    n.className = "t-caption truncate font-semibold";
+    n.textContent = v.name;
+    const s = document.createElement("div");
+    s.className = "muted t-caption";
+    s.textContent = `${fmtSize(v.size)} · ${v.status}${v.steps.length ? ` · ${v.steps.length} steps` : ""}`;
+    meta.append(n, s);
+    const del = document.createElement("button");
+    del.className = "t-caption rounded px-1.5 py-0.5 text-neutral-400 hover:text-red-600";
+    del.textContent = "✕";
+    del.title = "Remove video";
+    del.onclick = (e) => { e.stopPropagation(); removeVideo(v.id); };
+    row.append(dot, meta, del);
+    list.appendChild(row);
+  });
+}
+async function removeVideo(id) {
+  const v = videos.find((x) => x.id === id);
+  if (v && v.serverId) {
+    try { await fetch(`/api/videos/${encodeURIComponent(v.serverId)}`, { method: "DELETE" }); } catch (e) {}
+  }
+  videos = videos.filter((x) => x.id !== id);
+  if (selectedId === id) selectedId = videos[0]?.id || null;
+  renderVideos();
+  if (selectedId) selectVideo(selectedId);
+  else { document.getElementById("video-detail").classList.add("hidden"); updateVideoActions(); }
+}
+async function selectVideo(id) {
+  selectedId = id;
+  const v = selectedVideo();
+  renderVideos();
+  if (!v) return;
+  document.getElementById("video-detail").classList.remove("hidden");
+  document.getElementById("vd-name").textContent = v.name;
+  if (v.url) document.getElementById("vd-player").src = v.url;
+  // Server draft: pull persisted steps on first open (list has counts only).
+  if (v.serverId && !v.steps.length && v.status === "ready") {
+    try {
+      const r = await fetch(`/api/videos/${encodeURIComponent(v.serverId)}`, { cache: "no-store" });
+      if (r.ok) {
+        const j = await r.json();
+        if (j.steps && j.steps.length) {
+          v.steps = j.steps;
+          v.progress = 100;
+          v.stage = "Draft ready — review below";
+        }
+      }
+    } catch (e) {}
+  }
+  setPipeline(v.stage, v.progress, v.log.join("\n"));
+  setStatusBadge(v.status);
+  renderSteps();
+  updateVideoActions();
+}
+function setStatusBadge(st) {
+  document.getElementById("vd-status").textContent = st;
+}
+function setPipeline(stage, pct, log) {
+  document.getElementById("vd-stage").textContent = stage;
+  document.getElementById("vd-pct").textContent = Math.round(pct) + "%";
+  document.getElementById("vd-bar").style.width = pct + "%";
+  document.getElementById("vd-log").textContent = log || "";
+}
+async function runPipeline(v) {
+  if (!v) { bubble("Upload a video first — then generate instructions from it."); return; }
+  if (v.status === "working") return;
+  if (v.status === "uploading…") {
+    bubble("Still uploading — Generate unlocks when the upload finishes.");
+    return;
+  }
+  // No backend copy yet: if rosed is reachable and we still hold the file,
+  // upload now instead of mocking. Only when rosed is unreachable does the
+  // labeled offline mock below run.
+  if (!v.serverId) {
+    const backend = await probeVideoBackend();
+    if (backend && !v._file) {
+      v.stage = "No backend copy and no local file — upload the video again";
+      setPipeline(v.stage, 0, v.log.join("\n"));
+      renderVideos(); updateVideoActions();
+      bubble("⚠️ rosed has no copy of that video and the local file is gone — upload it again, then Generate.");
+      return;
+    }
+    if (backend && v._file) {
+      try {
+        v.status = "uploading…"; v.stage = "Uploading to rosed…";
+        setPipeline(v.stage, 2, "POST /api/videos?filename=");
+        setStatusBadge("uploading…"); renderVideos(); updateVideoActions();
+        const meta = await uploadOne(v._file);
+        delete v._file;
+        v.serverId = meta.id;
+        v.name = meta.name || v.name;
+        v.size = meta.size || v.size;
+        v.url = `/api/videos/${encodeURIComponent(meta.id)}/file`;
+        document.getElementById("video-backend").textContent = "rosed (/api/videos)";
+      } catch (e) {
+        const reason = String((e && e.message) || e).slice(0, 200);
+        v.status = "queued"; v.stage = `Upload failed: ${reason} — fix and retry`;
+        setPipeline(v.stage, 0, v.log.concat([reason]).slice(-4).join("\n"));
+        setStatusBadge("queued");
+        renderVideos(); updateVideoActions();
+        bubble(`⚠️ Upload failed: ${reason.replace(/</g, "&lt;")}. Nothing drafted — fix and retry.`);
+        return;
+      }
+    }
+  }
+  clearInterval(pipeTimer);
+  v.status = "working"; v.progress = 0; v.log = []; v.steps = [];
+  document.getElementById("vd-steps-wrap").classList.add("hidden");
+  document.getElementById("vd-saved").classList.add("hidden");
+  setStatusBadge("working");
+  selectVideo(v.id);
+  updateVideoActions();
+  // Backend: Spark reads the video natively (frames + narration, no SAM).
+  // Any failure surfaces as an error — the server never returns mock steps.
+  if (v.serverId) {
+    try {
+      v.stage = "Spark is watching the video…";
+      setPipeline(v.stage, 5, "POST /api/videos/:id/instructions");
+      const r = await fetch(`/api/videos/${encodeURIComponent(v.serverId)}/instructions`, { method: "POST" });
+      const j = await r.json().catch(() => ({}));
+      if (!r.ok) throw new Error((j && j.error) || `HTTP ${r.status}`);
+      v.steps = j.steps || [];
+      if (!v.steps.length) throw new Error("Spark found no task steps in this video");
+      v.status = "ready"; v.progress = 100; v.stage = "Draft ready — review below";
+      v.log.push("spark watched the video (frames + narration)");
+      setPipeline(v.stage, 100, v.log.slice(-4).join("\n") + "\nsteps.json saved ✓");
+      setStatusBadge("ready");
+      renderVideos(); renderSteps(); updateVideoActions();
+      bubble(`Video <strong>${v.name.replace(/</g, "&lt;")}</strong> → draft ready: <strong>${v.steps.length} steps</strong> from Spark. Review under the desktop, then send to Rose.`);
+      return;
+    } catch (e) {
+      const msg = String((e && e.message) || e).slice(0, 300).replace(/</g, "&lt;");
+      v.status = "queued"; v.progress = 0; v.stage = "Spark failed — see log";
+      v.log.push(msg);
+      setPipeline(v.stage, 0, v.log.slice(-4).join("\n"));
+      setStatusBadge("queued");
+      renderVideos(); updateVideoActions();
+      bubble(`⚠️ Spark could not read that video: ${msg}. Nothing drafted — fix and retry.`);
+      return;
+    }
+  }
+  let i = 0;
+  const tick = () => {
+    if (selectedId !== v.id) { clearInterval(pipeTimer); return; }
+    const st = STAGES[i];
+    v.stage = st.label; v.progress = st.pct;
+    v.log.push(`{stage:"${st.key}", pct:${st.pct}} — ${st.label}`);
+    setPipeline(v.stage, v.progress, v.log.slice(-4).join("\n"));
+    renderVideos();
+    i++;
+    if (i >= STAGES.length) {
+      clearInterval(pipeTimer);
+      v.status = "ready"; v.progress = 100; v.stage = "Offline mock draft — NOT from the video";
+      v.steps = mockSteps(v.name);
+      setPipeline(v.stage, 100, v.log.slice(-4).join("\n") + "\nConnect rosed for a real Spark video analysis");
+      setStatusBadge("ready");
+      renderVideos(); renderSteps(); updateVideoActions();
+      bubble(`Video <strong>${v.name.replace(/</g, "&lt;")}</strong> → offline <strong>mock</strong> draft (placeholder steps, not from the video). Upload to rosed for a real Spark analysis.`);
+    }
+  };
+  tick();
+  pipeTimer = setInterval(tick, 900);
+}
+function cancelPipeline() {
+  clearInterval(pipeTimer);
+  const v = selectedVideo();
+  if (v && v.status === "working") {
+    v.status = "queued"; v.stage = "Cancelled — press Generate to retry";
+    setStatusBadge("queued"); setPipeline(v.stage, v.progress, v.log.join("\n"));
+    renderVideos(); updateVideoActions();
+  }
+}
+// Offline-only placeholder steps (clearly labeled in the UI). Used only when
+// rosed is unreachable; the server path never mocks.
+function mockSteps(name) {
+  const base = name.replace(/\.\w+$/, "").replace(/[_-]+/g, " ").slice(0, 40) || "recorded task";
+  return [
+    { ts: 12, say: "Open the billing portal", intent: `open billing portal (${base})`, params: "portal_url = {{portal_url}}", approval: false, conf: 0.93, quote: "I'm opening the billing portal" },
+    { ts: 31, say: "Go to Invoices", intent: "navigate to Invoices list", params: "month = {{month}}", approval: false, conf: 0.88, quote: "go to Invoices" },
+    { ts: 65, say: "Filter by month — changes every time", intent: "set month filter", params: "month = {{month}}", approval: false, conf: 0.61, quote: "filter by month - changes every time" },
+    { ts: 100, say: "Export, then CSV", intent: "click Export → download CSV", params: "format = csv", approval: true, conf: 0.79, quote: "Export, then CSV" },
+  ];
+}
+function renderSteps() {
+  const v = selectedVideo();
+  const wrap = document.getElementById("vd-steps-wrap");
+  const box = document.getElementById("vd-steps");
+  if (!v || !v.steps.length) { wrap.classList.add("hidden"); return; }
+  wrap.classList.remove("hidden");
+  const avg = v.steps.reduce((a, s) => a + s.conf, 0) / v.steps.length;
+  document.getElementById("vd-conf").textContent = `avg confidence ${(avg * 100).toFixed(0)}%`;
+  box.replaceChildren();
+  v.steps.forEach((s, idx) => {
+    const card = document.createElement("div");
+    card.className = "rounded-lg border p-2";
+    card.style.borderColor = s.conf < 0.65 ? "#ef4444" : s.conf < 0.8 ? "#f59e0b" : "var(--line)";
+    const head = document.createElement("button");
+    head.className = "flex w-full items-center gap-2 text-left";
+    const mm = String(Math.floor(s.ts / 60)).padStart(2, "0"), ss = String(s.ts % 60).padStart(2, "0");
+    const confCls = s.conf >= 0.8 ? "text-green-700 dark:text-green-400" : s.conf >= 0.65 ? "text-amber-600 dark:text-amber-400" : "text-red-600";
+    head.innerHTML = `<span class="t-caption rounded px-1.5 py-0.5 font-mono" style="background:var(--line)">▶ ${mm}:${ss}</span><span class="t-caption flex-1 font-semibold"></span><span class="t-caption font-semibold ${confCls}"></span>`;
+    head.children[1].textContent = `Step ${idx + 1} · ${s.say}`;
+    head.children[2].textContent = Math.round(s.conf * 100) + "%";
+    head.title = "Seek video to this moment";
+    head.onclick = () => { const p = document.getElementById("vd-player"); try { p.currentTime = s.ts; p.play(); } catch (e) {} };
+    const intent = document.createElement("input");
+    intent.value = s.intent;
+    intent.className = "cfg-input t-caption mt-1.5";
+    intent.placeholder = "Agent intent…";
+    intent.oninput = () => { s.intent = intent.value; hideSaved(); };
+    const params = document.createElement("input");
+    params.value = s.params;
+    params.className = "cfg-input t-caption mt-1 font-mono";
+    params.placeholder = "params, {{slots}} for values that change";
+    params.oninput = () => { s.params = params.value; hideSaved(); };
+    const foot = document.createElement("div");
+    foot.className = "mt-1 flex items-center gap-2";
+    const q = document.createElement("span");
+    q.className = "muted t-caption flex-1 truncate italic";
+    q.textContent = `“${s.quote}”`;
+    const ap = document.createElement("label");
+    ap.className = "t-caption flex flex-none items-center gap-1";
+    const cb = document.createElement("input");
+    cb.type = "checkbox"; cb.checked = s.approval;
+    cb.onchange = () => { s.approval = cb.checked; hideSaved(); };
+    ap.append(cb, document.createTextNode("needs approval"));
+    const rm = document.createElement("button");
+    rm.className = "t-caption flex-none rounded px-1.5 py-0.5 text-neutral-400 hover:text-red-600";
+    rm.textContent = "✕"; rm.title = "Delete step";
+    rm.onclick = () => { v.steps.splice(idx, 1); renderSteps(); renderVideos(); updateVideoActions(); };
+    foot.append(q, ap, rm);
+    card.append(head, intent, params, foot);
+    box.appendChild(card);
+  });
+  updateVideoActions();
+}
+function hideSaved() { document.getElementById("vd-saved").classList.add("hidden"); }
+function showSaved(msg) {
+  const el = document.getElementById("vd-saved");
+  el.textContent = msg;
+  el.classList.remove("hidden");
+}
+function addStep() {
+  const v = selectedVideo(); if (!v) return;
+  v.steps.push({ ts: Math.round(document.getElementById("vd-player").currentTime || 0), say: "New step", intent: "", params: "", approval: false, conf: 0.5, quote: "" });
+  renderSteps();
+  updateVideoActions();
+}
+async function saveDraft() {
+  const v = selectedVideo(); if (!v) return;
+  if (v.serverId) {
+    try {
+      const r = await fetch(`/api/videos/${encodeURIComponent(v.serverId)}/draft`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ steps: v.steps }),
+      });
+      if (r.ok) {
+        showSaved("Draft saved to rosed.");
+        renderVideos();
+        return;
+      }
+      const j = await r.json().catch(() => ({}));
+      showSaved("⚠️ Save failed: " + (j.error || `HTTP ${r.status}`));
+      return;
+    } catch (e) {}
+  }
+  // Local fallback: no backend (or upload failed) — draft lives in the page.
+  showSaved("Draft saved locally (no video backend — upload again once rosed is reachable).");
+}
+function useInChat() {
+  const v = selectedVideo();
+  if (!v || !v.steps.length) { bubble("Generate instructions first — the draft is empty."); return; }
+  const text = `From video "${v.name}":\n` + v.steps.map((s, i) => `${i + 1}. ${s.intent} [${s.params}]${s.approval ? " (needs approval)" : ""}`).join("\n");
+  document.getElementById("composer").value = text;
+  document.getElementById("composer").focus();
+  bubble(`Draft from <strong>${v.name.replace(/</g, "&lt;")}</strong> loaded into the composer — review, then hit Run. Low-confidence steps will pause for approval at replay.`);
+}
+
 /// On page load: fill the sidebar chat list and open the most
 /// recent chat. Each chat is a separate run; nothing is merged
 /// into one long thread.
@@ -802,6 +1419,20 @@ async function restoreHistory() {
   const chats = await refreshChats();
   if (chats.length) await openChat(chats[0].chat_id);
 }
+
+(function initUiUpdates() {
+  CFG_FIELDS.forEach((id) => {
+    const el = document.getElementById(id);
+    if (el) CFG_DEFAULTS[id] = el.type === "checkbox" ? el.checked : el.value;
+  });
+  try {
+    const saved = JSON.parse(localStorage.getItem("rose-config-draft") || "null");
+    if (saved) applyConfig(saved);
+  } catch (e) {}
+  syncBrainNote();
+  renderVideos();
+  probeVideoBackend().then((ok) => { if (ok) refreshServerVideos(); });
+})();
 
 setInterval(refreshStatus, 2000);
 setInterval(refreshFrame, 1000);

@@ -6,6 +6,10 @@ Wants=xvnc.service
 [Service]
 Type=simple
 Environment=DISPLAY=:1
+# Optional persistent API keys (survive restarts, unlike Setup → Keys which
+# is memory-only): create ~/.config/rose/env with `ROSE_MUSE_API_KEY=...`
+# (chmod 600). The leading `-` ignores it when absent.
+EnvironmentFile=-%h/.config/rose/env
 # Default for .deb installs (/usr/bin/rosed). `rosed install` rewrites this
 # to the exact binary it runs from, so source builds work too.
 ExecStart=/usr/bin/rosed

@@ -85,7 +85,10 @@ mod tests {
     #[test]
     fn element_list_numbers_by_position() {
         assert_eq!(format_elements(&[]), "");
-        let list = format_elements(&[el("button: Close", 0, 0, 10, 10), el("button: Got it", 0, 0, 10, 10)]);
+        let list = format_elements(&[
+            el("button: Close", 0, 0, 10, 10),
+            el("button: Got it", 0, 0, 10, 10),
+        ]);
         assert!(
             list.starts_with("Interactive elements visible now"),
             "{list}"

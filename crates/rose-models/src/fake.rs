@@ -22,9 +22,7 @@ impl FakeBrain {
             },
             ModelReply::Act {
                 action: Action::Click {
-                    target: Target::Element(rose_core::ElementId(
-                        "g1,1@0.42,0.42".to_string(),
-                    )),
+                    target: Target::Element(rose_core::ElementId("g1,1@0.42,0.42".to_string())),
                     button: MouseButton::Left,
                 },
                 say: "Clicking the first cell".to_string(),

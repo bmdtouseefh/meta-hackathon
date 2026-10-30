@@ -18,9 +18,13 @@
     // Shows / hides the live-desktop panel (right side, view-only).
     document.getElementById('desk-panel').classList.toggle('hidden');
   }
+  let lastTab = 'keys';
   function toggleSetup(open) {
     document.getElementById('setup-modal').classList.toggle('hidden', !open);
-    if (open) setTimeout(() => document.getElementById('api-key').focus(), 50);
+    if (open) {
+      if (window.setupTab) setupTab(window.lastTab || 'keys');
+      setTimeout(() => document.getElementById('api-key').focus(), 50);
+    }
   }
   function toggleRuns() {
     // Rail mode: sidebar collapses to a slim strip, the ☰ stays exactly
@@ -48,18 +52,80 @@
   </div>
 </header>
 
-<!-- setup modal: keys live server-side only, never persisted, never in traces -->
+<!-- setup modal: keys (memory-only) + config management (GET/PUT /api/config when backend supports it) -->
 <div id="setup-modal" class="hidden fixed inset-0 z-20 flex items-center justify-center p-4 bg-black/50">
-  <div class="card w-full max-w-[min(28rem,94%)] rounded-xl p-6">
+  <div class="card w-full max-w-[min(36rem,96%)] max-h-[92vh] overflow-y-auto thin-scroll rounded-xl p-6">
     <h2 class="t-display">Setup</h2>
-    <p class="muted mt-1 text-xs">Keys are kept in server memory for this session only — never written to disk, logs, or traces.</p>
-    <label class="t-title mt-4 block text-sm" for="api-key">Muse API key</label>
-    <input id="api-key" type="password" autocomplete="off" placeholder="sk-…" class="mt-1 w-full rounded-lg border bg-transparent px-3 py-2 text-sm outline-none" style="border-color:var(--line)">
-    <div class="mt-1.5 text-xs"><span id="key-state" class="font-semibold text-red-500">missing</span> <span class="muted">· brain: <span class="font-semibold">muse</span> (fake needs no key)</span></div>
-    <div class="mt-4 flex flex-wrap justify-end gap-2">
-      <button onclick="clearKey()" class="btn-ghost rounded-lg px-4 py-2 font-semibold">Clear</button>
-      <button onclick="toggleSetup(false)" class="btn-ghost rounded-lg px-4 py-2 font-semibold">Cancel</button>
-      <button onclick="saveKey()" class="btn-accent rounded-lg px-5 py-2 font-semibold">Save</button>
+    <p class="muted mt-1 text-xs">Keys live in server memory for this session only — never written to disk, logs, or traces.</p>
+    <div class="mt-3 flex gap-2" role="tablist">
+      <button id="tab-keys" onclick="setupTab('keys')" class="btn-accent t-caption rounded-lg px-3 py-1.5 font-semibold">Keys</button>
+      <button id="tab-config" onclick="setupTab('config')" class="btn-ghost t-caption rounded-lg px-3 py-1.5 font-semibold">Config</button>
+      <span class="flex-1"></span>
+      <span id="config-dirty" class="hidden t-caption font-semibold text-amber-600">● unsaved</span>
+    </div>
+    <div id="pane-keys">
+      <label class="t-title mt-4 block text-sm" for="api-key">Muse API key</label>
+      <input id="api-key" type="password" autocomplete="off" placeholder="sk-…" class="mt-1 w-full rounded-lg border bg-transparent px-3 py-2 text-sm outline-none" style="border-color:var(--line)">
+      <div class="mt-1.5 text-xs"><span id="key-state" class="font-semibold text-red-500">missing</span> <span class="muted">· brain: <span class="font-semibold">muse</span> (fake needs no key)</span></div>
+      <div class="mt-4 flex flex-wrap justify-end gap-2">
+        <button onclick="clearKey()" class="btn-ghost rounded-lg px-4 py-2 font-semibold">Clear</button>
+        <button onclick="toggleSetup(false)" class="btn-ghost rounded-lg px-4 py-2 font-semibold">Cancel</button>
+        <button onclick="saveKey()" class="btn-accent rounded-lg px-5 py-2 font-semibold">Save</button>
+      </div>
+    </div>
+    <div id="pane-config" class="hidden">
+      <div class="mt-3 flex flex-wrap items-center gap-2">
+        <span class="muted t-caption">Source: <span id="config-source" class="font-semibold">loading…</span></span>
+        <span class="flex-1"></span>
+        <button onclick="resetConfig()" class="btn-ghost t-caption rounded px-2 py-1">Reset defaults</button>
+        <button onclick="exportConfig()" class="btn-ghost t-caption rounded px-2 py-1">Copy TOML</button>
+      </div>
+      <details open class="card mt-3 rounded-xl"><summary class="t-title cursor-pointer px-3 py-2">Server</summary>
+        <div class="grid gap-2 px-3 pb-3">
+          <label class="t-caption">Bind address<input id="cfg-bind" value="127.0.0.1:8787" oninput="markDirty()" class="cfg-input t-caption mt-1 font-mono"></label>
+          <label class="t-caption flex items-center gap-2"><input id="cfg-allow-remote" type="checkbox" oninput="markDirty()"> allow_remote <span class="muted">(refuse 0.0.0.0 unless checked)</span></label>
+        </div>
+      </details>
+      <details open class="card mt-2 rounded-xl"><summary class="t-title cursor-pointer px-3 py-2">Desktop &amp; browser (CDP)</summary>
+        <div class="grid gap-2 px-3 pb-3">
+          <div class="grid grid-cols-2 gap-2">
+            <label class="t-caption">Backend<select id="cfg-backend" onchange="markDirty()" class="cfg-input mt-1"><option value="auto" selected>auto (X11 + CDP when Chrome frontmost)</option><option value="x11">x11 (full desktop)</option><option value="cdp">cdp (browser tabs only)</option><option value="fake">fake (offline dev)</option></select></label>
+            <label class="t-caption">Display<input id="cfg-display" value=":1" oninput="markDirty()" class="cfg-input mt-1 font-mono"></label>
+          </div>
+          <div class="grid grid-cols-2 gap-2">
+            <label class="t-caption">Width<input id="cfg-width" type="number" value="1600" oninput="markDirty()" class="cfg-input mt-1 font-mono"></label>
+            <label class="t-caption">Height<input id="cfg-height" type="number" value="900" oninput="markDirty()" class="cfg-input mt-1 font-mono"></label>
+          </div>
+          <label class="t-caption">CDP endpoint<input id="cfg-cdp" value="http://127.0.0.1:9222" oninput="markDirty()" class="cfg-input mt-1 font-mono"></label>
+          <label class="t-caption flex items-center gap-2"><input id="cfg-launch" type="checkbox" oninput="markDirty()"> launch_if_missing</label>
+        </div>
+      </details>
+      <details open class="card mt-2 rounded-xl"><summary class="t-title cursor-pointer px-3 py-2">Brain (models)</summary>
+        <div class="grid gap-2 px-3 pb-3">
+          <div class="grid grid-cols-2 gap-2">
+            <label class="t-caption">Brain<select id="cfg-brain" onchange="markDirty()" class="cfg-input mt-1"><option value="muse" selected>muse (needs key)</option><option value="fake">fake (no key)</option></select></label>
+            <label class="t-caption">Model<input id="cfg-model" value="muse-spark-1.3-contributor" oninput="markDirty()" class="cfg-input mt-1 font-mono"></label>
+          </div>
+          <label class="t-caption">Endpoint<input id="cfg-endpoint" value="https://api.meta.ai/v1" oninput="markDirty()" class="cfg-input mt-1 font-mono"></label>
+          <div id="brain-note" class="muted t-caption">muse brain reads the key from Setup → Keys or <span class="font-mono">ROSE_MUSE_API_KEY</span>.</div>
+        </div>
+      </details>
+      <details open class="card mt-2 rounded-xl"><summary class="t-title cursor-pointer px-3 py-2">Policy (Governor)</summary>
+        <div class="grid grid-cols-3 gap-2 px-3 pb-3">
+          <label class="t-caption">max_steps<input id="cfg-steps" type="number" value="40" min="1" max="200" oninput="markDirty()" class="cfg-input mt-1 font-mono"></label>
+          <label class="t-caption">max_minutes<input id="cfg-minutes" type="number" value="15" min="1" max="120" oninput="markDirty()" class="cfg-input mt-1 font-mono"></label>
+          <label class="t-caption">max_model_calls<input id="cfg-calls" type="number" value="60" min="1" max="500" oninput="markDirty()" class="cfg-input mt-1 font-mono"></label>
+        </div>
+        <div class="px-3 pb-3"><label class="t-caption">require_approval_for (comma-separated)<input id="cfg-approvals" value="submit, send, pay, delete, publish" oninput="markDirty()" class="cfg-input mt-1 font-mono"></label></div>
+      </details>
+      <details class="card mt-2 rounded-xl"><summary class="t-title cursor-pointer px-3 py-2">Storage</summary>
+        <div class="px-3 pb-3"><label class="t-caption">Data dir<input id="cfg-datadir" value="~/.local/share/rose" oninput="markDirty()" class="cfg-input mt-1 font-mono"></label></div>
+      </details>
+      <div id="config-msg" class="muted t-caption mt-2">Loading…</div>
+      <div class="mt-3 flex flex-wrap justify-end gap-2">
+        <button onclick="toggleSetup(false)" class="btn-ghost rounded-lg px-4 py-2 font-semibold">Close</button>
+        <button onclick="saveConfig()" class="btn-accent rounded-lg px-5 py-2 font-semibold">Apply config</button>
+      </div>
     </div>
   </div>
 </div>
@@ -120,6 +186,68 @@
     </div>
     <p id="control-hint" class="muted mt-2 text-xs">Exactly what Rose sees. Take Control to drive it yourself through the same audited path — the agent pauses, never killed.</p>
     <button id="take-control" onclick="toggleControl()" class="btn-ghost mt-2 w-full rounded-lg px-3 py-2 font-semibold">Take Control</button>
+
+      <!-- video → instructions: under the live desktop, shares the right rail's scroll.
+           Backend: POST /api/videos?filename= upload, POST :id/instructions runs
+           Spark native video (frames + narration, no SAM) and saves steps.json,
+           PUT :id/draft saves edits (all under <data>/videos/<id>/).
+           Local object URLs + labeled offline mock remain for no-backend mode. -->
+    <section id="video-workflow" class="card mt-4 overflow-hidden rounded-xl" style="border-color:var(--line)">
+      <div class="flex items-center gap-2 border-b px-3 py-2" style="border-color:var(--line)">
+        <span class="t-title">🎬 Video → instructions</span>
+        <span id="video-count" class="t-caption rounded px-1.5 py-0.5" style="background:var(--line)">0</span>
+        <span class="flex-1"></span>
+        <span id="video-backend" class="muted t-caption">local only</span>
+      </div>
+      <div id="dropzone" class="m-3 cursor-pointer rounded-xl border-2 border-dashed px-3 py-4 text-center"
+        style="border-color:var(--line)"
+        onclick="document.getElementById('video-file').click()"
+        ondragover="event.preventDefault()"
+        ondrop="dropVideos(event)">
+        <div class="t-body font-semibold">Drop a narrated recording here, or <span style="color:var(--accent)"><u>browse</u></span></div>
+        <div class="muted t-caption mt-0.5">mp4 / webm / mov · uploads to rosed (/api/videos) when available, local otherwise</div>
+        <input id="video-file" type="file" accept="video/*" multiple class="hidden" onchange="pickVideos(this)">
+      </div>
+      <div id="video-list" class="flex flex-col gap-2 px-3 pb-1"></div>
+      <div id="video-empty" class="muted t-caption px-3 pb-3">No videos yet — upload one to draft agent instructions from it.</div>
+      <div id="video-detail" class="hidden border-t px-3 py-3" style="border-color:var(--line)">
+        <div class="flex items-center gap-2">
+          <span id="vd-name" class="t-title flex-1 truncate">video.mp4</span>
+          <span id="vd-status" class="t-caption rounded px-2 py-0.5 font-semibold" style="background:var(--line)">queued</span>
+        </div>
+        <video id="vd-player" controls playsinline class="mt-2 w-full rounded-lg bg-black" style="aspect-ratio:16/9;max-height:38vh"></video>
+        <div class="muted t-caption mt-1">Click a step to seek — transcript + evidence stay in sync (Skill Studio preview).</div>
+        <!-- actions: always visible (never hidden below the fold); Save and
+             Send stay disabled until the draft has steps. -->
+        <div class="mt-2 flex flex-wrap gap-2">
+          <button id="vd-generate" onclick="runPipeline(selectedVideo())" class="btn-accent t-caption rounded-lg px-3 py-1.5 font-semibold">⚙ Generate instructions</button>
+          <button onclick="cancelPipeline()" class="btn-ghost t-caption rounded-lg px-3 py-1.5">Cancel</button>
+          <button id="vd-save" onclick="saveDraft()" class="btn-ghost t-caption rounded-xl px-4 py-2 font-semibold" disabled>Save draft</button>
+          <button id="vd-send" onclick="useInChat()" class="t-caption rounded-xl bg-green-700 px-4 py-2 font-semibold text-white" disabled>➤ Send to Rose as instructions</button>
+        </div>
+        <div id="vd-saved" class="mt-1 hidden text-xs font-semibold text-green-600">Draft saved.</div>
+        <div class="mt-2 rounded-lg p-2" style="background:var(--bg)">
+          <div class="flex items-center gap-2">
+            <span id="vd-stage" class="t-caption font-semibold">Waiting…</span>
+            <span class="flex-1"></span>
+            <span id="vd-pct" class="muted t-caption">0%</span>
+          </div>
+          <div class="mt-1 h-1.5 overflow-hidden rounded-full" style="background:var(--line)">
+            <div id="vd-bar" class="h-full rounded-full transition-all" style="width:0%;background:var(--accent)"></div>
+          </div>
+          <div id="vd-log" class="muted t-caption mt-1 whitespace-pre-wrap font-mono"></div>
+        </div>
+        <div id="vd-steps-wrap" class="mt-3 hidden">
+          <div class="flex items-center gap-2">
+            <span class="t-title">Draft instructions</span>
+            <span id="vd-conf" class="muted t-caption"></span>
+            <span class="flex-1"></span>
+            <button onclick="addStep()" class="btn-ghost t-caption rounded px-2 py-1">+ step</button>
+          </div>
+          <div id="vd-steps" class="mt-2 flex flex-col gap-2"></div>
+        </div>
+      </div>
+    </section>
   </aside>
 </div>
 

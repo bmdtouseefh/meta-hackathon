@@ -72,13 +72,35 @@ fn split_chord(text: &str) -> Vec<String> {
 }
 
 /// Parse one model reply. Pure: unit-tested with fixtures, no network.
+///
+/// The reply must be one JSON object, but the model sometimes narrates
+/// around it ("Found the video — I'll pull its directions…{...}"), which
+/// used to fail the whole run after retry. Direct parse first; on failure
+/// recover the object between the first `{` and the last `}` and parse
+/// that. Anything else is still an error, never a guess.
 pub fn parse_reply(text: &str) -> Result<ModelReply> {
-    let raw: RawReply = serde_json::from_str(text.trim()).map_err(|e| {
-        RoseError::Model(format!(
-            "reply is not valid JSON ({e}): {}",
-            truncate(text, 200)
-        ))
-    })?;
+    let text = strip_fences(text);
+    match serde_json::from_str::<RawReply>(&text) {
+        Ok(raw) => to_reply(raw),
+        Err(first_err) => {
+            if let Some(start) = text.find('{') {
+                if let Some(end) = text.rfind('}') {
+                    if end > start {
+                        if let Ok(raw) = serde_json::from_str::<RawReply>(&text[start..=end]) {
+                            return to_reply(raw);
+                        }
+                    }
+                }
+            }
+            Err(RoseError::Model(format!(
+                "reply is not valid JSON ({first_err}): {}",
+                truncate(&text, 200)
+            )))
+        }
+    }
+}
+
+fn to_reply(raw: RawReply) -> Result<ModelReply> {
     let say = raw.say.unwrap_or_default();
     match raw.status.as_str() {
         "done" => Ok(ModelReply::Done { say }),
@@ -239,7 +261,8 @@ impl MuseClient {
         - If the goal (or its next step) can be done from the shell, reply \"shell\". \
         Opening/launching an app or a URL is ALWAYS a shell step (e.g. setsid google-chrome 'URL' &): never ask to look just to find its icon.\n\
         - If shell output in the history already proves the goal is complete, reply \"done\".\n\
-        - Only if the next step genuinely requires seeing and operating the GUI (clicking a control in an already-open app), reply {\"status\":\"act\",\"action\":\"look\",\"say\":\"I need to see the desktop to ...\"} and a screenshot will be taken for your next reply.\n";
+        - Only if the next step genuinely requires seeing and operating the GUI (clicking a control in an already-open app), reply {\"status\":\"act\",\"action\":\"look\",\"say\":\"I need to see the desktop to ...\"} and a screenshot will be taken for your next reply.\n\
+        - If the goal references a recorded video (e.g. \"mail-video\"), its Spark-drafted steps already exist: list ~/.local/share/rose/videos/ to find the id, `cat` that id's steps.json, and follow those steps instead of searching the disk for the video. Never re-derive what steps.json already says.\n";
 
     /// Goal + short history + current JPEG + grounded element list ->
     /// one JSON action. The list is the text twin of the annotated image
@@ -595,6 +618,28 @@ mod tests {
         assert!(parse_reply(r#"{"status":"dance"}"#).is_err());
         assert!(parse_reply(r#"{"status":"act","action":"click","say":"no coords"}"#).is_err());
         assert!(parse_reply("").is_err());
+    }
+
+    #[test]
+    fn narration_around_json_is_recovered_not_fatal() {
+        // The exact shape that killed a real run: prose, then the object.
+        let r = parse_reply(
+            "Found the instruction video — I'll pull its directions to send that first mail.\
+             { \"status\": \"act\", \"action\": \"shell\", \"text\": \"cat steps.json\", \"say\": \"Reading\" }",
+        )
+        .expect("recovers the object");
+        assert!(matches!(
+            r,
+            ModelReply::Shell { ref command, .. } if command == "cat steps.json"
+        ));
+        // Trailing chatter is tolerated too.
+        let r = parse_reply(
+            "{ \"status\": \"done\", \"say\": \"The CSV is downloaded\" } (anything else? just ask)",
+        )
+        .expect("trailing chatter tolerated");
+        assert!(matches!(r, ModelReply::Done { .. }));
+        // Braces with no JSON inside are still an error.
+        assert!(parse_reply("uve { no json } here").is_err());
     }
 
     #[test]

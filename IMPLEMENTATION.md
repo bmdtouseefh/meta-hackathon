@@ -484,24 +484,34 @@ logged-in profile. Record per-task: success / steps / approvals / failure mode.
 
 ## 8. Phase 2 — video → skill (start only after Phase 1 exit)
 
-Separate Python worker; `rosed` stays Rust and dumb about CV details.
+No Python worker and no SAM: Muse Spark reads video natively (frames +
+embedded narration in one call), so `rosed` does it directly in Rust.
+`job.json` (`{video_path, out_dir}`) is still written per upload in case a
+future offline worker wants it.
 
-- [ ] **V2.1 Job contract.** `rosed` (feature `video`) accepts an upload,
-  writes `jobs/<id>/job.json` `{video_path, out_dir}`, runs
-  `video-worker run jobs/<id>` as a subprocess, streams the worker's
-  `progress.jsonl` lines (`{stage, pct, note}`) to the UI, and imports the
-  resulting `skill.draft.yaml`. Worker crash/timeout = job failed, daemon unaffected.
-- [ ] **V2.2 Worker pipeline** (`video-worker/`, Python): ffmpeg extract →
-  Muse Voice transcript (timestamps) → frame-diff/cursor event detection →
-  narration↔event alignment → Muse Spark + SAM 3.1 grounding → Skill DSL
-  draft (schema in `architecture.html` §8) with per-step evidence +
-  confidence. Each stage independently runnable on fixtures
-  (`video-worker run --stage transcribe fixtures/demo1/`).
-- [ ] **V2.3 Skill Studio.** New UI tab: step list synced to a `<video>`
-  element (click step → seek), transcript line, target crop, editable
-  intent/params/approval flags, confidence highlighting, Save (→ SQLite
-  `skills` table, status `draft`→`reviewed`).
-- **Exit:** architecture §10 Phase 2 criteria on 3 real narrated recordings.
+- [x] **V2.1 Upload + Spark instructions.** `rosed` accepts an upload
+  (`POST /api/videos?filename=`, raw bytes, max 200 MB) into
+  `<data>/videos/<id>/` with `job.json`. `POST /api/videos/:id/instructions`
+  uploads to the Files API (`purpose=user_data`, 30-day auto-expiry),
+  calls the Responses API with `prompts/video.md`, validates the
+  `{"steps": [...]}` draft (cap 50, clamped confidence, approval flags),
+  persists `steps.json`, and deletes the remote file best-effort. No key
+  or model failure returns mock steps — errors surface to the UI as-is.
+  Non-mp4 uploads are normalized with ffmpeg (ships on the VM). No SAM
+  anywhere in this path (dropped: Spark sees the video itself).
+  *Accept:* upload an mp4 in the UI → Generate → steps describe the actual
+  recording (verified per recording, not fixtures — the shape is covered
+  by `cargo test -p rose-models video::` + rosed file/validation tests).
+- [ ] **V2.2 Evidence pass (optional).** If drafts need tighter grounding:
+  per-step frame crops from ffmpeg at the returned timestamps, shown in
+  the step list. Not a transcription or SAM stage — Spark already read
+  the narration.
+- [ ] **V2.3 Skill Studio.** Step list synced to a `<video>` element
+  (click step → seek), quote line, editable intent/params/approval flags,
+  confidence highlighting, Save (`PUT :id/draft` → `steps.json`; SQLite
+  `skills` table arrives with Phase 3).
+- **Exit:** 3 real narrated recordings draft steps that reproduce the task
+  after review (success recorded per recording).
 
 ## 9. Phase 3 — skill execution (start only after Phase 2 exit)
 
@@ -532,13 +542,19 @@ were broken; fix them instead.
 
 ## 10. Open questions (append here; do not improvise answers in code)
 
-1. Muse Voice timestamp granularity (word vs segment) — sets Phase 2
-   alignment design. *Owner: confirm from API before V2.2.*
-2. Muse Spark / SAM 3.1 exact endpoint + auth shapes — isolated in
-   `rose-models/src/{spark,sam}.rs`; fill from official docs at T3.1.
-   *(Resolved for Spark 2026-10-28, dev.meta.ai docs: `POST https://api.meta.ai/v1/chat/completions`,
-   OpenAI-compatible, `Authorization: Bearer <key>`, model `muse-spark-1.3-contributor`,
-   `developer` message steers, stateless, retry 429/5xx never 400. SAM still open.)*
+1. ~~Muse Voice timestamp granularity~~ — moot: Spark reads embedded
+   narration itself in the video call and returns approximate per-step
+   seconds. No Voice stage, no alignment design.
+2. Muse Spark video endpoint + auth — isolated in
+   `rose-models/src/video.rs`. *(Resolved 2026-10-30, dev.meta.ai docs:
+   video-understanding + file-handling: `POST {endpoint}/files` multipart
+   `purpose=user_data` → `file_id`, then `POST {endpoint}/responses`
+   with an `input_file` block; same `Authorization: Bearer <key>` and
+   model as chat; `max_output_tokens` ≥ 4000 (reasoning shares the
+   budget); only `video/mp4` understood (ffmpeg-normalize others);
+   retry 429/5xx, best-effort `DELETE` the file afterwards. SAM dropped
+   from this path — `rose-models/src/sam.rs` was never created and the
+   `ElementSource::Sam` contract variant stays unused.)*
 3. Password-field redaction beyond fixed regions (vision-based) — post-Phase 1.
 4. Frame rate vs cost: default 5 fps UI stream; measure in T4.1.
 

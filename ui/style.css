@@ -50,3 +50,16 @@ aside#chat-sidebar.rail { width: 3.5rem; }
 .t-title { font-weight: 650; font-size: clamp(.92rem, .88rem + .3vw, 1rem); line-height: 1.4; }
 .t-body { font-weight: 400; font-size: clamp(.875rem, .84rem + .2vw, .95rem); line-height: 1.55; }
 .t-caption { font-weight: 500; font-size: clamp(.72rem, .7rem + .15vw, .8rem); line-height: 1.5; }
+
+/* Setup config form + video workflow */
+.cfg-input { width: 100%; border-radius: .5rem; border: 1px solid var(--line); background: transparent; padding: .45rem .6rem; font-size: .85rem; outline: none; color: var(--ink); }
+.cfg-input:focus { border-color: var(--accent); }
+
+/* Right-rail scroll fix: the desk panel is a flex column AND the scroll
+   container. Its frame wrapper and video section both use overflow-hidden
+   (rounded corners), which zeroes their automatic minimum height — so they
+   absorbed flex shrink and clipped instead of overflowing. Non-shrinking
+   children force a real overflow, which overflow-y:auto then scrolls. */
+#desk-panel > * { flex-shrink: 0; }
+/* Action buttons that are disabled until they apply (Save/Send need steps). */
+#video-workflow button:disabled { opacity: .45; cursor: not-allowed; }

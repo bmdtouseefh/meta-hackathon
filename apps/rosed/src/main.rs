@@ -289,11 +289,384 @@ impl rose_web::HumanInput for ControlSource {
 #[allow(dead_code)] // brain/store selectors are read via config today
 struct Services {
     config: RoseConfig,
+    config_path: Option<PathBuf>,
     api_keys: ApiKeys,
     desktop: Arc<dyn DesktopBackend>,
     brain: BrainSvc,
     traces: Arc<TraceStore>,
     lease: Lease,
+}
+
+/// Live config shared between the web layer (GET/PUT /api/config) and the
+/// running loop. Policy + brain hot-reload on next run; backend/display/
+/// bind/data/cdp report `restart_needed` until `rosed` restarts.
+struct FileConfig {
+    path: Option<PathBuf>,
+    current: Arc<tokio::sync::RwLock<RoseConfig>>,
+}
+
+#[async_trait]
+impl rose_web::ConfigSource for FileConfig {
+    async fn get(&self) -> RoseConfig {
+        self.current.read().await.clone()
+    }
+
+    async fn set(&self, cfg: RoseConfig) -> Result<(RoseConfig, bool), String> {
+        rose_web::validate_config(&cfg)?;
+        let old = self.current.read().await.clone();
+        let restart = rose_web::config_restart_needed(&old, &cfg);
+        *self.current.write().await = cfg.clone();
+        if let Some(path) = &self.path {
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)
+                    .map_err(|e| format!("could not create {}: {e}", parent.display()))?;
+            }
+            let text = toml::to_string_pretty(&cfg)
+                .map_err(|e| format!("could not serialize config: {e}"))?;
+            std::fs::write(path, text)
+                .map_err(|e| format!("could not write {}: {e}", path.display()))?;
+        }
+        tracing::info!(restart_needed = restart, "config updated via UI");
+        Ok((cfg, restart))
+    }
+
+    fn source_name(&self) -> String {
+        match &self.path {
+            Some(p) => format!("rosed (/api/config, {})", p.display()),
+            None => "rosed (/api/config, defaults)".to_string(),
+        }
+    }
+}
+
+/// File-backed video store: `<data>/videos/<id>/` holds the original
+/// upload, `meta.json`, `steps.json`, and `job.json` (`{video_path,
+/// out_dir}`). Instructions come from Muse Spark native video
+/// understanding (Files API + Responses API, one call reads frames and
+/// narration together) — no SAM stage, no separate transcription stage.
+struct FileVideos {
+    root: PathBuf,
+    keys: rose_web::KeySlot,
+    env_key: Option<String>,
+    live: Arc<tokio::sync::RwLock<RoseConfig>>,
+}
+
+impl FileVideos {
+    fn new(
+        data_dir: PathBuf,
+        keys: rose_web::KeySlot,
+        env_key: Option<String>,
+        live: Arc<tokio::sync::RwLock<RoseConfig>>,
+    ) -> Self {
+        Self {
+            root: data_dir.join("videos"),
+            keys,
+            env_key,
+            live,
+        }
+    }
+
+    fn dir(&self, id: &str) -> Result<PathBuf, String> {
+        if !rose_web::valid_video_id(id) {
+            return Err("unknown video".to_string());
+        }
+        Ok(self.root.join(id))
+    }
+
+    fn read_detail(&self, id: &str) -> Option<rose_web::VideoDetail> {
+        let dir = self.dir(id).ok()?;
+        let meta_text = std::fs::read_to_string(dir.join("meta.json")).ok()?;
+        let meta: rose_web::VideoMeta = serde_json::from_str(&meta_text).ok()?;
+        let steps: Vec<rose_web::VideoStep> = std::fs::read_to_string(dir.join("steps.json"))
+            .ok()
+            .and_then(|t| serde_json::from_str(&t).ok())
+            .unwrap_or_default();
+        Some(rose_web::VideoDetail { meta, steps })
+    }
+
+    fn write_meta(&self, dir: &std::path::Path, meta: &rose_web::VideoMeta) -> Result<(), String> {
+        let text = serde_json::to_string_pretty(meta).map_err(|e| e.to_string())?;
+        std::fs::write(dir.join("meta.json"), text).map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    fn original_path(&self, dir: &std::path::Path, name: &str) -> PathBuf {
+        let ext = name
+            .rsplit('.')
+            .next()
+            .filter(|e| e.len() <= 5 && e.chars().all(|c| c.is_ascii_alphanumeric()))
+            .map(|e| format!(".{}", e.to_ascii_lowercase()))
+            .unwrap_or_else(|| ".mp4".to_string());
+        dir.join(format!("original{ext}"))
+    }
+
+    fn original_bytes(&self, dir: &std::path::Path, name: &str) -> Result<Vec<u8>, String> {
+        // Prefer the exact stored path, fall back to any original.* file.
+        let direct = self.original_path(dir, name);
+        if let Ok(bytes) = std::fs::read(&direct) {
+            return Ok(bytes);
+        }
+        let entries = std::fs::read_dir(dir).map_err(|e| e.to_string())?;
+        for entry in entries.filter_map(|e| e.ok()) {
+            if entry.file_name().to_string_lossy().starts_with("original.") {
+                return std::fs::read(entry.path()).map_err(|e| e.to_string());
+            }
+        }
+        Err("uploaded video file is missing".to_string())
+    }
+}
+
+/// Spark only reads `video/mp4`: mp4 uploads pass through, anything else
+/// is normalized with ffmpeg (ships on the VM per deploy/deb.sh).
+/// Returns the mp4 bytes plus the filename to report to the API.
+async fn ensure_mp4(name: &str, bytes: Vec<u8>) -> Result<(Vec<u8>, String), String> {
+    if name.to_ascii_lowercase().ends_with(".mp4") {
+        return Ok((bytes, rose_web::sanitize_video_name(name)));
+    }
+    let probe = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        tokio::process::Command::new("ffmpeg")
+            .arg("-version")
+            .output(),
+    )
+    .await;
+    match probe {
+        Ok(Ok(o)) if o.status.success() => {}
+        _ => {
+            return Err(format!(
+                "video is {} — Muse Spark only reads mp4; install ffmpeg on the VM or upload an mp4",
+                name.rsplit('.').next().unwrap_or("unknown")
+            ));
+        }
+    }
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let tmp = std::env::temp_dir().join(format!("rose-vidconv-{}-{n}", std::process::id()));
+    let stem = name
+        .rsplit('/')
+        .next()
+        .unwrap_or(name)
+        .rsplit('.')
+        .nth(1)
+        .unwrap_or("video");
+    let stem = rose_web::sanitize_video_name(stem);
+    let stem = stem.trim_end_matches(".mp4").to_string();
+    let out_name = format!("{stem}.mp4");
+    let convert = async {
+        std::fs::create_dir_all(&tmp).map_err(|e| e.to_string())?;
+        let inp = tmp.join(format!("in-{stem}"));
+        let outp = tmp.join("out.mp4");
+        std::fs::write(&inp, &bytes).map_err(|e| e.to_string())?;
+        let res = tokio::time::timeout(
+            std::time::Duration::from_secs(180),
+            tokio::process::Command::new("ffmpeg")
+                .args([
+                    "-y",
+                    "-i",
+                    &inp.to_string_lossy(),
+                    "-c:v",
+                    "libx264",
+                    "-preset",
+                    "veryfast",
+                    "-crf",
+                    "23",
+                    "-c:a",
+                    "aac",
+                    &outp.to_string_lossy(),
+                ])
+                .output(),
+        )
+        .await
+        .map_err(|_| "ffmpeg conversion timed out".to_string())?;
+        let out = res.map_err(|e| e.to_string())?;
+        if !out.status.success() {
+            return Err(format!(
+                "ffmpeg could not convert this video: {}",
+                String::from_utf8_lossy(&out.stderr)
+                    .chars()
+                    .take(300)
+                    .collect::<String>()
+            ));
+        }
+        std::fs::read(&outp).map_err(|e| e.to_string())
+    }
+    .await;
+    let _ = std::fs::remove_dir_all(&tmp);
+    convert.map(|mp4| (mp4, out_name))
+}
+
+#[async_trait]
+impl rose_web::VideoSource for FileVideos {
+    async fn list(&self) -> Vec<rose_web::VideoMeta> {
+        let mut out = Vec::new();
+        let entries =
+            std::fs::read_dir(&self.root).map(|r| r.filter_map(|e| e.ok()).collect::<Vec<_>>());
+        for entry in entries.unwrap_or_default() {
+            let meta_path = entry.path().join("meta.json");
+            if let Ok(text) = std::fs::read_to_string(&meta_path) {
+                if let Ok(meta) = serde_json::from_str::<rose_web::VideoMeta>(&text) {
+                    out.push(meta);
+                }
+            }
+        }
+        out.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+        out
+    }
+
+    async fn upload(
+        &self,
+        name: &str,
+        mime: &str,
+        bytes: Vec<u8>,
+    ) -> Result<rose_web::VideoMeta, String> {
+        const MAX: usize = 200 * 1024 * 1024;
+        if bytes.is_empty() {
+            return Err("empty upload".to_string());
+        }
+        if bytes.len() > MAX {
+            return Err("video too large (max 200 MB)".to_string());
+        }
+        let name = rose_web::sanitize_video_name(name);
+        let lower = name.to_ascii_lowercase();
+        if ![".mp4", ".webm", ".mov", ".mkv"]
+            .iter()
+            .any(|ext| lower.ends_with(ext))
+        {
+            return Err("only mp4 / webm / mov / mkv uploads".to_string());
+        }
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let id = format!("v{now:x}-{n}");
+        let dir = self.root.join(&id);
+        std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+        let dest = self.original_path(&dir, &name);
+        std::fs::write(&dest, &bytes).map_err(|e| e.to_string())?;
+        // V2.1 job contract for the future Python worker.
+        let job = serde_json::json!({
+            "video_path": dest.to_string_lossy(),
+            "out_dir": dir.to_string_lossy(),
+        });
+        let _ = std::fs::write(
+            dir.join("job.json"),
+            serde_json::to_string_pretty(&job).unwrap_or_default(),
+        );
+        let meta = rose_web::VideoMeta {
+            id: id.clone(),
+            name,
+            size: bytes.len() as u64,
+            mime: mime.to_string(),
+            created_at: chrono::Utc::now().to_rfc3339(),
+            status: "queued".to_string(),
+            steps: 0,
+        };
+        self.write_meta(&dir, &meta)?;
+        let _ = std::fs::write(dir.join("steps.json"), "[]");
+        tracing::info!(video_id = %id, bytes = bytes.len(), "video uploaded");
+        Ok(meta)
+    }
+
+    async fn file(&self, id: &str) -> Option<(Vec<u8>, String)> {
+        let dir = self.dir(id).ok()?;
+        let detail = self.read_detail(id)?;
+        // Original keeps its uploaded extension.
+        let entries = std::fs::read_dir(&dir).ok()?;
+        for entry in entries.filter_map(|e| e.ok()) {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.starts_with("original.") {
+                let bytes = std::fs::read(entry.path()).ok()?;
+                return Some((bytes, detail.meta.mime));
+            }
+        }
+        None
+    }
+
+    async fn detail(&self, id: &str) -> Option<rose_web::VideoDetail> {
+        self.read_detail(id)
+    }
+
+    async fn generate(&self, id: &str) -> Result<rose_web::VideoDetail, String> {
+        let dir = self.dir(id)?;
+        let mut detail = self.read_detail(id).ok_or("unknown video".to_string())?;
+        let key = self
+            .keys
+            .get()
+            .or_else(|| self.env_key.clone())
+            .ok_or_else(|| "no Muse API key — set it in Setup or ROSE_MUSE_API_KEY".to_string())?;
+        let snap = self.live.read().await.clone();
+        let bytes = self.original_bytes(&dir, &detail.meta.name)?;
+        let (mp4, upload_name) = ensure_mp4(&detail.meta.name, bytes).await?;
+        let draft = rose_models::video::extract_instructions(
+            &snap.models.endpoint,
+            &snap.models.model,
+            &key,
+            &upload_name,
+            &mp4,
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+        if draft.is_empty() {
+            return Err(
+                "Spark found no task steps in this video — try a narrated recording".to_string(),
+            );
+        }
+        let steps: Vec<rose_web::VideoStep> = draft
+            .into_iter()
+            .map(|s| rose_web::VideoStep {
+                ts: s.ts,
+                say: s.say,
+                intent: s.intent,
+                params: s.params,
+                approval: s.approval,
+                conf: s.conf,
+                quote: s.quote,
+            })
+            .collect();
+        std::fs::write(
+            dir.join("steps.json"),
+            serde_json::to_string_pretty(&steps).map_err(|e| e.to_string())?,
+        )
+        .map_err(|e| e.to_string())?;
+        detail.meta.status = "ready".to_string();
+        detail.meta.steps = steps.len();
+        detail.steps = steps;
+        self.write_meta(&dir, &detail.meta)?;
+        tracing::info!(video_id = %id, steps = detail.steps.len(), "video instructions drafted by spark");
+        Ok(detail)
+    }
+
+    async fn save_draft(
+        &self,
+        id: &str,
+        steps: Vec<rose_web::VideoStep>,
+    ) -> Result<rose_web::VideoDetail, String> {
+        if steps.len() > 100 {
+            return Err("too many steps (max 100)".to_string());
+        }
+        let dir = self.dir(id)?;
+        let mut detail = self.read_detail(id).ok_or("unknown video".to_string())?;
+        std::fs::write(
+            dir.join("steps.json"),
+            serde_json::to_string_pretty(&steps).map_err(|e| e.to_string())?,
+        )
+        .map_err(|e| e.to_string())?;
+        detail.meta.steps = steps.len();
+        if detail.meta.status == "queued" && !steps.is_empty() {
+            detail.meta.status = "ready".to_string();
+        }
+        detail.steps = steps;
+        self.write_meta(&dir, &detail.meta)?;
+        Ok(detail)
+    }
+
+    async fn remove(&self, id: &str) -> bool {
+        match self.dir(id) {
+            Ok(dir) => std::fs::remove_dir_all(&dir).is_ok(),
+            Err(_) => false,
+        }
+    }
 }
 
 fn default_config_path() -> Option<PathBuf> {
@@ -303,17 +676,18 @@ fn default_config_path() -> Option<PathBuf> {
 }
 
 /// Load TOML file (if present) + env secrets. Missing file = built-in default.
-fn load_config(path_override: Option<PathBuf>) -> Result<(RoseConfig, ApiKeys)> {
+/// Returns the resolved file path too, so PUT /api/config knows where to persist.
+fn load_config(path_override: Option<PathBuf>) -> Result<(RoseConfig, ApiKeys, Option<PathBuf>)> {
     let path = path_override.or_else(default_config_path);
-    let config = match path {
+    let config = match &path {
         Some(p) if p.exists() => {
             let text =
-                std::fs::read_to_string(&p).with_context(|| format!("reading {}", p.display()))?;
+                std::fs::read_to_string(p).with_context(|| format!("reading {}", p.display()))?;
             toml::from_str(&text).with_context(|| format!("parsing {}", p.display()))?
         }
         _ => RoseConfig::default(),
     };
-    Ok((config, ApiKeys::from_env()))
+    Ok((config, ApiKeys::from_env(), path))
 }
 
 fn expand_tilde(dir: &str) -> PathBuf {
@@ -370,7 +744,11 @@ fn make_store(config: &RoseConfig) -> Arc<TraceStore> {
     Arc::new(TraceStore::new(expand_tilde(&config.data.dir)))
 }
 
-fn build_services(config: RoseConfig, api_keys: ApiKeys) -> Result<Services> {
+fn build_services(
+    config: RoseConfig,
+    api_keys: ApiKeys,
+    config_path: Option<PathBuf>,
+) -> Result<Services> {
     // Guard: never serve remotely without an explicit opt-in.
     if config.server.allow_remote {
         eprintln!("WARNING: allow_remote = true: UI/API is reachable beyond localhost");
@@ -381,6 +759,7 @@ fn build_services(config: RoseConfig, api_keys: ApiKeys) -> Result<Services> {
         traces: make_store(&config),
         lease: Lease::new(),
         config,
+        config_path,
         api_keys,
     })
 }
@@ -406,13 +785,12 @@ fn needs_approval(policy: &Policy, intent: &str) -> bool {
 /// the next route (double-click, menu search, wait for launch).
 struct Stepper {
     desktop: Arc<dyn DesktopBackend>,
-    brain: BrainSvc,
     fake: FakeBrain,
     keys: rose_web::KeySlot,
     env_key: Option<String>,
-    endpoint: String,
-    model: String,
-    policy: Policy,
+    /// Live config: policy + brain hot-reload from PUT /api/config.
+    /// Read once per run so a run sees a consistent snapshot.
+    live: Arc<tokio::sync::RwLock<RoseConfig>>,
     traces: Arc<TraceStore>,
     shell: shell::ShellRunner,
     /// Who may inject input. While a human holds it the loop pauses at
@@ -425,6 +803,23 @@ struct Stepper {
     /// True while a run is in flight (also serialises runs: the stop
     /// flag's meaning is only well-defined for one run at a time).
     active: Arc<std::sync::atomic::AtomicBool>,
+    /// Paused-at-approval state, answered by the very next run in the
+    /// same chat (approve = resume where it paused, anything else drops
+    /// it). Single-use by design: at most one paused run exists, because
+    /// runs are serialised.
+    resume: std::sync::Mutex<Option<ResumeState>>,
+}
+
+/// A run that paused for approval, waiting for the answer. The next
+/// forced run in the same chat resumes with the full step history, so
+/// Approve continues where it stopped instead of restarting the task
+/// (which would redo — and possibly duplicate — already-done actions).
+struct ResumeState {
+    chat_id: String,
+    goal: String,
+    history: Vec<StepSummary>,
+    acted: bool,
+    steps_done: u32,
 }
 
 /// Shell commands need approval when they look destructive OR when
@@ -622,6 +1017,7 @@ impl rose_web::StepRunner for Stepper {
         &self,
         goal: &str,
         force: bool,
+        auto_approve: bool,
         chat_id: Option<&str>,
         tx: &rose_web::StepEventSender,
     ) -> Result<serde_json::Value, String> {
@@ -633,6 +1029,32 @@ impl rose_web::StepRunner for Stepper {
         }
         let _run_guard = ActiveGuard(Arc::clone(&self.active));
         self.stop_flag.store(false, Ordering::SeqCst);
+        // Answer a paused-for-approval run, or drop the pause: the
+        // approval question is answered by the very next forced run in
+        // the same chat for the same goal — anything else dismisses it.
+        // (Single-use: the slot is taken whether or not it matches.)
+        let resumed = self
+            .resume
+            .lock()
+            .ok()
+            .and_then(|mut slot| slot.take())
+            .filter(|p| {
+                force
+                    && !p.chat_id.is_empty()
+                    && chat_id.is_some_and(|c| c == p.chat_id)
+                    && p.goal == goal
+            });
+        // `force` answers one pending gate; `auto_approve` ("don't ask
+        // again for this run") answers every gate this run. Both are
+        // per-run: a fresh run gates normally.
+        let mut force = force;
+        // Live config snapshot: PUT /api/config hot-reloads policy + brain
+        // on the next run; a run sees one consistent snapshot throughout.
+        let snapshot = self.live.read().await.clone();
+        let policy = snapshot.policy.clone();
+        let brain: BrainSvc = snapshot.models.brain.as_str().into();
+        let endpoint = snapshot.models.endpoint.clone();
+        let model = snapshot.models.model.clone();
         // Every phase is emitted as it happens so the chat can narrate
         // the run live — and the identical event is appended to the
         // persisted trace (`rose_store`), so the run stays observable
@@ -745,10 +1167,21 @@ impl rose_web::StepRunner for Stepper {
             }};
         }
         emit!(serde_json::json!({
-            "type": "run_started", "goal": goal, "max_steps": self.policy.max_steps,
+            "type": "run_started", "goal": goal, "max_steps": policy.max_steps,
         }));
         let mut history: Vec<StepSummary> = prior_turns;
         let mut acted = false;
+        let mut base_steps = 0u32;
+        let mut did_resume = false;
+        // Resume: seed the full step history of the paused run so the
+        // brain continues where it stopped instead of redoing (and
+        // possibly duplicating) already-done actions.
+        if let Some(p) = resumed {
+            base_steps = p.steps_done;
+            history.extend(p.history);
+            acted = p.acted;
+            did_resume = true;
+        }
         let mut last_action: Option<Action> = None;
         let mut last_outcome: Option<bool> = None;
         let mut repeats = 0u32;
@@ -775,7 +1208,13 @@ impl rose_web::StepRunner for Stepper {
         // verification) before any screenshot is taken or sent.
         let mut vision = false;
         let mut mode_switches = 0u32;
-        let mut idx = 0u32;
+        let mut idx = base_steps;
+        if did_resume {
+            emit!(serde_json::json!({
+                "type": "resumed", "step": idx,
+                "say": format!("Approved — resuming at step {idx}, not restarting"),
+            }));
+        }
         // Read-back arming for removal goals (see goal_needs_removal_check):
         // the first Done forces a fresh observation instead of finishing;
         // only a second consecutive Done — after seeing that frame — ends
@@ -786,7 +1225,7 @@ impl rose_web::StepRunner for Stepper {
         // resume with a fresh observation — the human may have changed the
         // desktop under us, so nothing cached survives.
         let mut paused = false;
-        while idx < self.policy.max_steps {
+        while idx < policy.max_steps {
             check_stop!(idx, acted);
             if self.lease.holder() != Driver::Agent {
                 if !paused {
@@ -826,7 +1265,7 @@ impl rose_web::StepRunner for Stepper {
                 }));
                 let brain_started = std::time::Instant::now();
                 let reply = match unless_stopped(&self.stop_flag, async {
-                    match self.brain {
+                    match brain {
                         BrainSvc::Fake => self
                             .fake
                             .next_action_text(goal, &history)
@@ -840,8 +1279,7 @@ impl rose_web::StepRunner for Stepper {
                                 "no Muse API key — set it in Setup or ROSE_MUSE_API_KEY".to_string()
                             })
                             .and_then(|key| {
-                                MuseClient::new(&self.endpoint, &self.model, &key)
-                                    .map_err(|e| e.to_string())
+                                MuseClient::new(&endpoint, &model, &key).map_err(|e| e.to_string())
                             }) {
                             Ok(client) => client
                                 .next_action_text(goal, &history)
@@ -1041,7 +1479,10 @@ impl rose_web::StepRunner for Stepper {
                         if let Some(els) = grounded.as_deref() {
                             let still_there: Vec<String> = distinctive_words(&target)
                                 .into_iter()
-                                .filter(|w| els.iter().any(|e| e.label.to_lowercase().contains(w.as_str())))
+                                .filter(|w| {
+                                    els.iter()
+                                        .any(|e| e.label.to_lowercase().contains(w.as_str()))
+                                })
                                 .collect();
                             if !still_there.is_empty() {
                                 let say = format!(
@@ -1076,7 +1517,7 @@ impl rose_web::StepRunner for Stepper {
                 // brain thinks abandons the call instead of acting on a
                 // reply the user no longer wants executed.
                 let vision_reply = match unless_stopped(&self.stop_flag, async {
-                    match self.brain {
+                    match brain {
                         BrainSvc::Fake => self
                             .fake
                             .next_action(goal, &history, &brain_jpeg, grounded_elements)
@@ -1090,8 +1531,7 @@ impl rose_web::StepRunner for Stepper {
                                 "no Muse API key — set it in Setup or ROSE_MUSE_API_KEY".to_string()
                             })
                             .and_then(|key| {
-                                MuseClient::new(&self.endpoint, &self.model, &key)
-                                    .map_err(|e| e.to_string())
+                                MuseClient::new(&endpoint, &model, &key).map_err(|e| e.to_string())
                             }) {
                             Ok(client) => client
                                 .next_action(goal, &history, &brain_jpeg, grounded_elements)
@@ -1173,7 +1613,9 @@ impl rose_web::StepRunner for Stepper {
                                 Target::Element(id) => resolve_element(&elements, &id.0)
                                     .or_else(|| {
                                         rose_grid::resolve_grid_cell(
-                                            &id.0, frame.width, frame.height,
+                                            &id.0,
+                                            frame.width,
+                                            frame.height,
                                         )
                                     })
                                     .map(|(x, y)| Target::Point { x, y }),
@@ -1272,7 +1714,8 @@ impl rose_web::StepRunner for Stepper {
                             }));
                             finish_ok!(step_view_steps(&msg, acted, false, false, idx));
                         }
-                        let msg = "Pixel coordinates are not accepted — aiming by grid instead".to_string();
+                        let msg = "Pixel coordinates are not accepted — aiming by grid instead"
+                            .to_string();
                         emit!(serde_json::json!({
                             "type": "rejected", "step": idx,
                             "action": describe_action(&action), "say": msg,
@@ -1299,12 +1742,40 @@ impl rose_web::StepRunner for Stepper {
                         "type": "planned", "step": idx, "say": say,
                         "action": action_text, "brain_ms": brain_ms,
                     }));
-                    if !force && needs_approval(&self.policy, &say) {
-                        tracing::warn!(%say, "step gated: needs approval");
-                        emit!(serde_json::json!({
-                            "type": "approval", "step": idx, "say": say, "action": action_text,
-                        }));
-                        finish_ok!(step_view_steps(&say, acted, true, false, idx));
+                    if needs_approval(&policy, &say) {
+                        if auto_approve {
+                            // "Don't ask again" for this run: act, but leave
+                            // the bypass in the trace so it stays auditable.
+                            emit!(serde_json::json!({
+                                "type": "auto_approved", "step": idx,
+                                "say": say, "action": action_text,
+                            }));
+                        } else if force {
+                            // Answering this one gate; further gates still ask.
+                            force = false;
+                        } else {
+                            tracing::warn!(%say, "step gated: needs approval");
+                            emit!(serde_json::json!({
+                                "type": "approval", "step": idx, "say": say, "action": action_text,
+                            }));
+                            // Pause here instead of acting: the answer
+                            // arrives as the next run in this chat (approve
+                            // resumes with full history, anything else
+                            // drops the pause and starts fresh).
+                            if !chat_id.is_empty() {
+                                let pause = ResumeState {
+                                    chat_id: chat_id.clone(),
+                                    goal: goal.to_string(),
+                                    history: history.clone(),
+                                    acted,
+                                    steps_done: idx,
+                                };
+                                if let Ok(mut slot) = self.resume.lock() {
+                                    *slot = Some(pause);
+                                }
+                            }
+                            finish_ok!(step_view_steps(&say, acted, true, false, idx));
+                        }
                     }
                     // No-effect repeat: the previous identical action
                     // provably changed nothing on screen, so executing
@@ -1425,12 +1896,33 @@ impl rose_web::StepRunner for Stepper {
                         "type": "planned", "step": idx, "say": say,
                         "action": action_text, "command": command, "brain_ms": brain_ms,
                     }));
-                    if !force && shell_needs_approval(&self.policy, &say, &command) {
-                        tracing::warn!(%say, %command, "shell command gated: needs approval");
-                        emit!(serde_json::json!({
-                            "type": "approval", "step": idx, "say": say, "action": action_text,
-                        }));
-                        finish_ok!(step_view_steps(&say, acted, true, false, idx));
+                    if shell_needs_approval(&policy, &say, &command) {
+                        if auto_approve {
+                            emit!(serde_json::json!({
+                                "type": "auto_approved", "step": idx,
+                                "say": say, "action": action_text,
+                            }));
+                        } else if force {
+                            force = false;
+                        } else {
+                            tracing::warn!(%say, %command, "shell command gated: needs approval");
+                            emit!(serde_json::json!({
+                                "type": "approval", "step": idx, "say": say, "action": action_text,
+                            }));
+                            if !chat_id.is_empty() {
+                                let pause = ResumeState {
+                                    chat_id: chat_id.clone(),
+                                    goal: goal.to_string(),
+                                    history: history.clone(),
+                                    acted,
+                                    steps_done: idx,
+                                };
+                                if let Ok(mut slot) = self.resume.lock() {
+                                    *slot = Some(pause);
+                                }
+                            }
+                            finish_ok!(step_view_steps(&say, acted, true, false, idx));
+                        }
                     }
                     check_stop!(idx, acted);
                     tracing::info!(idx, %say, %command, "shell exec");
@@ -1549,10 +2041,10 @@ impl rose_web::StepRunner for Stepper {
         }
         let msg = format!(
             "Stopped after {} steps (budget) without finishing.",
-            self.policy.max_steps
+            policy.max_steps
         );
         emit!(serde_json::json!({"type": "stuck", "say": msg}));
-        let mut view = step_view_steps(&msg, acted, false, false, self.policy.max_steps);
+        let mut view = step_view_steps(&msg, acted, false, false, policy.max_steps);
         view["chat_id"] = serde_json::json!(chat_id);
         record_final!(view.clone());
         Ok(view)
@@ -1762,7 +2254,7 @@ async fn main() -> Result<()> {
         return cmd_install(dry_run);
     }
 
-    let (config, keys) = load_config(cli.config)?;
+    let (config, keys, config_path) = load_config(cli.config)?;
 
     if cli.print_config {
         return print_config(&config, &keys);
@@ -1786,7 +2278,7 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    let services = build_services(config, keys)?;
+    let services = build_services(config, keys, config_path)?;
 
     // Bind guard: loopback always OK; anything else needs explicit opt-in.
     let addr: std::net::SocketAddr = services
@@ -1811,20 +2303,21 @@ async fn main() -> Result<()> {
     );
     // Web-set keys live in server memory (KeySlot); env key is the fallback.
     let keys = rose_web::KeySlot::default();
+    let live: Arc<tokio::sync::RwLock<RoseConfig>> =
+        Arc::new(tokio::sync::RwLock::new(services.config.clone()));
+    let data_dir = expand_tilde(&services.config.data.dir);
     let stepper = Stepper {
         desktop: Arc::clone(&services.desktop),
-        brain: services.config.models.brain.as_str().into(),
         fake: FakeBrain::demo(),
         keys: keys.clone(),
         env_key: services.api_keys.muse_api_key.clone(),
-        endpoint: services.config.models.endpoint.clone(),
-        model: services.config.models.model.clone(),
-        policy: services.config.policy.clone(),
+        live: Arc::clone(&live),
         traces: Arc::clone(&services.traces),
         shell: shell::ShellRunner::new(services.config.desktop.display.clone()),
         lease: services.lease.clone(),
         stop_flag: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        resume: std::sync::Mutex::new(None),
     };
     let state = rose_web::AppState {
         source: Some(Arc::new(BackendSource {
@@ -1837,12 +2330,22 @@ async fn main() -> Result<()> {
         traces: Some(Arc::new(TraceAdapter {
             store: Arc::clone(&services.traces),
         })),
-        keys,
+        keys: keys.clone(),
         lease: services.lease.clone(),
         control: Some(Arc::new(ControlSource {
             backend: Arc::clone(&services.desktop),
             lease: services.lease.clone(),
         })),
+        config: Some(Arc::new(FileConfig {
+            path: services.config_path.clone(),
+            current: Arc::clone(&live),
+        })),
+        videos: Some(Arc::new(FileVideos::new(
+            data_dir,
+            keys,
+            services.api_keys.muse_api_key.clone(),
+            Arc::clone(&live),
+        ))),
         env_key_present: services.api_keys.muse_api_key.is_some(),
         backend: services.config.desktop.backend.clone(),
         brain: services.config.models.brain.clone(),
@@ -1875,7 +2378,7 @@ mod tests {
 
     #[test]
     fn missing_file_falls_back_to_default() {
-        let (cfg, _) =
+        let (cfg, _, _) =
             load_config(Some(PathBuf::from("/nonexistent/rose-test.toml"))).expect("load");
         assert_eq!(cfg, RoseConfig::default());
     }
@@ -1885,7 +2388,7 @@ mod tests {
         let mut cfg = RoseConfig::default();
         cfg.desktop.backend = "fake".to_string();
         cfg.models.brain = "fake".to_string();
-        let svc = build_services(cfg, ApiKeys::default()).expect("fake services build");
+        let svc = build_services(cfg, ApiKeys::default(), None).expect("fake services build");
         let info = svc.desktop.info().await.expect("info");
         assert_eq!((info.width, info.height), (1600, 900));
         let frame = svc.desktop.capture().await.expect("capture");
@@ -1898,7 +2401,7 @@ mod tests {
         // is resolved per step.
         let mut cfg = RoseConfig::default(); // backend x11 (lazy), brain muse
         cfg.desktop.backend = "fake".to_string(); // keep this test display-free
-        build_services(cfg, ApiKeys::default()).expect("muse selector builds");
+        build_services(cfg, ApiKeys::default(), None).expect("muse selector builds");
         assert!(needs_approval(&Policy::default(), "Click Pay now"));
         assert!(!needs_approval(&Policy::default(), "Clicking Export"));
     }
@@ -1967,21 +2470,145 @@ mod tests {
     }
 
     fn test_stepper(brain: BrainSvc) -> Stepper {
+        let mut cfg = RoseConfig::default();
+        cfg.desktop.backend = "fake".to_string();
+        cfg.models.brain = match brain {
+            BrainSvc::Fake => "fake".to_string(),
+            BrainSvc::Muse => "muse".to_string(),
+        };
         Stepper {
             desktop: Arc::new(FakeDesktop::new()),
-            brain,
             fake: FakeBrain::demo(),
             keys: rose_web::KeySlot::default(),
             env_key: None,
-            endpoint: "https://api.meta.ai/v1".to_string(),
-            model: "muse-spark-1.3-contributor".to_string(),
-            policy: Policy::default(),
+            live: Arc::new(tokio::sync::RwLock::new(cfg)),
             traces: test_traces(),
             shell: shell::ShellRunner::new(":fake"),
             lease: Lease::new(),
             stop_flag: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            resume: std::sync::Mutex::new(None),
         }
+    }
+
+    #[tokio::test]
+    async fn file_config_set_persists_and_flags_restart() {
+        use rose_web::ConfigSource;
+        let dir = std::env::temp_dir().join(format!("rose-cfg-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("tmp");
+        let path = dir.join("config.toml");
+        let live = Arc::new(tokio::sync::RwLock::new(RoseConfig::default()));
+        let store = FileConfig {
+            path: Some(path.clone()),
+            current: Arc::clone(&live),
+        };
+        let mut next = RoseConfig::default();
+        next.policy.max_steps = 12;
+        let (applied, restart) = store.set(next).await.expect("set");
+        assert_eq!(applied.policy.max_steps, 12);
+        assert!(!restart, "policy-only change hot-reloads");
+        assert!(path.exists(), "config persisted to file");
+        let mut back = RoseConfig::default();
+        back.desktop.backend = "fake".to_string();
+        let (_, restart) = store.set(back).await.expect("set");
+        assert!(restart, "backend switch needs restart");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn test_videos(data_dir: PathBuf) -> FileVideos {
+        FileVideos::new(
+            data_dir,
+            rose_web::KeySlot::default(),
+            None,
+            Arc::new(tokio::sync::RwLock::new(RoseConfig::default())),
+        )
+    }
+
+    #[tokio::test]
+    async fn file_videos_upload_save_remove_roundtrip() {
+        use rose_web::VideoSource;
+        let dir = std::env::temp_dir().join(format!("rose-vid-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("tmp");
+        let store = test_videos(dir.clone());
+        let meta = store
+            .upload("demo.mp4", "video/mp4", b"0123456789".to_vec())
+            .await
+            .expect("upload");
+        assert_eq!(meta.name, "demo.mp4");
+        let (bytes, mime) = store.file(&meta.id).await.expect("file");
+        assert_eq!(bytes, b"0123456789");
+        assert_eq!(mime, "video/mp4");
+        let saved = store.save_draft(&meta.id, Vec::new()).await.expect("save");
+        assert!(saved.steps.is_empty());
+        assert!(store.remove(&meta.id).await);
+        assert!(store.detail(&meta.id).await.is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn video_generate_needs_an_api_key_not_a_mock() {
+        use rose_web::VideoSource;
+        // No key anywhere: generate must fail loudly instead of
+        // returning stock steps. No network is touched.
+        let dir = std::env::temp_dir().join(format!("rose-vid-key-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("tmp");
+        let store = test_videos(dir.clone());
+        let meta = store
+            .upload("demo.mp4", "video/mp4", b"0123456789".to_vec())
+            .await
+            .expect("upload");
+        let err = store.generate(&meta.id).await.unwrap_err();
+        assert!(err.contains("API key"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn ensure_mp4_passes_mp4_through_untouched() {
+        let bytes = b"fake-mp4-bytes".to_vec();
+        let (out, name) = ensure_mp4("clip.mp4", bytes.clone()).await.expect("mp4");
+        assert_eq!(out, bytes);
+        assert_eq!(name, "clip.mp4");
+    }
+
+    #[tokio::test]
+    async fn live_config_hot_reloads_policy_into_next_run() {
+        use rose_web::StepRunner;
+        // Script needs 2 vision steps; live max_steps=1 must stop it early.
+        let click = rose_models::ModelReply::Act {
+            action: rose_core::Action::Click {
+                target: rose_core::Target::Element(rose_core::ElementId(
+                    "g1,1@0.42,0.42".to_string(),
+                )),
+                button: rose_core::MouseButton::Left,
+            },
+            say: "Clicking".to_string(),
+            enter_after: false,
+        };
+        let stepper = Stepper {
+            fake: FakeBrain::scripted(vec![
+                rose_models::ModelReply::Look {
+                    say: "Need to see the desktop".to_string(),
+                },
+                click,
+                rose_models::ModelReply::Done {
+                    say: "Done".to_string(),
+                },
+            ]),
+            ..test_stepper(BrainSvc::Fake)
+        };
+        {
+            let mut cfg = stepper.live.write().await;
+            cfg.policy.max_steps = 1;
+        }
+        let (tx, _rx) = event_channel();
+        let view = stepper
+            .run_step("hot reload test", false, false, None, &tx)
+            .await
+            .expect("run");
+        assert_eq!(view["steps"], 1, "live policy capped the run");
     }
 
     #[test]
@@ -2000,7 +2627,7 @@ mod tests {
         use rose_web::StepRunner;
         let (tx, _rx) = event_channel();
         let view = test_stepper(BrainSvc::Fake)
-            .run_step("click the first cell", false, None, &tx)
+            .run_step("click the first cell", false, false, None, &tx)
             .await
             .expect("step");
         assert_eq!(view["acted"], true);
@@ -2012,7 +2639,7 @@ mod tests {
         use rose_web::StepRunner;
         let (tx, mut rx) = event_channel();
         let err = test_stepper(BrainSvc::Muse)
-            .run_step("do a thing", false, None, &tx)
+            .run_step("do a thing", false, false, None, &tx)
             .await
             .unwrap_err();
         assert!(err.contains("API key"), "{err}");
@@ -2055,16 +2682,147 @@ mod tests {
         };
         let (tx, _rx) = event_channel();
         let gated = stepper
-            .run_step("pay", false, None, &tx)
+            .run_step("pay", false, false, None, &tx)
             .await
             .expect("gated");
         assert_eq!(gated["acted"], false);
         assert_eq!(gated["approval_needed"], true);
         let forced = stepper
-            .run_step("pay", true, None, &tx)
+            .run_step("pay", true, false, None, &tx)
             .await
             .expect("forced");
         assert_eq!(forced["acted"], true);
+    }
+
+    fn risky_click(say: &str) -> rose_models::ModelReply {
+        rose_models::ModelReply::Act {
+            action: rose_core::Action::Click {
+                target: rose_core::Target::Element(rose_core::ElementId(
+                    "g1,1@0.42,0.42".to_string(),
+                )),
+                button: rose_core::MouseButton::Left,
+            },
+            say: say.to_string(),
+            enter_after: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn approve_resumes_where_it_paused_instead_of_restarting() {
+        use rose_web::StepRunner;
+        // Run 1 gates on the risky click; run 2 (forced, same chat+goal)
+        // resumes with the paused history — a `resumed` event, no replay
+        // of the discovery steps, and the gated action finally acts.
+        let stepper = Stepper {
+            fake: FakeBrain::scripted(vec![
+                rose_models::ModelReply::Look {
+                    say: "Need to see the desktop".to_string(),
+                },
+                risky_click("Clicking Pay now"),
+                // Resumed runs restart text-first: look, then act.
+                rose_models::ModelReply::Look {
+                    say: "Need to see the desktop".to_string(),
+                },
+                risky_click("Clicking Pay now"),
+                rose_models::ModelReply::Done {
+                    say: "Paid".to_string(),
+                },
+            ]),
+            ..test_stepper(BrainSvc::Fake)
+        };
+        let chat = "chat-resume-1";
+        let (tx, mut rx) = event_channel();
+        let gated = stepper
+            .run_step("pay the bill", false, false, Some(chat), &tx)
+            .await
+            .expect("gated");
+        assert_eq!(gated["approval_needed"], true);
+        assert_eq!(gated["acted"], false);
+        let resumed = stepper
+            .run_step("pay the bill", true, false, Some(chat), &tx)
+            .await
+            .expect("resumed");
+        assert_eq!(resumed["done"], true);
+        assert_eq!(resumed["acted"], true);
+        let events = drain(&mut rx);
+        assert!(
+            events.iter().any(|e| e["type"] == "resumed"),
+            "continuation is announced, not a silent restart: {events:?}"
+        );
+        // Single-use: a further forced run finds no pause to answer.
+        let (tx, mut rx) = event_channel();
+        let _ = stepper
+            .run_step("pay the bill", true, false, Some(chat), &tx)
+            .await;
+        let events = drain(&mut rx);
+        assert!(
+            !events.iter().any(|e| e["type"] == "resumed"),
+            "pause is consumed by its answer: {events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn approve_all_bypasses_further_gates_with_audit() {
+        use rose_web::StepRunner;
+        let stepper = Stepper {
+            fake: FakeBrain::scripted(vec![
+                rose_models::ModelReply::Look {
+                    say: "Need to see the desktop".to_string(),
+                },
+                risky_click("Clicking Pay now"),
+                risky_click("Clicking Send receipt"),
+                rose_models::ModelReply::Done {
+                    say: "Paid and sent".to_string(),
+                },
+            ]),
+            ..test_stepper(BrainSvc::Fake)
+        };
+        let (tx, mut rx) = event_channel();
+        let view = stepper
+            .run_step("pay and send", false, true, Some("chat-auto-1"), &tx)
+            .await
+            .expect("auto-approved run");
+        assert_eq!(view["done"], true);
+        assert_eq!(view["approval_needed"], false);
+        let events = drain(&mut rx);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| e["type"] == "auto_approved")
+                .count(),
+            2,
+            "every bypassed gate stays in the trace: {events:?}"
+        );
+        assert!(
+            !events.iter().any(|e| e["type"] == "approval"),
+            "no pause was raised: {events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn force_answers_only_the_first_gate() {
+        use rose_web::StepRunner;
+        let stepper = Stepper {
+            fake: FakeBrain::scripted(vec![
+                rose_models::ModelReply::Look {
+                    say: "Need to see the desktop".to_string(),
+                },
+                risky_click("Clicking Pay now"),
+                risky_click("Clicking Send receipt"),
+                rose_models::ModelReply::Done {
+                    say: "Paid and sent".to_string(),
+                },
+            ]),
+            ..test_stepper(BrainSvc::Fake)
+        };
+        let (tx, _rx) = event_channel();
+        let view = stepper
+            .run_step("pay and send", true, false, Some("chat-once-1"), &tx)
+            .await
+            .expect("forced run");
+        // First gate passed via force; the second one still asked.
+        assert_eq!(view["approval_needed"], true);
+        assert_eq!(view["acted"], true);
     }
 
     #[tokio::test]
@@ -2099,7 +2857,7 @@ mod tests {
         };
         let (tx, mut rx) = event_channel();
         let view = stepper
-            .run_step("open the browser", false, None, &tx)
+            .run_step("open the browser", false, false, None, &tx)
             .await
             .expect("run");
         assert_eq!(view["acted"], true);
@@ -2196,7 +2954,11 @@ mod tests {
         let (tx, mut rx) = event_channel();
         let run = tokio::spawn({
             let stepper = Arc::clone(&stepper);
-            async move { stepper.run_step("takeover test", false, None, &tx).await }
+            async move {
+                stepper
+                    .run_step("takeover test", false, false, None, &tx)
+                    .await
+            }
         });
         // The loop announces the pause and dispatches nothing while held.
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
@@ -2241,7 +3003,7 @@ mod tests {
         };
         let (tx, mut rx) = event_channel();
         let view = stepper
-            .run_step("remove the volume pane", false, None, &tx)
+            .run_step("remove the volume pane", false, false, None, &tx)
             .await
             .expect("run");
         assert_eq!(view["done"], true);
@@ -2271,7 +3033,7 @@ mod tests {
         };
         let (tx, _rx) = event_channel();
         let view = stepper
-            .run_step("open the GOOGL chart", false, None, &tx)
+            .run_step("open the GOOGL chart", false, false, None, &tx)
             .await
             .expect("run");
         assert_eq!(view["done"], true);
@@ -2362,7 +3124,7 @@ mod tests {
         };
         let (tx, mut rx) = event_channel();
         let view = stepper
-            .run_step("click the first cell", false, None, &tx)
+            .run_step("click the first cell", false, false, None, &tx)
             .await
             .expect("run");
         assert_eq!(view["done"], true);
@@ -2414,7 +3176,7 @@ mod tests {
         };
         let (tx, mut rx) = event_channel();
         let view = stepper
-            .run_step("click the first cell", false, None, &tx)
+            .run_step("click the first cell", false, false, None, &tx)
             .await
             .expect("run");
         assert_eq!(view["done"], true);
@@ -2468,7 +3230,7 @@ mod tests {
         };
         let (tx, mut rx) = event_channel();
         let view = stepper
-            .run_step("click the first cell", false, None, &tx)
+            .run_step("click the first cell", false, false, None, &tx)
             .await
             .expect("run");
         assert_eq!(view["done"], true);
@@ -2517,13 +3279,16 @@ mod tests {
         };
         let (tx, _rx) = event_channel();
         let view = stepper
-            .run_step("click the first cell", false, None, &tx)
+            .run_step("click the first cell", false, false, None, &tx)
             .await
             .expect("run");
         assert_eq!(view["acted"], false);
         assert_eq!(desktop.highlighted(), None, "no pixel click ever acted");
         assert!(
-            view["say"].as_str().unwrap_or("").contains("guessed pixels"),
+            view["say"]
+                .as_str()
+                .unwrap_or("")
+                .contains("guessed pixels"),
             "{view}"
         );
     }
@@ -2559,7 +3324,7 @@ mod tests {
         };
         let (tx, _rx) = event_channel();
         let view = stepper
-            .run_step("click cell 5,5", false, None, &tx)
+            .run_step("click cell 5,5", false, false, None, &tx)
             .await
             .expect("run");
         assert_eq!(view["done"], true);
@@ -2589,7 +3354,7 @@ mod tests {
         };
         let (tx, mut rx) = event_channel();
         let view = stepper
-            .run_step("look at the desktop", false, None, &tx)
+            .run_step("look at the desktop", false, false, None, &tx)
             .await
             .expect("run");
         assert_eq!(view["done"], true);
@@ -2654,7 +3419,7 @@ mod tests {
         };
         let (tx, mut rx) = event_channel();
         let err = stepper
-            .run_step("click the first cell", false, None, &tx)
+            .run_step("click the first cell", false, false, None, &tx)
             .await
             .expect_err("grid failure must fail the step, not fall back to raw");
         assert!(err.contains("grid overlay failed"), "{err}");
@@ -2696,8 +3461,8 @@ mod tests {
             rose_models::ModelReply::Act {
                 action: rose_core::Action::Click {
                     target: rose_core::Target::Element(rose_core::ElementId(
-                            "g9,10@0,0".to_string(),
-                        )),
+                        "g9,10@0,0".to_string(),
+                    )),
                     button: rose_core::MouseButton::Left,
                 },
                 say: say.to_string(),
@@ -2725,7 +3490,7 @@ mod tests {
         };
         let (tx, mut rx) = event_channel();
         let view = stepper
-            .run_step("click the tooltip", false, None, &tx)
+            .run_step("click the tooltip", false, false, None, &tx)
             .await
             .expect("run");
         assert_eq!(view["done"], true);
@@ -2757,7 +3522,7 @@ mod tests {
         };
         let (tx, mut rx) = event_channel();
         let view = stepper
-            .run_step("click the tooltip", false, None, &tx)
+            .run_step("click the tooltip", false, false, None, &tx)
             .await
             .expect("run");
         assert_eq!(view["done"], true);
@@ -2796,7 +3561,7 @@ mod tests {
         };
         let (tx, _rx) = event_channel();
         let view = stepper
-            .run_step("open the browser", false, None, &tx)
+            .run_step("open the browser", false, false, None, &tx)
             .await
             .expect("run");
         assert_eq!(view["acted"], true);
@@ -2846,7 +3611,7 @@ mod tests {
         };
         let (tx, mut rx) = event_channel();
         let view = stepper
-            .run_step("click a cell", false, None, &tx)
+            .run_step("click a cell", false, false, None, &tx)
             .await
             .expect("run");
         assert_eq!(view["done"], true, "{view}");
@@ -2904,7 +3669,7 @@ mod tests {
         let stepper_ref = &stepper;
         let flag = Arc::clone(&stop_flag);
         let view = {
-            let run = stepper_ref.run_step("stop me", false, None, &tx);
+            let run = stepper_ref.run_step("stop me", false, false, None, &tx);
             tokio::pin!(run);
             loop {
                 tokio::select! {
@@ -2945,7 +3710,7 @@ mod tests {
         };
         let (tx, mut rx) = event_channel();
         let view = stepper
-            .run_step("echo test", false, None, &tx)
+            .run_step("echo test", false, false, None, &tx)
             .await
             .expect("run");
         assert_eq!(view["done"], true, "{view}");
@@ -2992,13 +3757,13 @@ mod tests {
         };
         let (tx, _rx) = event_channel();
         let gated = stepper
-            .run_step("clean", false, None, &tx)
+            .run_step("clean", false, false, None, &tx)
             .await
             .expect("gated");
         assert_eq!(gated["approval_needed"], true, "{gated}");
         assert_eq!(gated["acted"], false);
         let forced = stepper
-            .run_step("clean", true, None, &tx)
+            .run_step("clean", true, false, None, &tx)
             .await
             .expect("forced");
         assert_eq!(forced["done"], true, "{forced}");
@@ -3026,12 +3791,12 @@ mod tests {
         };
         let (tx, _rx) = event_channel();
         let first = stepper
-            .run_step("first goal", false, None, &tx)
+            .run_step("first goal", false, false, None, &tx)
             .await
             .expect("turn 1");
         let chat_id = first["chat_id"].as_str().expect("chat id").to_string();
         let second = stepper
-            .run_step("second goal", false, Some(&chat_id), &tx)
+            .run_step("second goal", false, false, Some(&chat_id), &tx)
             .await
             .expect("turn 2");
         assert_eq!(second["chat_id"], chat_id);
@@ -3051,7 +3816,7 @@ mod tests {
         let stepper = test_stepper(BrainSvc::Fake);
         let (tx, _rx) = event_channel();
         let view = stepper
-            .run_step("persist this run", false, None, &tx)
+            .run_step("persist this run", false, false, None, &tx)
             .await
             .expect("run");
         assert_eq!(view["done"], true);
@@ -3097,7 +3862,7 @@ mod tests {
         let mut cfg = RoseConfig::default();
         cfg.desktop.backend = "x11".to_string();
         cfg.models.brain = "fake".to_string();
-        build_services(cfg, ApiKeys::default()).expect("x11 selector builds");
+        build_services(cfg, ApiKeys::default(), None).expect("x11 selector builds");
     }
 
     #[test]
@@ -3107,7 +3872,7 @@ mod tests {
         let mut cfg = RoseConfig::default();
         cfg.desktop.backend = "cdp".to_string();
         cfg.models.brain = "fake".to_string();
-        build_services(cfg, ApiKeys::default()).expect("cdp selector builds");
+        build_services(cfg, ApiKeys::default(), None).expect("cdp selector builds");
     }
 
     #[test]
@@ -3116,7 +3881,7 @@ mod tests {
         let mut cfg = RoseConfig::default();
         cfg.desktop.backend = "auto".to_string();
         cfg.models.brain = "fake".to_string();
-        build_services(cfg, ApiKeys::default()).expect("auto selector builds");
+        build_services(cfg, ApiKeys::default(), None).expect("auto selector builds");
     }
 
     #[test]
@@ -3124,7 +3889,7 @@ mod tests {
         let mut cfg = RoseConfig::default();
         cfg.desktop.backend = "wayland".to_string();
         cfg.models.brain = "fake".to_string();
-        let err = build_services(cfg, ApiKeys::default())
+        let err = build_services(cfg, ApiKeys::default(), None)
             .map(|_| ())
             .unwrap_err();
         assert!(err.to_string().contains("unknown desktop backend"), "{err}");

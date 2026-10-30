@@ -7,7 +7,9 @@
 pub mod fake;
 pub mod grounding;
 pub mod spark;
+pub mod video;
 
 pub use fake::FakeBrain;
 pub use grounding::{format_elements, resolve_element};
 pub use spark::{ModelReply, MuseClient};
+pub use video::{extract_instructions, parse_steps, DraftStep};

@@ -9,12 +9,15 @@
 
 use async_trait::async_trait;
 use axum::{
-    http::{header, StatusCode},
+    body::Bytes,
+    http::{header, HeaderMap, StatusCode},
     response::{Html, IntoResponse},
     routing::{get, post},
     Json, Router,
 };
 use rose_agent::{Driver, Lease};
+use rose_core::RoseConfig;
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
 /// Read-only snapshot of the desktop for the live view. Implemented in
@@ -60,12 +63,18 @@ pub fn emit(tx: &StepEventSender, event: serde_json::Value) {
 /// Single prototype step: capture -> brain -> gate -> act. Implemented in
 /// `apps/rosed`; the full loop (budgets, store, events) arrives in M2.
 /// Returns a JSON value built by [`step_view`]; `Err` is a user-facing message.
+///
+/// `force` answers a pending approval: the run resumes where it paused
+/// (single-use — it passes that one gate, later gates still ask).
+/// `auto_approve` is "don't ask again for this run": every further gate
+/// auto-passes, each logged as an `approval` event with `"auto": true`.
 #[async_trait]
 pub trait StepRunner: Send + Sync {
     async fn run_step(
         &self,
         goal: &str,
         force: bool,
+        auto_approve: bool,
         chat_id: Option<&str>,
         tx: &StepEventSender,
     ) -> Result<serde_json::Value, String>;
@@ -166,6 +175,152 @@ impl KeySlot {
     }
 }
 
+/// Live config: GET shows the desired config, PUT validates + persists.
+/// Policy + brain hot-reload into the running loop; backend/display/size/
+/// bind/data/cdp need a `rosed` restart (reported as `restart_needed`).
+#[async_trait]
+pub trait ConfigSource: Send + Sync {
+    async fn get(&self) -> RoseConfig;
+    /// Persist + apply. Returns `(applied_config, restart_needed)`.
+    async fn set(&self, cfg: RoseConfig) -> Result<(RoseConfig, bool), String>;
+    fn source_name(&self) -> String {
+        "rosed (/api/config)".to_string()
+    }
+}
+
+/// Validate a full config the same way PUT does. Pure: no I/O.
+pub fn validate_config(cfg: &RoseConfig) -> Result<(), String> {
+    let addr: std::net::SocketAddr = cfg
+        .server
+        .bind
+        .parse()
+        .map_err(|_| "bind must be host:port (e.g. 127.0.0.1:8787)".to_string())?;
+    if !addr.ip().is_loopback() && !cfg.server.allow_remote {
+        return Err("refusing non-loopback bind without allow_remote = true".to_string());
+    }
+    match cfg.desktop.backend.as_str() {
+        "auto" | "x11" | "cdp" | "fake" => {}
+        other => return Err(format!("unknown desktop backend: {other}")),
+    }
+    if !(640..=7680).contains(&cfg.desktop.width) || !(360..=4320).contains(&cfg.desktop.height) {
+        return Err("desktop size looks wrong (want 640..7680 x 360..4320)".to_string());
+    }
+    match cfg.models.brain.as_str() {
+        "muse" | "fake" => {}
+        other => return Err(format!("unknown brain: {other}")),
+    }
+    if cfg.models.endpoint.trim().is_empty() {
+        return Err("models.endpoint must not be empty".to_string());
+    }
+    if cfg.models.model.trim().is_empty() {
+        return Err("models.model must not be empty".to_string());
+    }
+    if !(1..=200).contains(&cfg.policy.max_steps) {
+        return Err("policy.max_steps must be 1..200".to_string());
+    }
+    if !(1..=120).contains(&cfg.policy.max_minutes) {
+        return Err("policy.max_minutes must be 1..120".to_string());
+    }
+    if !(1..=500).contains(&cfg.policy.max_model_calls) {
+        return Err("policy.max_model_calls must be 1..500".to_string());
+    }
+    if cfg.data.dir.trim().is_empty() {
+        return Err("data.dir must not be empty".to_string());
+    }
+    if cfg.cdp.endpoint.trim().is_empty() {
+        return Err("cdp.endpoint must not be empty".to_string());
+    }
+    Ok(())
+}
+
+/// True when applying `next` needs a restart to take effect (anything the
+/// running loop cannot hot-reload: bind, backend, geometry, cdp, data dir).
+/// Policy + models hot-reload, so they never force a restart.
+pub fn config_restart_needed(old: &RoseConfig, next: &RoseConfig) -> bool {
+    old.server != next.server
+        || old.desktop != next.desktop
+        || old.cdp != next.cdp
+        || old.data != next.data
+}
+
+/// One draft instruction derived from a video (Skill Studio step).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct VideoStep {
+    pub ts: u64,
+    pub say: String,
+    pub intent: String,
+    pub params: String,
+    pub approval: bool,
+    pub conf: f32,
+    pub quote: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct VideoMeta {
+    pub id: String,
+    pub name: String,
+    pub size: u64,
+    pub mime: String,
+    pub created_at: String,
+    pub status: String,
+    pub steps: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct VideoDetail {
+    pub meta: VideoMeta,
+    pub steps: Vec<VideoStep>,
+}
+
+/// File-backed video store seam (implemented in `apps/rosed`; the web
+/// layer never touches the filesystem). Uploads live under
+/// `<data>/videos/<id>/`, alongside `job.json` (`{video_path, out_dir}`).
+/// `generate` calls Muse Spark native video (frames + narration in one
+/// call) — never a mock, never SAM.
+#[async_trait]
+pub trait VideoSource: Send + Sync {
+    async fn list(&self) -> Vec<VideoMeta>;
+    async fn upload(&self, name: &str, mime: &str, bytes: Vec<u8>) -> Result<VideoMeta, String>;
+    async fn file(&self, id: &str) -> Option<(Vec<u8>, String)>;
+    async fn detail(&self, id: &str) -> Option<VideoDetail>;
+    async fn generate(&self, id: &str) -> Result<VideoDetail, String>;
+    async fn save_draft(&self, id: &str, steps: Vec<VideoStep>) -> Result<VideoDetail, String>;
+    async fn remove(&self, id: &str) -> bool;
+}
+
+pub fn sanitize_video_name(name: &str) -> String {
+    let base = name
+        .rsplit('/')
+        .next()
+        .unwrap_or(name)
+        .rsplit('\\')
+        .next()
+        .unwrap_or(name)
+        .trim();
+    let cleaned: String = base
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_' || c == ' ' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let cleaned = cleaned.trim().trim_matches('.').to_string();
+    if cleaned.is_empty() {
+        "video.mp4".to_string()
+    } else if cleaned.contains('.') {
+        cleaned
+    } else {
+        format!("{cleaned}.mp4")
+    }
+}
+
+pub fn valid_video_id(id: &str) -> bool {
+    !id.is_empty() && id.len() <= 64 && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+}
+
 #[derive(Clone)]
 pub struct AppState {
     pub source: Option<Arc<dyn FrameSource>>,
@@ -174,6 +329,8 @@ pub struct AppState {
     pub keys: KeySlot,
     pub lease: Lease,
     pub control: Option<Arc<dyn HumanInput>>,
+    pub config: Option<Arc<dyn ConfigSource>>,
+    pub videos: Option<Arc<dyn VideoSource>>,
     pub env_key_present: bool,
     pub backend: String,
     pub brain: String,
@@ -240,7 +397,34 @@ pub fn router(state: AppState) -> Router {
         .route("/desktop/takeover", post(api_takeover))
         .route("/desktop/handback", post(api_handback))
         .route("/desktop/input", post(api_input))
+        .route("/api/config", get(api_config_get).put(api_config_put))
+        .merge(videos_router())
         .with_state(state)
+}
+
+/// Video routes carry their own body limit: axum's global default is 2 MB,
+/// which rejects every real screen recording with 413 (browsers surface
+/// the torn-down upload as a bare network error). The upload handler caps
+/// at 200 MB itself, so the framework limit is lifted here only — every
+/// other route keeps the 2 MB default.
+fn videos_router() -> Router<AppState> {
+    use axum::extract::DefaultBodyLimit;
+    Router::new()
+        .route("/api/videos", get(api_videos_list).post(api_videos_upload))
+        .route(
+            "/api/videos/{id}",
+            get(api_video_get).delete(api_video_delete),
+        )
+        .route("/api/videos/{id}/file", get(api_video_file))
+        .route(
+            "/api/videos/{id}/instructions",
+            post(api_video_instructions),
+        )
+        .route(
+            "/api/videos/{id}/draft",
+            post(api_video_draft).put(api_video_draft),
+        )
+        .layer(DefaultBodyLimit::disable())
 }
 
 async fn api_status(axum::extract::State(s): axum::extract::State<AppState>) -> impl IntoResponse {
@@ -358,6 +542,10 @@ async fn api_step(
             .into_response();
     }
     let force = body.get("force").and_then(|v| v.as_bool()).unwrap_or(false);
+    let auto_approve = body
+        .get("auto_approve")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
     let chat_id = body
         .get("chat_id")
         .and_then(|v| v.as_str())
@@ -377,7 +565,9 @@ async fn api_step(
             let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
             let runner = Arc::clone(runner);
             tokio::spawn(async move {
-                let final_view = match runner.run_step(&goal, force, chat_id.as_deref(), &tx).await
+                let final_view = match runner
+                    .run_step(&goal, force, auto_approve, chat_id.as_deref(), &tx)
+                    .await
                 {
                     Ok(mut view) => {
                         if view.get("type").is_none() {
@@ -433,7 +623,10 @@ async fn api_takeover(
     axum::extract::State(s): axum::extract::State<AppState>,
 ) -> impl IntoResponse {
     if s.control.is_none() {
-        return err(StatusCode::SERVICE_UNAVAILABLE, "takeover input not configured");
+        return err(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "takeover input not configured",
+        );
     }
     s.lease.take_human();
     tracing::info!("takeover: human holds the desktop, agent paused");
@@ -467,12 +660,18 @@ async fn api_input(
     Json(body): Json<serde_json::Value>,
 ) -> impl IntoResponse {
     if s.lease.holder() != Driver::Human {
-        return err(StatusCode::CONFLICT, "agent holds the desktop - take control first");
+        return err(
+            StatusCode::CONFLICT,
+            "agent holds the desktop - take control first",
+        );
     }
     let control = match &s.control {
         Some(c) => Arc::clone(c),
         None => {
-            return err(StatusCode::SERVICE_UNAVAILABLE, "takeover input not configured");
+            return err(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "takeover input not configured",
+            );
         }
     };
     let kind = body.get("kind").and_then(|v| v.as_str()).unwrap_or("");
@@ -515,11 +714,296 @@ async fn api_input(
             };
             control.scroll_frac(x, y, dy).await
         }
-        _ => return err(StatusCode::BAD_REQUEST, "kind: click | double_click | type | key | scroll"),
+        _ => {
+            return err(
+                StatusCode::BAD_REQUEST,
+                "kind: click | double_click | type | key | scroll",
+            )
+        }
     };
     match result {
         Ok(()) => Json(serde_json::json!({"ok": true})).into_response(),
         Err(e) => err(StatusCode::BAD_GATEWAY, e),
+    }
+}
+
+/// GET /api/config — the desired config (what the Setup pane edits).
+/// Shape: `{config: RoseConfig, source}`. Accepts no input.
+async fn api_config_get(
+    axum::extract::State(s): axum::extract::State<AppState>,
+) -> impl IntoResponse {
+    match &s.config {
+        None => err(
+            StatusCode::NOT_FOUND,
+            "no /api/config yet (config backend not wired)",
+        ),
+        Some(c) => {
+            let cfg = c.get().await;
+            Json(serde_json::json!({"config": cfg, "source": c.source_name()})).into_response()
+        }
+    }
+}
+
+/// PUT /api/config — validate + persist + hot-reload policy/models.
+/// Accepts the nested RoseConfig shape the UI sends (or `{config: {...}}`).
+/// Backend/display/size/bind/data/cdp changes report `restart_needed: true`.
+async fn api_config_put(
+    axum::extract::State(s): axum::extract::State<AppState>,
+    Json(body): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    let store = match &s.config {
+        None => {
+            return err(
+                StatusCode::NOT_FOUND,
+                "no /api/config yet (config backend not wired)",
+            );
+        }
+        Some(c) => c.clone(),
+    };
+    let inner = body.get("config").unwrap_or(&body);
+    let cfg: RoseConfig = match serde_json::from_value(inner.clone()) {
+        Ok(c) => c,
+        Err(e) => return err(StatusCode::BAD_REQUEST, format!("invalid config: {e}")),
+    };
+    if let Err(e) = validate_config(&cfg) {
+        return err(StatusCode::BAD_REQUEST, e);
+    }
+    match store.set(cfg).await {
+        Ok((applied, restart_needed)) => Json(serde_json::json!({
+            "config": applied,
+            "restart_needed": restart_needed,
+            "hot_reloaded": ["policy", "models"],
+            "source": store.source_name(),
+        }))
+        .into_response(),
+        Err(e) => err(StatusCode::BAD_REQUEST, e),
+    }
+}
+
+const MAX_VIDEO_BYTES: usize = 200 * 1024 * 1024;
+
+fn video_mime(name: &str, headers: &HeaderMap) -> String {
+    if let Some(ct) = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+    {
+        let ct = ct.split(';').next().unwrap_or("").trim().to_string();
+        if !ct.is_empty() {
+            return ct;
+        }
+    }
+    let lower = name.to_ascii_lowercase();
+    if lower.ends_with(".mp4") {
+        "video/mp4".to_string()
+    } else if lower.ends_with(".webm") {
+        "video/webm".to_string()
+    } else if lower.ends_with(".mov") {
+        "video/quicktime".to_string()
+    } else if lower.ends_with(".mkv") {
+        "video/x-matroska".to_string()
+    } else {
+        "video/mp4".to_string()
+    }
+}
+
+/// GET /api/videos — list uploads, newest first.
+async fn api_videos_list(
+    axum::extract::State(s): axum::extract::State<AppState>,
+) -> impl IntoResponse {
+    match &s.videos {
+        None => err(
+            StatusCode::NOT_FOUND,
+            "no /api/videos yet (video backend not wired)",
+        ),
+        Some(v) => Json(serde_json::json!({"videos": v.list().await})).into_response(),
+    }
+}
+
+/// POST /api/videos?filename=foo.mp4 — raw bytes body (no multipart dep).
+/// The UI sends one file per request; the filename query carries the name.
+async fn api_videos_upload(
+    axum::extract::State(s): axum::extract::State<AppState>,
+    axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> impl IntoResponse {
+    let store = match &s.videos {
+        None => {
+            return err(
+                StatusCode::NOT_FOUND,
+                "no /api/videos yet (video backend not wired)",
+            );
+        }
+        Some(v) => v.clone(),
+    };
+    let raw = q
+        .get("filename")
+        .or_else(|| q.get("name"))
+        .cloned()
+        .unwrap_or_else(|| "video.mp4".to_string());
+    let name = sanitize_video_name(&raw);
+    let lower = name.to_ascii_lowercase();
+    if ![".mp4", ".webm", ".mov", ".mkv"]
+        .iter()
+        .any(|ext| lower.ends_with(ext))
+    {
+        return err(
+            StatusCode::BAD_REQUEST,
+            "only mp4 / webm / mov / mkv uploads",
+        );
+    }
+    if body.is_empty() {
+        return err(StatusCode::BAD_REQUEST, "empty upload");
+    }
+    if body.len() > MAX_VIDEO_BYTES {
+        return err(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "video too large (max 200 MB)",
+        );
+    }
+    let mime = video_mime(&name, &headers);
+    match store.upload(&name, &mime, body.to_vec()).await {
+        Ok(meta) => Json(serde_json::json!({
+            "video": meta,
+            "videos": store.list().await,
+        }))
+        .into_response(),
+        Err(e) => err(StatusCode::BAD_REQUEST, e),
+    }
+}
+
+async fn api_video_get(
+    axum::extract::State(s): axum::extract::State<AppState>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> impl IntoResponse {
+    match &s.videos {
+        None => err(
+            StatusCode::NOT_FOUND,
+            "no /api/videos yet (video backend not wired)",
+        ),
+        Some(v) => match v.detail(&id).await {
+            Some(d) => Json(serde_json::json!({"video": d.meta, "steps": d.steps})).into_response(),
+            None => err(StatusCode::NOT_FOUND, "unknown video"),
+        },
+    }
+}
+
+async fn api_video_delete(
+    axum::extract::State(s): axum::extract::State<AppState>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> impl IntoResponse {
+    match &s.videos {
+        None => err(
+            StatusCode::NOT_FOUND,
+            "no /api/videos yet (video backend not wired)",
+        ),
+        Some(v) => {
+            if v.remove(&id).await {
+                Json(serde_json::json!({"deleted": true})).into_response()
+            } else {
+                err(StatusCode::NOT_FOUND, "unknown video")
+            }
+        }
+    }
+}
+
+/// GET /api/videos/:id/file — the original bytes for the <video> player.
+async fn api_video_file(
+    axum::extract::State(s): axum::extract::State<AppState>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> impl IntoResponse {
+    match &s.videos {
+        None => err(
+            StatusCode::NOT_FOUND,
+            "no /api/videos yet (video backend not wired)",
+        ),
+        Some(v) => match v.file(&id).await {
+            Some((bytes, mime)) => (
+                [
+                    (header::CONTENT_TYPE, mime),
+                    (header::CACHE_CONTROL, "no-store".to_string()),
+                ],
+                bytes,
+            )
+                .into_response(),
+            None => err(StatusCode::NOT_FOUND, "unknown video"),
+        },
+    }
+}
+
+/// POST /api/videos/:id/instructions — draft steps from the video.
+/// Muse Spark reads the video (frames + narration) natively via the
+/// Files + Responses APIs — no SAM stage, no separate transcription.
+/// The draft is persisted next to the upload (`steps.json`) so
+/// Save/Send work against the backend.
+async fn api_video_instructions(
+    axum::extract::State(s): axum::extract::State<AppState>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> impl IntoResponse {
+    match &s.videos {
+        None => err(
+            StatusCode::NOT_FOUND,
+            "no /api/videos yet (video backend not wired)",
+        ),
+        Some(v) => match v.generate(&id).await {
+            Ok(d) => {
+                let avg: f32 = if d.steps.is_empty() {
+                    0.0
+                } else {
+                    d.steps.iter().map(|st| st.conf).sum::<f32>() / d.steps.len() as f32
+                };
+                Json(serde_json::json!({
+                    "video_id": d.meta.id,
+                    "steps": d.steps,
+                    "avg_confidence": avg,
+                    "stages": ["upload", "spark"],
+                }))
+                .into_response()
+            }
+            // Unknown id is 404; a missing key is 400 (fixable in Setup);
+            // anything else is the model/upstream failing (502), never a
+            // silent mock — the UI surfaces the message as-is.
+            Err(e) => {
+                let status = if e.contains("unknown video") {
+                    StatusCode::NOT_FOUND
+                } else if e.contains("API key") {
+                    StatusCode::BAD_REQUEST
+                } else {
+                    StatusCode::BAD_GATEWAY
+                };
+                err(status, e)
+            }
+        },
+    }
+}
+
+/// PUT/POST /api/videos/:id/draft `{steps: [...]}` — persist edited steps.
+async fn api_video_draft(
+    axum::extract::State(s): axum::extract::State<AppState>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    Json(body): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    let store = match &s.videos {
+        None => {
+            return err(
+                StatusCode::NOT_FOUND,
+                "no /api/videos yet (video backend not wired)",
+            );
+        }
+        Some(v) => v.clone(),
+    };
+    let steps_value = body.get("steps").unwrap_or(&body);
+    let steps: Vec<VideoStep> = match serde_json::from_value(steps_value.clone()) {
+        Ok(st) => st,
+        Err(e) => return err(StatusCode::BAD_REQUEST, format!("invalid steps: {e}")),
+    };
+    if steps.len() > 100 {
+        return err(StatusCode::BAD_REQUEST, "too many steps (max 100)");
+    }
+    match store.save_draft(&id, steps).await {
+        Ok(d) => Json(serde_json::json!({"saved": true, "video": d.meta, "steps": d.steps}))
+            .into_response(),
+        Err(e) => err(StatusCode::NOT_FOUND, e),
     }
 }
 
@@ -749,6 +1233,8 @@ mod tests {
             keys: KeySlot::default(),
             lease: Lease::new(),
             control: None,
+            config: None,
+            videos: None,
             env_key_present: false,
             backend: "fake".to_string(),
             brain: "fake".to_string(),
@@ -830,15 +1316,32 @@ mod tests {
     }
 
     async fn request(port: u16, method: &str, path: &str, body: Option<&str>) -> (String, Vec<u8>) {
+        request_bytes(
+            port,
+            method,
+            path,
+            "application/json",
+            body.map(str::as_bytes).unwrap_or(&[]),
+        )
+        .await
+    }
+
+    async fn request_bytes(
+        port: u16,
+        method: &str,
+        path: &str,
+        content_type: &str,
+        payload: &[u8],
+    ) -> (String, Vec<u8>) {
         let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", port))
             .await
             .expect("connect");
-        let payload = body.unwrap_or("");
         let req = format!(
-            "{method} {path} HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
+            "{method} {path} HTTP/1.1\r\nHost: x\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
             payload.len()
         );
         stream.write_all(req.as_bytes()).await.expect("write");
+        stream.write_all(payload).await.expect("write body");
         let mut buf = Vec::new();
         stream.read_to_end(&mut buf).await.expect("read");
         let split = buf
@@ -886,6 +1389,7 @@ mod tests {
             &self,
             goal: &str,
             force: bool,
+            _auto_approve: bool,
             _chat_id: Option<&str>,
             tx: &StepEventSender,
         ) -> Result<serde_json::Value, String> {
@@ -1184,5 +1688,268 @@ mod tests {
         assert!(head.contains("503"), "{head}");
         let (head, _) = post(port, "/desktop/handback", "{}").await;
         assert!(head.contains("200 OK"), "{head}");
+    }
+
+    struct StubConfig {
+        current: std::sync::Mutex<rose_core::RoseConfig>,
+    }
+    #[async_trait]
+    impl ConfigSource for StubConfig {
+        async fn get(&self) -> rose_core::RoseConfig {
+            self.current.lock().expect("cfg").clone()
+        }
+        async fn set(
+            &self,
+            cfg: rose_core::RoseConfig,
+        ) -> Result<(rose_core::RoseConfig, bool), String> {
+            let old = self.current.lock().expect("cfg").clone();
+            let restart = config_restart_needed(&old, &cfg);
+            *self.current.lock().expect("cfg") = cfg.clone();
+            Ok((cfg, restart))
+        }
+    }
+
+    async fn put(port: u16, path: &str, body: &str) -> (String, Vec<u8>) {
+        request(port, "PUT", path, Some(body)).await
+    }
+
+    #[tokio::test]
+    async fn config_get_put_roundtrip_with_validation() {
+        // No source: 404 so the UI falls back to its local draft.
+        let port = spawn(state(None)).await;
+        let (head, _) = get(port, "/api/config").await;
+        assert!(head.contains("404"), "{head}");
+
+        let mut st = state(None);
+        st.config = Some(Arc::new(StubConfig {
+            current: std::sync::Mutex::new(rose_core::RoseConfig::default()),
+        }));
+        let port = spawn(st).await;
+        let (_, body) = get(port, "/api/config").await;
+        let v: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        assert_eq!(v["config"]["desktop"]["backend"], "x11");
+
+        // Bad bind is 400, never applied.
+        let (head, _) = put(
+            port,
+            "/api/config",
+            r#"{"server":{"bind":"nope","allow_remote":false},"desktop":{"backend":"fake","display":":1","width":1600,"height":900},"models":{"brain":"fake","endpoint":"https://api.meta.ai/v1","model":"m"},"policy":{"max_steps":40,"max_minutes":15,"max_model_calls":60,"require_approval_for":[]},"data":{"dir":"/tmp/rose"},"cdp":{"endpoint":"http://127.0.0.1:9222"}}"#,
+        )
+        .await;
+        assert!(head.contains("400"), "{head}");
+        // Non-loopback bind without opt-in is refused.
+        let (head, _) = put(
+            port,
+            "/api/config",
+            r#"{"server":{"bind":"0.0.0.0:8787","allow_remote":false},"desktop":{"backend":"fake","display":":1","width":1600,"height":900},"models":{"brain":"fake","endpoint":"https://api.meta.ai/v1","model":"m"},"policy":{"max_steps":40,"max_minutes":15,"max_model_calls":60,"require_approval_for":[]},"data":{"dir":"/tmp/rose"},"cdp":{"endpoint":"http://127.0.0.1:9222"}}"#,
+        )
+        .await;
+        assert!(head.contains("400"), "{head}");
+
+        // Policy-only change: hot-reloads, no restart.
+        let (head, body) = put(
+            port,
+            "/api/config",
+            r#"{"server":{"bind":"127.0.0.1:8787","allow_remote":false},"desktop":{"backend":"x11","display":":1","width":1600,"height":900},"models":{"brain":"muse","endpoint":"https://api.meta.ai/v1","model":"muse-spark-1.3-contributor"},"policy":{"max_steps":12,"max_minutes":15,"max_model_calls":60,"require_approval_for":["pay"]},"data":{"dir":"~/.local/share/rose"},"cdp":{"endpoint":"http://127.0.0.1:9222"}}"#,
+        )
+        .await;
+        assert!(head.contains("200 OK"), "{head}");
+        let v: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        assert_eq!(v["restart_needed"], false);
+        assert_eq!(v["config"]["policy"]["max_steps"], 12);
+
+        // Backend switch: accepted but flags restart.
+        let (head, body) = put(
+            port,
+            "/api/config",
+            r#"{"server":{"bind":"127.0.0.1:8787","allow_remote":false},"desktop":{"backend":"fake","display":":1","width":1600,"height":900},"models":{"brain":"fake","endpoint":"https://api.meta.ai/v1","model":"muse-spark-1.3-contributor"},"policy":{"max_steps":12,"max_minutes":15,"max_model_calls":60,"require_approval_for":["pay"]},"data":{"dir":"~/.local/share/rose"},"cdp":{"endpoint":"http://127.0.0.1:9222"}}"#,
+        )
+        .await;
+        assert!(head.contains("200 OK"), "{head}");
+        let v: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        assert_eq!(v["restart_needed"], true);
+    }
+
+    #[test]
+    fn config_validation_rejects_bad_values() {
+        let mut cfg = rose_core::RoseConfig::default();
+        assert!(validate_config(&cfg).is_ok());
+        cfg.policy.max_steps = 0;
+        assert!(validate_config(&cfg).is_err());
+        cfg.policy.max_steps = 40;
+        cfg.desktop.backend = "nope".to_string();
+        assert!(validate_config(&cfg).is_err());
+        cfg.desktop.backend = "fake".to_string();
+        cfg.server.bind = "0.0.0.0:8787".to_string();
+        assert!(validate_config(&cfg).is_err());
+        cfg.server.allow_remote = true;
+        assert!(validate_config(&cfg).is_ok());
+    }
+
+    type StubVideoRow = (VideoMeta, Vec<u8>, Vec<VideoStep>);
+    struct StubVideos {
+        items: std::sync::Mutex<std::collections::HashMap<String, StubVideoRow>>,
+    }
+    impl StubVideos {
+        fn new() -> Self {
+            Self {
+                items: std::sync::Mutex::new(std::collections::HashMap::new()),
+            }
+        }
+    }
+    #[async_trait]
+    impl VideoSource for StubVideos {
+        async fn list(&self) -> Vec<VideoMeta> {
+            let mut v: Vec<VideoMeta> = self
+                .items
+                .lock()
+                .expect("v")
+                .values()
+                .map(|(m, _, _)| m.clone())
+                .collect();
+            v.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+            v
+        }
+        async fn upload(
+            &self,
+            name: &str,
+            mime: &str,
+            bytes: Vec<u8>,
+        ) -> Result<VideoMeta, String> {
+            let id = format!("v{}", self.items.lock().expect("v").len() + 1);
+            let meta = VideoMeta {
+                id: id.clone(),
+                name: name.to_string(),
+                size: bytes.len() as u64,
+                mime: mime.to_string(),
+                created_at: "2026-01-01T00:00:00Z".to_string(),
+                status: "ready".to_string(),
+                steps: 0,
+            };
+            self.items
+                .lock()
+                .expect("v")
+                .insert(id, (meta.clone(), bytes, Vec::new()));
+            Ok(meta)
+        }
+        async fn file(&self, id: &str) -> Option<(Vec<u8>, String)> {
+            self.items
+                .lock()
+                .expect("v")
+                .get(id)
+                .map(|(m, b, _)| (b.clone(), m.mime.clone()))
+        }
+        async fn detail(&self, id: &str) -> Option<VideoDetail> {
+            self.items
+                .lock()
+                .expect("v")
+                .get(id)
+                .map(|(m, _, s)| VideoDetail {
+                    meta: m.clone(),
+                    steps: s.clone(),
+                })
+        }
+        async fn generate(&self, id: &str) -> Result<VideoDetail, String> {
+            // Test double for the endpoint plumbing: returns one fixed
+            // step so tests never depend on a model. Production
+            // (apps/rosed) always calls Spark and errors without a key.
+            let mut lock = self.items.lock().expect("v");
+            let (meta, _, steps) = lock.get_mut(id).ok_or("unknown video".to_string())?;
+            *steps = vec![VideoStep {
+                ts: 0,
+                say: "stub step (tests only)".to_string(),
+                intent: "stub step (tests only)".to_string(),
+                params: String::new(),
+                approval: false,
+                conf: 1.0,
+                quote: String::new(),
+            }];
+            meta.steps = steps.len();
+            meta.status = "ready".to_string();
+            Ok(VideoDetail {
+                meta: meta.clone(),
+                steps: steps.clone(),
+            })
+        }
+        async fn save_draft(&self, id: &str, steps: Vec<VideoStep>) -> Result<VideoDetail, String> {
+            let mut lock = self.items.lock().expect("v");
+            let (meta, _, saved) = lock.get_mut(id).ok_or("unknown video".to_string())?;
+            *saved = steps;
+            meta.steps = saved.len();
+            Ok(VideoDetail {
+                meta: meta.clone(),
+                steps: saved.clone(),
+            })
+        }
+        async fn remove(&self, id: &str) -> bool {
+            self.items.lock().expect("v").remove(id).is_some()
+        }
+    }
+
+    #[tokio::test]
+    async fn videos_list_upload_instructions_draft_roundtrip() {
+        // No source: 404 so the UI stays in local-only mode.
+        let port = spawn(state(None)).await;
+        let (head, _) = get(port, "/api/videos").await;
+        assert!(head.contains("404"), "{head}");
+
+        let mut st = state(None);
+        st.videos = Some(Arc::new(StubVideos::new()));
+        let port = spawn(st).await;
+        let (_, body) = get(port, "/api/videos").await;
+        let v: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        assert_eq!(v["videos"], serde_json::json!([]));
+
+        // Upload raw bytes with ?filename=.
+        let (head, body) = request(
+            port,
+            "POST",
+            "/api/videos?filename=demo.mp4",
+            Some("0123456789"),
+        )
+        .await;
+        assert!(head.contains("200 OK"), "{head}");
+        let v: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        let id = v["video"]["id"].as_str().expect("id").to_string();
+        assert_eq!(v["video"]["name"], "demo.mp4");
+        assert_eq!(v["video"]["size"], 10);
+
+        // File serves the same bytes; detail shows no steps yet.
+        let (head, body) = get(port, &format!("/api/videos/{id}/file")).await;
+        assert!(head.contains("200 OK"), "{head}");
+        assert_eq!(body, b"0123456789");
+        let (_, body) = get(port, &format!("/api/videos/{id}")).await;
+        let v: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        assert_eq!(v["steps"], serde_json::json!([]));
+
+        // Bodies over axum's 2 MB default must still upload: every real
+        // screen recording exceeds it, and the torn-down connection used
+        // to surface in the browser as a bare network error.
+        let big = vec![0u8; 3 * 1024 * 1024];
+        let (head, body) = request_bytes(
+            port,
+            "POST",
+            "/api/videos?filename=big.mp4",
+            "video/mp4",
+            &big,
+        )
+        .await;
+        assert!(head.contains("200 OK"), "{head}");
+        let v: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        assert_eq!(v["video"]["size"], 3 * 1024 * 1024);
+
+        // Generate drafts server-side; unknown ids are 404, not a mock.
+        let (head, body) = post(port, &format!("/api/videos/{id}/instructions"), "{}").await;
+        assert!(head.contains("200 OK"), "{head}");
+        let v: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        assert_eq!(v["steps"].as_array().expect("steps").len(), 1);
+        let (head, _) = post(port, "/api/videos/v-nonexistent/instructions", "{}").await;
+        assert!(head.contains("404"), "{head}");
+        let (head, _) = put(port, &format!("/api/videos/{id}/draft"), r#"{"steps": []}"#).await;
+        assert!(head.contains("200 OK"), "{head}");
+        let (head, _) = request(port, "DELETE", &format!("/api/videos/{id}"), None).await;
+        assert!(head.contains("200 OK"), "{head}");
+        let (head, _) = get(port, &format!("/api/videos/{id}")).await;
+        assert!(head.contains("404"), "{head}");
     }
 }
