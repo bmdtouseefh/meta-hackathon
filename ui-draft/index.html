@@ -7,9 +7,9 @@
 <script src="https://cdn.tailwindcss.com"></script>
 <script>
   tailwind.config = { darkMode: 'class' };
-  const theme = localStorage.getItem('rose-theme')
+  const stored = localStorage.getItem('rose-theme')
     || (matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light');
-  if (theme === 'dark') document.documentElement.classList.add('dark');
+  if (stored === 'dark') document.documentElement.classList.add('dark');
   function toggleTheme() {
     const dark = document.documentElement.classList.toggle('dark');
     localStorage.setItem('rose-theme', dark ? 'dark' : 'light');
@@ -17,116 +17,134 @@
   function toggleDesktop() {
     document.getElementById('desk-panel').classList.toggle('hidden');
   }
+  let lastTab = 'keys';
+  function toggleSetup(open) {
+    const m = document.getElementById('setup-modal');
+    m.classList.toggle('hidden', !open);
+    m.classList.toggle('flex', !!open);
+    if (open) { setupTab(lastTab); setTimeout(() => document.getElementById('api-key')?.focus(), 50); }
+  }
+  function toggleRuns() {
+    document.getElementById('chat-sidebar').classList.toggle('rail');
+  }
 </script>
 <style>
-  .t-display { font-size: 1.125rem; line-height: 1.4; font-weight: 700; }
-  .t-head    { font-size: 0.9375rem; line-height: 1.45; font-weight: 600; }
-  .t-body    { font-size: 0.875rem;  line-height: 1.5;  font-weight: 400; }
-  .t-caption { font-size: 0.75rem;   line-height: 1.5;  font-weight: 400; }
-  .thumb { width: 100%; aspect-ratio: 16 / 9; border-radius: 0.375rem; }
-  #desktop-svg { width: 100%; height: auto; display: block; }
-  .chat-col { max-width: min(46rem, 92%); margin-inline: auto; }
-  .msg-rose { background: var(--tw-bg-opacity, 1); }
-  textarea { field-sizing: content; }
+  :root {
+    --bg: #f7f7f8;
+    --ink: #1a1a1e;
+    --muted: #6f6f78;
+    --card: #ffffff;
+    --line: #e5e5ea;
+    --accent: #0064E0;
+    --accent-ink: #ffffff;
+    --bubble-rose: #ffffff;
+    --bubble-mine: #0064E0;
+    --shadow: 0 1px 2px rgba(0,0,0,.06);
+  }
+  .dark {
+    --bg: #131316;
+    --ink: #ececef;
+    --muted: #a1a1aa;
+    --card: #1c1c21;
+    --line: #2c2c33;
+    --accent: #4f8cff;
+    --accent-ink: #ffffff;
+    --bubble-rose: #1c1c21;
+    --bubble-mine: #4f8cff;
+    --shadow: 0 1px 2px rgba(0,0,0,.4);
+  }
+  html, body { height: 100%; overscroll-behavior: none; }
+  body { overflow: hidden; background: var(--bg); color: var(--ink); }
+  .card { background: var(--card); border: 1px solid var(--line); box-shadow: var(--shadow); }
+  .muted { color: var(--muted); }
+  .btn-accent { background: var(--accent); color: var(--accent-ink); transition: filter .12s ease; }
+  .btn-accent:hover { filter: brightness(1.08); }
+  .btn-ghost { border: 1px solid var(--line); background: var(--card); transition: background .12s ease; }
+  .btn-ghost:hover { background: var(--line); }
+  .bubble-mine { background: var(--bubble-mine); color: #fff; }
+  .bubble-rose { background: var(--bubble-rose); border: 1px solid var(--line); }
+  #thread, #chat-list, #desk-panel { overscroll-behavior: contain; }
+  #thread { scrollbar-gutter: stable; }
+  aside#chat-sidebar.rail { width: 3.5rem; }
+  #chat-sidebar { transition: width .18s ease; }
+  #chat-sidebar.rail .rail-hide { display: none; }
+  #chat-sidebar.rail .rail-top { padding: .75rem .5rem 0; }
+  .thin-scroll::-webkit-scrollbar { width: .45rem; }
+  .thin-scroll::-webkit-scrollbar-thumb { background: var(--line); border-radius: 999px; }
+  .t-display { font-weight: 700; font-size: clamp(1.05rem, 1rem + .6vw, 1.25rem); line-height: 1.3; letter-spacing: -.01em; }
+  .t-title { font-weight: 650; font-size: clamp(.92rem, .88rem + .3vw, 1rem); line-height: 1.4; }
+  .t-body { font-weight: 400; font-size: clamp(.875rem, .84rem + .2vw, .94rem); line-height: 1.55; }
+  .t-caption { font-weight: 500; font-size: clamp(.72rem, .7rem + .15vw, .78rem); line-height: 1.5; }
+  .cfg-input { width: 100%; border-radius: .5rem; border: 1px solid var(--line); background: transparent; padding: .45rem .6rem; font-size: .85rem; outline: none; }
 </style>
 </head>
-<body class="bg-white text-neutral-900 dark:bg-neutral-900 dark:text-neutral-100 font-sans m-0 t-body min-h-screen flex flex-col">
 
-<div class="flex flex-wrap items-center gap-2 px-[2%] py-1 t-caption bg-amber-100 dark:bg-amber-950 text-amber-900 dark:text-amber-200">
-  <span class="font-semibold">DRAFT PREVIEW — chat-first:</span>
-  <span class="opacity-70">type below and hit Enter — mock Rose replies, then asks approval (all client-side mock)</span>
-  <span class="flex-1"></span>
-  <button onclick="toggleTheme()" class="px-2 py-0.5 rounded border border-amber-400">◐ theme</button>
-</div>
+<body class="t-body m-0 flex h-[100dvh] flex-col overflow-hidden font-sans">
 
-<header class="flex flex-wrap items-center gap-[0.75%] px-[2%] py-2 border-b border-neutral-200 dark:border-neutral-800">
-  <span class="t-display">🌌 Rose</span>
-  <span id="status-dot" class="inline-block w-3 h-3 rounded-full bg-green-600"></span>
-  <span id="status-text" class="t-body">Running · step 4/40 · :1</span>
-  <span class="flex-1"></span>
-  <button onclick="toggleSetup(true)" class="px-3 py-1 rounded border border-neutral-300 dark:border-neutral-700" title="Setup: API keys & brain">⚙ Setup</button>
-  <button onclick="toggleDesktop()" class="px-3 py-1 rounded border border-neutral-300 dark:border-neutral-700">🖥 Desktop</button>
-  <button class="px-3 py-1 rounded bg-red-700 text-white font-semibold">■ Stop</button>
+<header class="z-10 flex-none border-b py-2" style="border-color:var(--line);background:var(--card)">
+  <div class="flex w-full flex-wrap items-center gap-2 px-2">
+    <span class="t-display">🌌 Rose</span>
+    <span id="status-pill" class="flex items-center gap-2 rounded-full border px-3 py-1" style="border-color:var(--line)">
+      <span id="status-dot" class="inline-block size-2 rounded-full bg-emerald-500"></span>
+      <span id="status-text" class="t-caption">Running · step 4/40 · :1</span>
+    </span>
+    <span class="flex-1"></span>
+    <span id="backend-text" class="muted t-caption hidden sm:block">draft · preview only</span>
+    <button onclick="toggleTheme()" title="Toggle light/dark" class="btn-ghost rounded-lg px-2.5 py-1.5">◐</button>
+    <button onclick="toggleSetup(true)" title="Setup: API keys and config" class="btn-ghost rounded-lg px-3 py-1.5">⚙ Setup</button>
+    <button onclick="toggleDesktop()" title="Show or hide the live desktop preview" class="btn-ghost rounded-lg px-3 py-1.5">🖥 Desktop</button>
+    <button onclick="mockStop()" title="Stop the current run" class="rounded-lg bg-red-600 px-3.5 py-1.5 font-semibold text-white">■ Stop</button>
+  </div>
 </header>
 
-<div class="flex flex-1 min-h-0">
-  <!-- conversation: the main thing -->
-  <main class="flex-1 flex flex-col min-h-[60vh]">
-    <div id="thread" class="chat-col w-full flex-1 overflow-y-auto flex flex-col gap-[1rem] py-[2%]">
-      <!-- goal -->
-      <div class="self-end max-w-[85%] px-[2%] py-2 rounded-2xl rounded-br-sm bg-[#0064E0] text-white">
-        Pay the March invoice from Example Ltd
+<div class="z-10 flex min-h-0 w-full flex-1 gap-px overflow-hidden" style="background:var(--line)">
+
+  <!-- chat history sidebar: restored from nebula, fully working mock -->
+  <aside id="chat-sidebar" class="card flex w-[clamp(12rem,15%,16rem)] flex-none flex-col overflow-hidden rounded-none min-h-0" style="border:0">
+    <div class="rail-top flex-none p-3">
+      <div class="flex items-center">
+        <button onclick="toggleRuns()" title="Collapse chat history" class="btn-ghost rounded-lg px-2.5 py-1.5">☰</button>
       </div>
-      <!-- narration -->
-      <div class="self-start max-w-[90%] flex gap-2">
-        <span class="flex-none">🌌</span>
-        <div class="px-[2%] py-2 rounded-2xl rounded-tl-sm bg-neutral-100 dark:bg-neutral-800">
-          Portal's open, I can see the March invoices. Heading for <strong>INV-2041 · $42.00</strong>.
-        </div>
+      <button onclick="newChat()" title="Start a new chat"
+        class="rail-hide btn-accent mt-2 w-full rounded-lg px-3 py-2 text-sm font-semibold">New chat</button>
+      <input id="chat-search" type="search" placeholder="Search chats…" oninput="refreshChats()"
+        class="rail-hide mt-2 w-full rounded-lg border bg-transparent px-3 py-1.5 text-sm outline-none" style="border-color:var(--line)" aria-label="Search chats">
+    </div>
+    <div class="rail-hide muted t-caption flex-none px-3 pb-1">History</div>
+    <div id="chat-list" class="rail-hide thin-scroll flex min-h-0 flex-1 flex-col gap-1 overflow-y-auto p-3 pt-1" role="list">
+      <div class="muted text-xs">loading…</div>
+    </div>
+  </aside>
+
+  <!-- conversation -->
+  <main class="card flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden rounded-none" style="border:0;contain:layout style">
+    <div class="flex-none border-b px-5 py-4" style="border-color:var(--line)">
+      <div class="mx-auto w-full max-w-[42rem]">
+        <div class="t-title">What should Rose do?</div>
+        <div class="muted text-sm">Describe the goal — Rose narrates each step and pauses before anything irreversible.</div>
       </div>
-      <!-- verified step -->
-      <div class="self-start w-full max-w-[90%] flex gap-2">
-        <span class="flex-none text-green-600 font-bold">✓</span>
-        <div class="flex-1 px-[2%] py-2 rounded-2xl rounded-tl-sm border border-neutral-200 dark:border-neutral-700">
-          <div class="t-head">Step 5 · Clicked “Invoices” <span class="t-caption text-neutral-500 font-normal">(812, 240)</span></div>
-          <div class="t-caption text-neutral-500">postcondition met: heading ‘Invoices’ visible · 1.2s</div>
-        </div>
-      </div>
-      <!-- approval: inline, where the conversation already is -->
-      <div class="self-start w-full max-w-[90%] flex gap-2">
-        <span class="flex-none text-amber-500 font-bold text-lg">●</span>
-        <div class="flex-1 p-[2%] rounded-2xl rounded-tl-sm border-2 border-amber-500 bg-amber-50 dark:bg-amber-950">
-          <div class="t-head">Step 7 needs approval — Click “Pay now” ($42.00)</div>
-          <div class="my-2 w-3/4"><svg class="thumb" viewBox="0 0 160 90"><rect width="160" height="90" fill="#2b3038"/><rect x="30" y="20" width="100" height="26" rx="3" fill="#f5f5f5"/><circle cx="118" cy="58" r="10" fill="none" stroke="#e88aa5" stroke-width="3"/></svg></div>
-          <div class="flex flex-wrap gap-2">
-            <button onclick="resolveApproval(true)" class="px-4 py-1.5 rounded bg-green-700 text-white font-semibold">Approve</button>
-            <button onclick="resolveApproval(false)" class="px-4 py-1.5 rounded bg-red-700 text-white font-semibold">Deny</button>
-            <button class="px-4 py-1.5 rounded border border-neutral-300 dark:border-neutral-600">Take over</button>
-          </div>
-        </div>
-      </div>
+    </div>
+    <div id="thread" class="thin-scroll mx-auto flex min-h-0 w-full max-w-[42rem] flex-1 flex-col gap-4 overflow-y-auto px-4 py-6">
       <div id="live-tail" class="contents"></div>
     </div>
-
-    <!-- composer: the primary control -->
-    <div class="border-t border-neutral-200 dark:border-neutral-800">
-      <div class="chat-col w-full py-[1.5%]">
-        <div class="flex items-end gap-2 rounded-2xl border-2 border-neutral-300 dark:border-neutral-600 focus-within:border-[#0064E0] px-[2%] py-2 bg-white dark:bg-neutral-950">
-          <textarea id="composer" rows="2" placeholder="Tell Rose what to do…"
-            class="flex-1 bg-transparent outline-none resize-none t-body max-h-[30vh]"></textarea>
-          <button class="px-2 py-1 rounded t-caption text-neutral-500" disabled title="Voice arrives in Phase 2">🎙</button>
-          <button onclick="send()" class="px-5 py-2 rounded-xl bg-[#0064E0] text-white font-semibold flex-none">Run</button>
-        </div>
-        <div class="t-caption text-neutral-500 mt-1">Enter to run · new instructions queue while a run is active · recent: Export March invoices ✓ · Move PDFs ✓</div>
+    <div class="flex-none border-t px-5 py-4" style="border-color:var(--line)">
+      <div class="mx-auto flex w-full max-w-[42rem] items-end gap-2 rounded-xl border px-3 py-2" style="border-color:var(--line);background:var(--bg)">
+        <textarea id="composer" rows="2" placeholder="Tell Rose what to do…"
+          class="max-h-[30vh] min-h-[2.75rem] w-full flex-1 resize-none bg-transparent text-sm outline-none placeholder:opacity-60"></textarea>
+        <button onclick="send()" class="btn-accent flex-none rounded-lg px-5 py-2 font-semibold">Run</button>
       </div>
+      <div id="queue-note" class="muted mx-auto mt-1.5 w-full max-w-[42rem] text-xs">Enter to run · recent: Export March invoices ✓ · Move PDFs ✓</div>
     </div>
   </main>
 
-<!-- setup modal: keys live server-side only, never persisted, never in traces -->
-<div id="setup-modal" class="hidden fixed inset-0 z-10 flex items-center justify-center p-[4%] bg-black/50" onclick="if(event.target===this)toggleSetup(false)">
-  <div class="w-full max-w-[min(28rem,94%)] rounded-2xl border border-neutral-200 dark:border-neutral-700 bg-white dark:bg-neutral-900 p-[5%]">
-    <h2 class="t-display mb-1">⚙ Setup</h2>
-    <p class="t-caption text-neutral-500 mt-0">Keys are kept in server memory for this session only — never written to disk, logs, or traces.</p>
-    <label class="t-head block mt-3 mb-1" for="api-key">Muse API key</label>
-    <input id="api-key" type="password" autocomplete="off" placeholder="sk-…"
-      class="w-full px-3 py-2 rounded-xl border border-neutral-300 dark:border-neutral-600 bg-transparent t-body">
-    <div class="t-caption mt-1"><span id="key-state" class="text-red-500 font-semibold">missing</span> · brain: <span class="font-semibold">muse</span> (fake needs no key)</div>
-    <div class="flex flex-wrap justify-end gap-2 mt-4">
-      <button onclick="clearKey()" class="px-4 py-2 rounded-xl border border-neutral-300 dark:border-neutral-600">Clear</button>
-      <button onclick="toggleSetup(false)" class="px-4 py-2 rounded-xl border border-neutral-300 dark:border-neutral-600">Cancel</button>
-          <button onclick="saveKey()" class="px-5 py-2 rounded-xl bg-[#0064E0] text-white font-semibold">Save</button>
+  <!-- desktop + video workflow -->
+  <aside id="desk-panel" class="card flex min-h-0 min-w-0 flex-1 flex-col overflow-y-auto rounded-none p-5" style="border:0;contain:layout style">
+    <div class="mb-2 flex items-center justify-between">
+      <span class="t-title">Live desktop <span id="display-name" class="muted text-xs font-medium">· :1</span></span>
+      <span class="rounded bg-red-600 px-2 py-0.5 text-xs font-semibold text-white">VIEW-ONLY</span>
     </div>
-  </div>
-</div>
-
-  <!-- desktop: secondary, toggleable -->
-  <aside id="desk-panel" class="hidden lg:block w-[38%] border-l border-neutral-200 dark:border-neutral-800 p-[1%] overflow-y-auto">
-    <div class="flex items-center justify-between mb-1">
-      <span class="t-head">Live desktop · :1</span>
-      <span class="t-caption px-2 py-0.5 rounded bg-red-700 text-white font-semibold">VIEW-ONLY</span>
-    </div>
-    <div class="rounded-lg overflow-hidden border border-neutral-200 dark:border-neutral-700">
-      <svg id="desktop-svg" viewBox="0 0 1600 900">
+    <div class="overflow-hidden rounded-lg border bg-black" style="border-color:var(--line)">
+      <svg id="desktop-svg" viewBox="0 0 1600 900" class="block w-full">
         <rect width="1600" height="900" fill="#3a4048"/>
         <rect width="1600" height="36" fill="#1b1e24"/>
         <rect x="120" y="80" width="1360" height="740" rx="8" fill="#202124"/>
@@ -140,60 +158,566 @@
         <rect y="864" width="1600" height="36" fill="#1b1e24"/>
       </svg>
     </div>
-    <p class="t-caption text-neutral-500 mt-1">Exactly what Rose sees. Take Control routes your input through the same audited path.</p>
-    <button class="mt-1 w-full px-3 py-2 rounded border border-neutral-300 dark:border-neutral-700 font-semibold">Take Control</button>
+    <p class="muted mt-2 text-xs">Exactly what Rose sees. Take Control routes input through the same audited path.</p>
+    <button class="btn-ghost mt-2 w-full rounded-lg px-3 py-2 font-semibold">Take Control</button>
+
+    <!-- video → instructions: under the live desktop, shares the right rail's scroll -->
+    <section id="video-workflow" class="card mt-4 overflow-hidden rounded-xl" style="border-color:var(--line)">
+      <div class="flex items-center gap-2 border-b px-3 py-2" style="border-color:var(--line)">
+        <span class="t-title">🎬 Video → instructions</span>
+        <span id="video-count" class="t-caption rounded px-1.5 py-0.5" style="background:var(--line)">0</span>
+        <span class="flex-1"></span>
+        <span class="muted t-caption">Phase 2 mock</span>
+      </div>
+      <div id="dropzone" class="m-3 cursor-pointer rounded-xl border-2 border-dashed px-3 py-4 text-center"
+        style="border-color:var(--line)"
+        onclick="document.getElementById('video-file').click()"
+        ondragover="event.preventDefault()"
+        ondrop="dropVideos(event)">
+        <div class="t-body font-semibold">Drop a narrated recording here, or <span style="color:var(--accent)"><u>browse</u></span></div>
+        <div class="muted t-caption mt-0.5">mp4 / webm / mov · stays local · first 3–5 min works best</div>
+        <input id="video-file" type="file" accept="video/*" multiple class="hidden" onchange="pickVideos(this)">
+      </div>
+      <div id="video-list" class="flex flex-col gap-2 px-3 pb-1"></div>
+      <div id="video-empty" class="muted t-caption px-3 pb-3">No videos yet — upload one to draft agent instructions from it.</div>
+      <div id="video-detail" class="hidden border-t px-3 py-3" style="border-color:var(--line)">
+        <div class="flex items-center gap-2">
+          <span id="vd-name" class="t-title flex-1 truncate">video.mp4</span>
+          <span id="vd-status" class="t-caption rounded px-2 py-0.5 font-semibold" style="background:var(--line)">queued</span>
+        </div>
+        <video id="vd-player" controls playsinline class="mt-2 w-full rounded-lg bg-black" style="aspect-ratio:16/9"></video>
+        <div class="muted t-caption mt-1">Click a step to seek — transcript + evidence stay in sync (Skill Studio preview).</div>
+        <div class="mt-2 rounded-lg p-2" style="background:var(--bg)">
+          <div class="flex items-center gap-2">
+            <span id="vd-stage" class="t-caption font-semibold">Waiting…</span>
+            <span class="flex-1"></span>
+            <span id="vd-pct" class="muted t-caption">0%</span>
+          </div>
+          <div class="mt-1 h-1.5 overflow-hidden rounded-full" style="background:var(--line)">
+            <div id="vd-bar" class="h-full rounded-full transition-all" style="width:0%;background:var(--accent)"></div>
+          </div>
+          <div id="vd-log" class="muted t-caption mt-1 whitespace-pre-wrap font-mono"></div>
+          <div class="mt-2 flex gap-2">
+            <button onclick="runPipeline(selectedVideo())" class="btn-accent t-caption rounded-lg px-3 py-1.5 font-semibold">⚙ Generate instructions</button>
+            <button onclick="cancelPipeline()" class="btn-ghost t-caption rounded-lg px-3 py-1.5">Cancel</button>
+          </div>
+        </div>
+        <div id="vd-steps-wrap" class="mt-3 hidden">
+          <div class="flex items-center gap-2">
+            <span class="t-title">Draft instructions</span>
+            <span id="vd-conf" class="muted t-caption"></span>
+            <span class="flex-1"></span>
+            <button onclick="addStep()" class="btn-ghost t-caption rounded px-2 py-1">+ step</button>
+          </div>
+          <div id="vd-steps" class="mt-2 flex flex-col gap-2"></div>
+          <div class="mt-3 flex flex-wrap gap-2">
+            <button onclick="useInChat()" class="t-caption rounded-xl bg-green-700 px-4 py-2 font-semibold text-white">➤ Send to Rose as instructions</button>
+            <button onclick="saveDraft()" class="btn-ghost t-caption rounded-xl px-4 py-2 font-semibold">Save draft</button>
+          </div>
+          <div id="vd-saved" class="mt-1 hidden text-xs font-semibold text-green-600">Draft saved (mock — real wiring: SQLite skills table, status draft→reviewed).</div>
+        </div>
+      </div>
+    </section>
   </aside>
 </div>
 
+<!-- setup modal: keys + config -->
+<div id="setup-modal" class="fixed inset-0 z-20 hidden items-center justify-center bg-black/50 p-4" onclick="if(event.target===this)toggleSetup(false)">
+  <div class="card w-full max-w-[min(36rem,96%)] max-h-[92vh] overflow-y-auto rounded-xl p-6">
+    <h2 class="t-display">⚙ Setup</h2>
+    <p class="muted mt-1 text-xs">Keys live in server memory for this session only — never written to disk, logs, or traces. Config edits apply to <span class="font-mono">~/.config/rose/config.toml</span> via <span class="font-mono">/api/config</span> (mocked in this draft).</p>
+    <div class="mt-3 flex gap-2" role="tablist">
+      <button id="tab-keys" onclick="setupTab('keys')" class="btn-accent t-caption rounded-lg px-3 py-1.5 font-semibold">Keys</button>
+      <button id="tab-config" onclick="setupTab('config')" class="btn-ghost t-caption rounded-lg px-3 py-1.5 font-semibold">Config</button>
+      <span class="flex-1"></span>
+      <span id="config-dirty" class="hidden t-caption font-semibold text-amber-600">● unsaved</span>
+    </div>
+    <div id="pane-keys">
+      <label class="t-title mt-4 block text-sm" for="api-key">Muse API key</label>
+      <input id="api-key" type="password" autocomplete="off" placeholder="sk-…"
+        class="cfg-input mt-1">
+      <div class="mt-1.5 text-xs"><span id="key-state" class="font-semibold text-red-500">missing</span> <span class="muted">· brain: <span class="font-semibold">muse</span> (fake needs no key)</span></div>
+      <div class="mt-4 flex flex-wrap justify-end gap-2">
+        <button onclick="clearKey()" class="btn-ghost rounded-lg px-4 py-2 font-semibold">Clear</button>
+        <button onclick="toggleSetup(false)" class="btn-ghost rounded-lg px-4 py-2 font-semibold">Cancel</button>
+        <button onclick="saveKey()" class="btn-accent rounded-lg px-5 py-2 font-semibold">Save</button>
+      </div>
+    </div>
+    <div id="pane-config" class="hidden">
+      <div class="mt-3 flex flex-wrap items-center gap-2">
+        <span class="muted t-caption">Source: <span id="config-source" class="font-semibold">defaults (rose.example.toml)</span></span>
+        <span class="flex-1"></span>
+        <button onclick="resetConfig()" class="btn-ghost t-caption rounded px-2 py-1">Reset defaults</button>
+        <button onclick="exportConfig()" class="btn-ghost t-caption rounded px-2 py-1">Copy TOML</button>
+      </div>
+      <details open class="card mt-3 rounded-xl"><summary class="t-title cursor-pointer px-3 py-2">Server</summary>
+        <div class="grid gap-2 px-3 pb-3">
+          <label class="t-caption">Bind address<input id="cfg-bind" value="127.0.0.1:8787" oninput="markDirty()" class="cfg-input t-caption mt-1 font-mono"></label>
+          <label class="t-caption flex items-center gap-2"><input id="cfg-allow-remote" type="checkbox" oninput="markDirty()"> allow_remote <span class="muted">(refuse 0.0.0.0 unless checked)</span></label>
+        </div>
+      </details>
+      <details open class="card mt-2 rounded-xl"><summary class="t-title cursor-pointer px-3 py-2">Desktop &amp; browser (CDP)</summary>
+        <div class="grid gap-2 px-3 pb-3">
+          <div class="grid grid-cols-2 gap-2">
+            <label class="t-caption">Backend<select id="cfg-backend" onchange="markDirty()" class="cfg-input mt-1"><option value="auto" selected>auto (X11 + CDP when Chrome frontmost)</option><option value="x11">x11 (full desktop)</option><option value="cdp">cdp (browser tabs only)</option><option value="fake">fake (offline dev)</option></select></label>
+            <label class="t-caption">Display<input id="cfg-display" value=":1" oninput="markDirty()" class="cfg-input mt-1 font-mono"></label>
+          </div>
+          <div class="grid grid-cols-2 gap-2">
+            <label class="t-caption">Width<input id="cfg-width" type="number" value="1600" oninput="markDirty()" class="cfg-input mt-1 font-mono"></label>
+            <label class="t-caption">Height<input id="cfg-height" type="number" value="900" oninput="markDirty()" class="cfg-input mt-1 font-mono"></label>
+          </div>
+          <label class="t-caption">CDP endpoint<input id="cfg-cdp" value="http://127.0.0.1:9222" oninput="markDirty()" class="cfg-input mt-1 font-mono"></label>
+          <label class="t-caption flex items-center gap-2"><input id="cfg-launch" type="checkbox" oninput="markDirty()"> launch_if_missing</label>
+        </div>
+      </details>
+      <details open class="card mt-2 rounded-xl"><summary class="t-title cursor-pointer px-3 py-2">Brain (models)</summary>
+        <div class="grid gap-2 px-3 pb-3">
+          <div class="grid grid-cols-2 gap-2">
+            <label class="t-caption">Brain<select id="cfg-brain" onchange="markDirty()" class="cfg-input mt-1"><option value="muse" selected>muse (needs key)</option><option value="fake">fake (no key)</option></select></label>
+            <label class="t-caption">Model<input id="cfg-model" value="muse-spark-1.3-contributor" oninput="markDirty()" class="cfg-input mt-1 font-mono"></label>
+          </div>
+          <label class="t-caption">Endpoint<input id="cfg-endpoint" value="https://api.meta.ai/v1" oninput="markDirty()" class="cfg-input mt-1 font-mono"></label>
+          <div id="brain-note" class="muted t-caption">muse brain reads the key from Setup → Keys or <span class="font-mono">ROSE_MUSE_API_KEY</span>.</div>
+        </div>
+      </details>
+      <details open class="card mt-2 rounded-xl"><summary class="t-title cursor-pointer px-3 py-2">Policy (Governor)</summary>
+        <div class="grid grid-cols-3 gap-2 px-3 pb-3">
+          <label class="t-caption">max_steps<input id="cfg-steps" type="number" value="40" min="1" max="200" oninput="markDirty()" class="cfg-input mt-1 font-mono"></label>
+          <label class="t-caption">max_minutes<input id="cfg-minutes" type="number" value="15" min="1" max="120" oninput="markDirty()" class="cfg-input mt-1 font-mono"></label>
+          <label class="t-caption">max_model_calls<input id="cfg-calls" type="number" value="60" min="1" max="500" oninput="markDirty()" class="cfg-input mt-1 font-mono"></label>
+        </div>
+        <div class="px-3 pb-3"><label class="t-caption">require_approval_for (comma-separated)<input id="cfg-approvals" value="submit, send, pay, delete, publish" oninput="markDirty()" class="cfg-input mt-1 font-mono"></label></div>
+      </details>
+      <details class="card mt-2 rounded-xl"><summary class="t-title cursor-pointer px-3 py-2">Storage</summary>
+        <div class="px-3 pb-3"><label class="t-caption">Data dir<input id="cfg-datadir" value="~/.local/share/rose" oninput="markDirty()" class="cfg-input mt-1 font-mono"></label></div>
+      </details>
+      <div id="config-msg" class="muted t-caption mt-2">No changes yet. Real wiring: <span class="font-mono">GET /api/config</span> fills this form, <span class="font-mono">PUT /api/config</span> validates + applies.</div>
+      <div class="mt-3 flex flex-wrap justify-end gap-2">
+        <button onclick="toggleSetup(false)" class="btn-ghost rounded-lg px-4 py-2 font-semibold">Close</button>
+        <button onclick="saveConfig()" class="btn-accent rounded-lg px-5 py-2 font-semibold">Apply config</button>
+      </div>
+    </div>
+  </div>
+</div>
+
 <script>
-function toggleSetup(open) {
-  document.getElementById('setup-modal').classList.toggle('hidden', !open);
-  if (open) setTimeout(() => document.getElementById('api-key').focus(), 50);
-}
-function saveKey() {
-  const v = document.getElementById('api-key').value.trim();
-  const st = document.getElementById('key-state');
-  if (!v) { st.textContent = 'missing'; st.className = 'text-red-500 font-semibold'; return; }
-  document.getElementById('api-key').value = ''; // never linger in the DOM
-  st.textContent = 'set for this session';
-  st.className = 'text-green-600 font-semibold';
-  toggleSetup(false);
-  bubble('API key saved for this session — server memory only, nothing written to disk.');
-}
-function clearKey() {
-  document.getElementById('api-key').value = '';
-  const st = document.getElementById('key-state');
-  st.textContent = 'missing';
-  st.className = 'text-red-500 font-semibold';
-}
-document.addEventListener('keydown', e => {
-  if (e.key === 'Escape') toggleSetup(false);
+// ---- chat history (restored, working mock from nebula) ----
+document.getElementById('setup-modal').addEventListener('click', e => {
+  if (e.target.id === 'setup-modal') toggleSetup(false);
 });
-const thread = () => document.getElementById('live-tail');
-function bubble(html, mine) {
+const MOCK_CHATS = [
+  { id: 'c1', title: 'Pay the March invoice', state: 'done', turns: 3, steps: 7, when: 'today' },
+  { id: 'c2', title: 'Export March invoices', state: 'done', turns: 2, steps: 5, when: 'yesterday' },
+  { id: 'c3', title: 'Move PDFs to folder', state: 'waiting_approval', turns: 1, steps: 4, when: 'yesterday' },
+  { id: 'c4', title: 'Check calendar invites', state: 'failed', turns: 1, steps: 2, when: 'last week' },
+];
+const STATE_ICON = { done: '✓', finished: '✓', failed: '✗', stopped: '■', waiting_approval: '●', running: '▶' };
+let selectedChat = 'c1';
+function refreshChats() {
+  const list = document.getElementById('chat-list');
+  if (!list) return;
+  const q = (document.getElementById('chat-search')?.value || '').toLowerCase();
+  list.replaceChildren();
+  const chats = MOCK_CHATS.filter(c => !q || c.title.toLowerCase().includes(q));
+  if (!chats.length) {
+    const d = document.createElement('div');
+    d.className = 'muted px-2 py-3 text-center text-xs';
+    d.textContent = q ? 'No chats match your search.' : 'No chats yet — start one with New chat.';
+    list.appendChild(d);
+    return;
+  }
+  for (const chat of chats) {
+    const active = chat.id === selectedChat;
+    const item = document.createElement('button');
+    item.type = 'button';
+    item.setAttribute('role', 'listitem');
+    item.className = 'w-full rounded-lg px-3 py-2 text-left';
+    item.style.cssText = active ? 'background:var(--accent);color:#fff' : 'border:1px solid var(--line);background:transparent';
+    const title = document.createElement('div');
+    title.className = 'text-sm font-semibold leading-snug';
+    title.textContent = `${STATE_ICON[chat.state] || '•'} ${chat.title}`;
+    const meta = document.createElement('div');
+    meta.className = 'text-xs ' + (active ? '' : 'muted');
+    if (active) meta.style.opacity = '.85';
+    meta.textContent = `${chat.turns} turn${chat.turns === 1 ? '' : 's'} · ${chat.steps} steps · ${chat.when}`;
+    item.append(title, meta);
+    item.onclick = () => openChat(chat.id);
+    list.appendChild(item);
+  }
+}
+function openChat(id) {
+  selectedChat = id;
+  document.getElementById('live-tail').replaceChildren();
+  const chat = MOCK_CHATS.find(c => c.id === id);
+  mockBubble(chat ? chat.title : 'New chat', true);
+  mockBubble('This is a preview of that conversation.', false);
+  refreshChats();
+}
+function newChat() {
+  selectedChat = null;
+  document.getElementById('live-tail').replaceChildren();
+  mockBubble('New conversation started. What should Rose do?', false);
+  refreshChats();
+  document.getElementById('composer')?.focus();
+}
+function mockBubble(text, mine) {
+  const tail = document.getElementById('live-tail');
   const d = document.createElement('div');
-  d.className = mine
-    ? 'self-end max-w-[85%] px-[2%] py-2 rounded-2xl rounded-br-sm bg-[#0064E0] text-white'
-    : 'self-start max-w-[90%] flex gap-2';
-  d.innerHTML = mine ? html : `<span class="flex-none">🌌</span><div class="px-[2%] py-2 rounded-2xl rounded-tl-sm bg-neutral-100 dark:bg-neutral-800">${html}</div>`;
-  thread().appendChild(d);
+  if (mine) {
+    d.className = 'bubble-mine self-end max-w-[85%] rounded-2xl rounded-br-md px-3.5 py-2 text-sm';
+    d.textContent = text;
+  } else {
+    d.className = 'bubble-rose self-start max-w-[90%] rounded-2xl rounded-tl-md px-3.5 py-2 text-sm';
+    d.textContent = text;
+  }
+  tail.appendChild(d);
   d.scrollIntoView({ block: 'nearest' });
 }
 function send() {
   const box = document.getElementById('composer');
   const v = box.value.trim();
   if (!v) return;
-  bubble(v.replace(/</g, '&lt;'), true);
+  mockBubble(v, true);
   box.value = '';
-  setTimeout(() => bubble(`On it — starting <strong>${v.replace(/</g, '&lt;')}</strong>. I'll narrate each step here and pause for approval before anything irreversible.`), 600);
-  setTimeout(() => bubble(`Step 1 · Screenshot taken, grounding targets…`), 1600);
+  setTimeout(() => mockBubble('On it — starting: ' + v.slice(0, 120), false), 500);
+  setTimeout(() => mockBubble('Step 1 · Screenshot taken, grounding targets…', false), 1200);
 }
-function resolveApproval(ok) {
-  bubble(ok ? 'Approved — continuing the run.' : 'Denied — run aborted, desktop untouched.');
+function mockStop() {
+  mockBubble('Stopped — desktop untouched.', false);
 }
+function setupTab(which) {
+  lastTab = which;
+  const keys = which === 'keys';
+  document.getElementById('pane-keys').classList.toggle('hidden', !keys);
+  document.getElementById('pane-config').classList.toggle('hidden', keys);
+  document.getElementById('tab-keys').className = 't-caption rounded-lg px-3 py-1.5 font-semibold ' + (keys ? 'btn-accent' : 'btn-ghost');
+  document.getElementById('tab-config').className = 't-caption rounded-lg px-3 py-1.5 font-semibold ' + (!keys ? 'btn-accent' : 'btn-ghost');
+}
+function saveKey() {
+  const v = document.getElementById('api-key').value.trim();
+  const st = document.getElementById('key-state');
+  if (!v) { st.textContent = 'missing'; st.className = 'font-semibold text-red-500'; return; }
+  document.getElementById('api-key').value = '';
+  st.textContent = 'set for this session';
+  st.className = 'font-semibold text-green-600';
+  toggleSetup(false);
+  mockBubble('API key saved for this session — server memory only, nothing written to disk.', false);
+}
+function clearKey() {
+  document.getElementById('api-key').value = '';
+  const st = document.getElementById('key-state');
+  st.textContent = 'missing';
+  st.className = 'font-semibold text-red-500';
+}
+// ---- config management (mock; real wiring: GET/PUT /api/config) ----
+const CFG_FIELDS = ['cfg-bind','cfg-backend','cfg-display','cfg-width','cfg-height','cfg-cdp','cfg-launch','cfg-brain','cfg-model','cfg-endpoint','cfg-steps','cfg-minutes','cfg-calls','cfg-approvals','cfg-datadir'];
+const CFG_DEFAULTS = {};
+function snapshotConfig() {
+  const o = {};
+  CFG_FIELDS.forEach(id => {
+    const el = document.getElementById(id);
+    o[id] = el.type === 'checkbox' ? el.checked : el.value;
+  });
+  return o;
+}
+function applyConfig(o) {
+  CFG_FIELDS.forEach(id => {
+    const el = document.getElementById(id);
+    if (!el || o[id] === undefined) return;
+    if (el.type === 'checkbox') el.checked = !!o[id]; else el.value = o[id];
+  });
+  syncBrainNote();
+}
+function markDirty() {
+  document.getElementById('config-dirty').classList.remove('hidden');
+  document.getElementById('config-msg').textContent = 'Unsaved changes — Apply validates locally, then PUT /api/config (mocked here).';
+  syncBrainNote();
+}
+function markClean(msg) {
+  document.getElementById('config-dirty').classList.add('hidden');
+  document.getElementById('config-msg').textContent = msg;
+}
+function syncBrainNote() {
+  const b = document.getElementById('cfg-brain').value;
+  document.getElementById('brain-note').innerHTML = b === 'fake'
+    ? 'fake brain needs no key — good for offline drafts.'
+    : 'muse brain reads the key from Setup → Keys or <span class="font-mono">ROSE_MUSE_API_KEY</span>.';
+}
+function collectConfig() {
+  const v = id => document.getElementById(id).value.trim();
+  const c = id => document.getElementById(id).checked;
+  return {
+    server: { bind: v('cfg-bind'), allow_remote: c('cfg-allow-remote') },
+    desktop: { backend: v('cfg-backend'), display: v('cfg-display'), width: +v('cfg-width'), height: +v('cfg-height') },
+    cdp: { endpoint: v('cfg-cdp'), launch_if_missing: c('cfg-launch') },
+    models: { brain: v('cfg-brain'), endpoint: v('cfg-endpoint'), model: v('cfg-model') },
+    policy: { max_steps: +v('cfg-steps'), max_minutes: +v('cfg-minutes'), max_model_calls: +v('cfg-calls'), require_approval_for: v('cfg-approvals').split(',').map(s=>s.trim()).filter(Boolean) },
+    data: { dir: v('cfg-datadir') },
+  };
+}
+function saveConfig() {
+  const cfg = collectConfig();
+  const errs = [];
+  if (!/^\S+:\d+$/.test(cfg.server.bind)) errs.push('bind must be host:port');
+  if (!(cfg.desktop.width >= 640 && cfg.desktop.height >= 360)) errs.push('desktop size looks too small');
+  if (!(cfg.policy.max_steps >= 1 && cfg.policy.max_steps <= 200)) errs.push('max_steps 1..200');
+  if (errs.length) { document.getElementById('config-msg').textContent = '⚠️ ' + errs.join(' · '); return; }
+  try { localStorage.setItem('rose-config-draft', JSON.stringify(snapshotConfig())); } catch(e) {}
+  document.getElementById('config-source').textContent = 'draft (localStorage) — PUT /api/config on real backend';
+  document.getElementById('status-text').textContent = `Running · ${cfg.policy.max_steps} steps · ${cfg.desktop.display} · brain=${cfg.models.brain}`;
+  markClean('✓ Applied (mock) — validated locally. Real backend: PUT /api/config then rosed hot-reloads policy + brain.');
+  mockBubble(`Config applied: backend=${cfg.desktop.backend}, brain=${cfg.models.brain}, budget=${cfg.policy.max_steps} steps / ${cfg.policy.max_minutes} min.`, false);
+}
+function resetConfig() {
+  applyConfig(CFG_DEFAULTS);
+  try { localStorage.removeItem('rose-config-draft'); } catch(e) {}
+  document.getElementById('config-source').textContent = 'defaults (rose.example.toml)';
+  markClean('Reset to rose.example.toml defaults.');
+}
+function exportConfig() {
+  const cfg = collectConfig();
+  const toml = `[server]\nbind = "${cfg.server.bind}"\nallow_remote = ${cfg.server.allow_remote}\n\n[desktop]\nbackend = "${cfg.desktop.backend}"\ndisplay = "${cfg.desktop.display}"\nwidth = ${cfg.desktop.width}\nheight = ${cfg.desktop.height}\n\n[cdp]\nendpoint = "${cfg.cdp.endpoint}"\nlaunch_if_missing = ${cfg.cdp.launch_if_missing}\n\n[models]\nbrain = "${cfg.models.brain}"\nendpoint = "${cfg.models.endpoint}"\nmodel = "${cfg.models.model}"\n\n[policy]\nmax_steps = ${cfg.policy.max_steps}\nmax_minutes = ${cfg.policy.max_minutes}\nmax_model_calls = ${cfg.policy.max_model_calls}\nrequire_approval_for = [${cfg.policy.require_approval_for.map(s=>`"${s}"`).join(', ')}]\n\n[data]\ndir = "${cfg.data.dir}"\n`;
+  if (navigator.clipboard) navigator.clipboard.writeText(toml).then(() => markClean('TOML copied to clipboard.')).catch(() => markClean('Copy failed.'));
+}
+// ---- video → instructions (mock pipeline) ----
+let videos = [];
+let selectedId = null;
+let pipeTimer = null;
+const STAGES = [
+  { key: 'extract', label: 'Extracting frames (ffmpeg)', pct: 18 },
+  { key: 'transcribe', label: 'Transcribing narration (Muse Voice)', pct: 45 },
+  { key: 'align', label: 'Aligning narration ↔ clicks', pct: 68 },
+  { key: 'ground', label: 'Grounding targets (Spark + SAM)', pct: 86 },
+  { key: 'draft', label: 'Drafting skill YAML', pct: 100 },
+];
+function fmtSize(b) {
+  if (b < 1024) return b + ' B';
+  if (b < 1048576) return (b/1024).toFixed(1) + ' KB';
+  if (b < 1073741824) return (b/1048576).toFixed(1) + ' MB';
+  return (b/1073741824).toFixed(2) + ' GB';
+}
+function pickVideos(input) { addFiles([...input.files]); input.value = ''; }
+function dropVideos(e) {
+  e.preventDefault();
+  if (e.dataTransfer?.files?.length) addFiles([...e.dataTransfer.files]);
+}
+function addFiles(files) {
+  const vids = files.filter(f => f.type.startsWith('video/') || /\.(mp4|webm|mov|mkv)$/i.test(f.name));
+  if (!vids.length) { mockBubble('No video files in that drop — try mp4 / webm / mov.', false); return; }
+  vids.forEach(f => {
+    const v = { id: 'v' + Math.random().toString(36).slice(2, 8), name: f.name, size: f.size, url: URL.createObjectURL(f), status: 'queued', progress: 0, stage: 'Waiting…', log: [], steps: [] };
+    videos.unshift(v);
+    if (!selectedId) selectedId = v.id;
+  });
+  renderVideos();
+  selectVideo(selectedId);
+  mockBubble(vids.length + ' video(s) queued — press Generate instructions under the desktop.', false);
+}
+function selectedVideo() { return videos.find(v => v.id === selectedId) || null; }
+function renderVideos() {
+  const list = document.getElementById('video-list');
+  document.getElementById('video-count').textContent = videos.length;
+  document.getElementById('video-empty').style.display = videos.length ? 'none' : '';
+  list.replaceChildren();
+  videos.forEach(v => {
+    const row = document.createElement('div');
+    row.className = 'flex cursor-pointer items-center gap-2 rounded-lg border px-2 py-1.5';
+    row.style.borderColor = v.id === selectedId ? 'var(--accent)' : 'var(--line)';
+    if (v.id === selectedId) row.style.background = 'var(--bg)';
+    row.onclick = () => selectVideo(v.id);
+    const dot = document.createElement('span');
+    dot.className = 'size-2 flex-none rounded-full ' + (v.status === 'ready' ? 'bg-green-600' : v.status === 'working' ? 'animate-pulse bg-blue-600' : 'bg-neutral-400');
+    const meta = document.createElement('div');
+    meta.className = 'min-w-0 flex-1';
+    const n = document.createElement('div');
+    n.className = 't-caption truncate font-semibold';
+    n.textContent = v.name;
+    const s = document.createElement('div');
+    s.className = 'muted t-caption';
+    s.textContent = `${fmtSize(v.size)} · ${v.status}${v.steps.length ? ` · ${v.steps.length} steps` : ''}`;
+    meta.append(n, s);
+    const del = document.createElement('button');
+    del.className = 't-caption rounded px-1.5 py-0.5 text-neutral-400 hover:text-red-600';
+    del.textContent = '✕';
+    del.title = 'Remove video';
+    del.onclick = (e) => { e.stopPropagation(); removeVideo(v.id); };
+    row.append(dot, meta, del);
+    list.appendChild(row);
+  });
+}
+function removeVideo(id) {
+  videos = videos.filter(v => v.id !== id);
+  if (selectedId === id) selectedId = videos[0]?.id || null;
+  renderVideos();
+  if (selectedId) selectVideo(selectedId);
+  else document.getElementById('video-detail').classList.add('hidden');
+}
+function selectVideo(id) {
+  selectedId = id;
+  const v = selectedVideo();
+  renderVideos();
+  if (!v) return;
+  document.getElementById('video-detail').classList.remove('hidden');
+  document.getElementById('vd-name').textContent = v.name;
+  document.getElementById('vd-player').src = v.url;
+  setPipeline(v.stage, v.progress, v.log.join('\n'));
+  setStatusBadge(v.status);
+  renderSteps();
+}
+function setStatusBadge(st) {
+  const b = document.getElementById('vd-status');
+  b.textContent = st;
+}
+function setPipeline(stage, pct, log) {
+  document.getElementById('vd-stage').textContent = stage;
+  document.getElementById('vd-pct').textContent = Math.round(pct) + '%';
+  document.getElementById('vd-bar').style.width = pct + '%';
+  document.getElementById('vd-log').textContent = log || '';
+}
+function runPipeline(v) {
+  if (!v) { mockBubble('Upload a video first — then generate instructions from it.', false); return; }
+  if (v.status === 'working') return;
+  clearInterval(pipeTimer);
+  v.status = 'working'; v.progress = 0; v.log = []; v.steps = [];
+  document.getElementById('vd-steps-wrap').classList.add('hidden');
+  document.getElementById('vd-saved').classList.add('hidden');
+  setStatusBadge('working');
+  selectVideo(v.id);
+  let i = 0;
+  const tick = () => {
+    if (selectedId !== v.id) { clearInterval(pipeTimer); return; }
+    const st = STAGES[i];
+    v.stage = st.label; v.progress = st.pct;
+    v.log.push(`{stage:"${st.key}", pct:${st.pct}} — ${st.label}`);
+    setPipeline(v.stage, v.progress, v.log.slice(-4).join('\n'));
+    renderVideos();
+    i++;
+    if (i >= STAGES.length) {
+      clearInterval(pipeTimer);
+      v.status = 'ready'; v.progress = 100; v.stage = 'Draft ready — review below';
+      v.steps = mockSteps(v.name);
+      setPipeline(v.stage, 100, v.log.slice(-4).join('\n') + '\nimported skill.draft.yaml ✓');
+      setStatusBadge('ready');
+      renderVideos(); renderSteps();
+      mockBubble(`Video "${v.name}" → draft ready: ${v.steps.length} steps with timestamps. Review under the desktop, then send to Rose.`, false);
+    }
+  };
+  tick();
+  pipeTimer = setInterval(tick, 900);
+}
+function cancelPipeline() {
+  clearInterval(pipeTimer);
+  const v = selectedVideo();
+  if (v && v.status === 'working') {
+    v.status = 'queued'; v.stage = 'Cancelled — press Generate to retry';
+    setStatusBadge('queued'); setPipeline(v.stage, v.progress, v.log.join('\n'));
+    renderVideos();
+  }
+}
+function mockSteps(name) {
+  const base = name.replace(/\.\w+$/, '').replace(/[_-]+/g, ' ').slice(0, 40) || 'recorded task';
+  return [
+    { ts: 12, say: 'Open the billing portal', intent: `open billing portal (${base})`, params: 'portal_url = {{portal_url}}', approval: false, conf: 0.93, quote: "I'm opening the billing portal" },
+    { ts: 31, say: 'Go to Invoices', intent: 'navigate to Invoices list', params: 'month = {{month}}', approval: false, conf: 0.88, quote: 'go to Invoices' },
+    { ts: 65, say: 'Filter by month — changes every time', intent: 'set month filter', params: 'month = {{month}}', approval: false, conf: 0.61, quote: 'filter by month - changes every time' },
+    { ts: 100, say: 'Export, then CSV', intent: 'click Export → download CSV', params: 'format = csv', approval: true, conf: 0.79, quote: 'Export, then CSV' },
+  ];
+}
+function confColor(c) {
+  return c >= 0.8 ? 'color:var(--accent)' : c >= 0.65 ? 'color:#b45309' : 'color:#dc2626';
+}
+function renderSteps() {
+  const v = selectedVideo();
+  const wrap = document.getElementById('vd-steps-wrap');
+  const box = document.getElementById('vd-steps');
+  if (!v || !v.steps.length) { wrap.classList.add('hidden'); return; }
+  wrap.classList.remove('hidden');
+  const avg = v.steps.reduce((a,s)=>a+s.conf,0)/v.steps.length;
+  document.getElementById('vd-conf').textContent = `avg confidence ${(avg*100).toFixed(0)}%`;
+  box.replaceChildren();
+  v.steps.forEach((s, idx) => {
+    const card = document.createElement('div');
+    card.className = 'rounded-lg border p-2';
+    card.style.borderColor = s.conf < 0.65 ? '#ef4444' : s.conf < 0.8 ? '#f59e0b' : 'var(--line)';
+    const head = document.createElement('button');
+    head.className = 'flex w-full items-center gap-2 text-left';
+    const mm = String(Math.floor(s.ts/60)).padStart(2,'0'), ss = String(s.ts%60).padStart(2,'0');
+    head.innerHTML = `<span class="t-caption rounded px-1.5 py-0.5 font-mono" style="background:var(--line)">▶ ${mm}:${ss}</span><span class="t-caption flex-1 font-semibold"></span><span class="t-caption font-semibold"></span>`;
+    head.children[1].textContent = `Step ${idx+1} · ${s.say}`;
+    head.children[2].textContent = Math.round(s.conf*100) + '%';
+    head.children[2].style.cssText = confColor(s.conf);
+    head.title = 'Seek video to this moment';
+    head.onclick = () => { const p = document.getElementById('vd-player'); try { p.currentTime = s.ts; p.play(); } catch(e) {} };
+    const intent = document.createElement('input');
+    intent.value = s.intent;
+    intent.className = 'cfg-input t-caption mt-1.5';
+    intent.placeholder = 'Agent intent…';
+    intent.oninput = () => { s.intent = intent.value; hideSaved(); };
+    const params = document.createElement('input');
+    params.value = s.params;
+    params.className = 'cfg-input t-caption mt-1 font-mono';
+    params.placeholder = 'params, {{slots}} for values that change';
+    params.oninput = () => { s.params = params.value; hideSaved(); };
+    const foot = document.createElement('div');
+    foot.className = 'mt-1 flex items-center gap-2';
+    const q = document.createElement('span');
+    q.className = 'muted t-caption flex-1 truncate italic';
+    q.textContent = `“${s.quote}”`;
+    const ap = document.createElement('label');
+    ap.className = 't-caption flex flex-none items-center gap-1';
+    const cb = document.createElement('input');
+    cb.type = 'checkbox'; cb.checked = s.approval;
+    cb.onchange = () => { s.approval = cb.checked; hideSaved(); };
+    ap.append(cb, document.createTextNode('needs approval'));
+    const rm = document.createElement('button');
+    rm.className = 't-caption flex-none rounded px-1.5 py-0.5 text-neutral-400 hover:text-red-600';
+    rm.textContent = '✕'; rm.title = 'Delete step';
+    rm.onclick = () => { v.steps.splice(idx,1); renderSteps(); renderVideos(); };
+    foot.append(q, ap, rm);
+    card.append(head, intent, params, foot);
+    box.appendChild(card);
+  });
+}
+function hideSaved() { document.getElementById('vd-saved').classList.add('hidden'); }
+function addStep() {
+  const v = selectedVideo(); if (!v) return;
+  v.steps.push({ ts: Math.round(document.getElementById('vd-player').currentTime || 0), say: 'New step', intent: '', params: '', approval: false, conf: 0.5, quote: '' });
+  renderSteps();
+}
+function saveDraft() {
+  const v = selectedVideo(); if (!v) return;
+  document.getElementById('vd-saved').classList.remove('hidden');
+}
+function useInChat() {
+  const v = selectedVideo();
+  if (!v || !v.steps.length) { mockBubble('Generate instructions first — the draft is empty.', false); return; }
+  const text = `From video "${v.name}":\n` + v.steps.map((s,i) => `${i+1}. ${s.intent} [${s.params}]${s.approval ? ' (needs approval)' : ''}`).join('\n');
+  document.getElementById('composer').value = text;
+  document.getElementById('composer').focus();
+  mockBubble(`Draft from "${v.name}" loaded into the composer — edit, then hit Run.`, false);
+}
+// ---- init ----
+(function init(){
+  CFG_FIELDS.forEach(id => {
+    const el = document.getElementById(id);
+    CFG_DEFAULTS[id] = el.type === 'checkbox' ? el.checked : el.value;
+  });
+  try {
+    const saved = JSON.parse(localStorage.getItem('rose-config-draft') || 'null');
+    if (saved) { applyConfig(saved); document.getElementById('config-source').textContent = 'draft (localStorage)'; }
+  } catch(e) {}
+  syncBrainNote();
+  refreshChats();
+  mockBubble('Pay the March invoice from Example Ltd', true);
+  mockBubble('The March invoices are visible. Heading for INV-2041 · $42.00.', false);
+  document.getElementById('status-text').textContent = 'Running · step 4/40 · :1';
+  document.getElementById('backend-text').textContent = 'draft · preview only';
+})();
 document.getElementById('composer').addEventListener('keydown', e => {
   if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); }
 });
+document.addEventListener('keydown', e => { if (e.key === 'Escape') toggleSetup(false); });
+if (matchMedia('(max-width: 1023px)').matches) document.getElementById('desk-panel').classList.add('hidden');
 </script>
 </body>
 </html>
