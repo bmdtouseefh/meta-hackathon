@@ -9,11 +9,31 @@ bind = "127.0.0.1:8787"
 allow_remote = false
 
 [desktop]
-# "x11" (real, T1.2) | "fake" (tests / offline dev).
-backend = "x11"
+# "auto" (recommended: X11 desktop, CDP whenever a Chrome window is frontmost)
+# | "x11" (full desktop via pixels) | "cdp" (browser tabs only, no native UI)
+# | "fake" (tests / offline dev).
+backend = "auto"
 display = ":1"
 width = 1600
 height = 900
+
+[cdp]
+# CDP endpoint of the VM's existing Chrome (google-chrome-stable launched
+# with --remote-debugging-port=9222). No Chromium install: chromiumoxide
+# speaks CDP to any recent Chrome and reuses its logged-in profile.
+# Start Chrome once, e.g.:
+#   google-chrome-stable --remote-debugging-port=9222 --user-data-dir=~/.config/rose/chrome-profile &
+# (Chrome refuses remote debugging on its *default* profile dir, so the CDP
+# browser must use a non-default dir; setup.sh/deploy.sh migrate the existing
+# profile there one-time, logins kept.)
+endpoint = "http://127.0.0.1:9222"
+# If true and the endpoint refuses, launch the detected chrome binary
+# headed (1600x900 on :1) instead of failing the step.
+launch_if_missing = false
+# Override chrome binary auto-detect
+# (google-chrome-stable | google-chrome | chromium-browser | ...).
+# Empty = auto-detect, CHROME_BIN env wins over this.
+chrome_binary = ""
 
 [models]
 # "muse" (Muse Spark 1.3, T3.1) | "fake" (scripted replies, no API key).
@@ -23,17 +43,11 @@ endpoint = "https://api.meta.ai/v1"
 # Contributor tier: low cost, one call per step.
 model = "muse-spark-1.3-contributor"
 
-[grounding]
-# SoM overlay parser: "omniparser" (grounding-worker sidecar) | "off" (raw
-# screenshots + legacy x,y clicks) | "fake" reserved for tests.
-# Lite contour parser runs on 4 CPU / 4 GB RAM (<500 MB RSS). Full
-# OmniParser V2 weights (icon_detect_v3 MIT + icon_caption MIT) can replace
-# the sidecar later behind the same POST /parse contract — no Rust changes.
-backend = "omniparser"
-endpoint = "http://127.0.0.1:8791"
-# Minimum element confidence 0..100; below this the overlay id is hidden
-# from the brain and the step falls back to raw pixels.
-min_conf = 5
+# Vision grounding is not configured: the brain only ever sees gridded
+# screenshots — the backend's DOM/AX element list as text when it has
+# one (browser pages), the constant axis-numbered 64x36 grid everywhere
+# else. Raw screenshots are never sent; a frame that cannot be gridded
+# fails the step instead.
 
 [policy]
 max_steps = 40

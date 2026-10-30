@@ -241,14 +241,17 @@ impl MuseClient {
         - If shell output in the history already proves the goal is complete, reply \"done\".\n\
         - Only if the next step genuinely requires seeing and operating the GUI (clicking a control in an already-open app), reply {\"status\":\"act\",\"action\":\"look\",\"say\":\"I need to see the desktop to ...\"} and a screenshot will be taken for your next reply.\n";
 
-    /// Goal + short history + current JPEG -> one JSON action.
+    /// Goal + short history + current JPEG + grounded element list ->
+    /// one JSON action. The list is the text twin of the annotated image
+    /// (same 1..N order) so the brain picks by meaning, not by squinting.
     pub async fn next_action(
         &self,
         goal: &str,
         history: &[StepSummary],
         jpeg: &[u8],
+        elements: &[rose_core::Element],
     ) -> Result<ModelReply> {
-        self.call(goal, history, Some(jpeg)).await
+        self.call(goal, history, Some(jpeg), elements).await
     }
 
     /// Goal + short history, NO screenshot -> one JSON action.
@@ -259,7 +262,7 @@ impl MuseClient {
         goal: &str,
         history: &[StepSummary],
     ) -> Result<ModelReply> {
-        self.call(goal, history, None).await
+        self.call(goal, history, None, &[]).await
     }
 
     /// Bad reply: one retry, then a clear error (never panic on model output).
@@ -268,13 +271,20 @@ impl MuseClient {
         goal: &str,
         history: &[StepSummary],
         jpeg: Option<&[u8]>,
+        elements: &[rose_core::Element],
     ) -> Result<ModelReply> {
         let (user_text, developer, image_part) = match jpeg {
             Some(jpeg) => {
                 let image_b64 = base64::engine::general_purpose::STANDARD.encode(jpeg);
+                let element_list = crate::grounding::format_elements(elements);
+                let elements_text = if element_list.is_empty() {
+                    String::new()
+                } else {
+                    format!("\n{element_list}")
+                };
                 (
                     format!(
-                        "Goal: {goal}\nPrevious actions (most recent last):\n{}\nCurrent screenshot attached (1600x900). Reply with ONE JSON object only.",
+                        "Goal: {goal}\nPrevious actions (most recent last):\n{}\nCurrent screenshot attached (stay inside its pixels; X11 is 1600x900, browser viewports are shorter).{elements_text}\nReply with ONE JSON object only.",
                         Self::history_text(history)
                     ),
                     BRAIN_PROMPT.to_string(),
@@ -437,6 +447,22 @@ mod tests {
                 action: Action::DoubleClick { .. },
                 ..
             }
+        ));
+        // Grid-cell picks arrive as element strings too ("g<col>,<row>");
+        // the Stepper resolves them against the frame's grid geometry.
+        let g = parse_reply(
+            r#"{"status":"act","action":"click","element":"g14,3","say":"Clicking cell 14,3"}"#,
+        )
+        .expect("grid cell click");
+        assert!(matches!(
+            g,
+            ModelReply::Act {
+                action: Action::Click {
+                    target: Target::Element(ElementId(ref s)),
+                    ..
+                },
+                ..
+            } if s == "g14,3"
         ));
         // Legacy pixels still parse for fallback runs.
         assert!(parse_reply(r#"{"status":"act","action":"click","x":1,"y":2,"say":"p"}"#).is_ok());

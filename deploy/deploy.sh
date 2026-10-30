@@ -34,46 +34,42 @@ sudo apt install -y "./$DEB"
 echo "-- after: $(dpkg-query -W -f='${Version}' rose)"
 echo "-- rosed install (per-user wiring, absolute path on purpose)"
 /usr/bin/rosed install
-echo "-- grounding-worker deps + unit (lite SoM parser, 4 CPU / 4 GB, uv venv)"
-export PATH="$HOME/.local/bin:$PATH"
-command -v uv >/dev/null 2>&1 || curl -LsSf https://astral.sh/uv/install.sh | sh
-export PATH="$HOME/.local/bin:$PATH"
-sudo apt install -y tesseract-ocr tesseract-ocr-eng
-VENV="$HOME/.local/share/rose/grounding-venv"
-uv venv "$VENV" 2>/dev/null || true
-uv pip install --python "$VENV/bin/python" -r /usr/share/rose/grounding-worker/requirements.txt
-cp -f /usr/lib/systemd/user/grounding.service ~/.config/systemd/user/grounding.service
-# Existing config.toml is never overwritten by rosed install, so enable the
-# overlay here (idempotent). Section-aware: only touch [grounding].
-python3 - <<'PY'
-import pathlib, re
-p = pathlib.Path.home() / ".config/rose/config.toml"
-text = p.read_text() if p.exists() else ""
-m = re.search(r"(?m)^\[grounding\][^\[]*", text)
-if m is None:
-    text += '\n[grounding]\nbackend = "omniparser"\nendpoint = "http://127.0.0.1:8791"\nmin_conf = 5\n'
-else:
-    block = m.group(0)
-    if re.search(r'(?m)^backend\s*=', block):
-        block = re.sub(r'(?m)^backend\s*=.*', 'backend = "omniparser"', block, count=1)
-    else:
-        block = block.rstrip("\n") + '\nbackend = "omniparser"\n'
-    text = text[:m.start()] + block + text[m.end():]
-p.parent.mkdir(parents=True, exist_ok=True)
-p.write_text(text)
-PY
+cp -f /usr/lib/systemd/user/chrome-cdp.service ~/.config/systemd/user/chrome-cdp.service
+echo "-- chrome-cdp (existing google-chrome-stable with --remote-debugging-port=9222)"
+# One-time migration: Chrome refuses remote debugging on its default profile
+# dir, so chrome-cdp uses ~/.config/rose/chrome-profile (logins kept).
+if [ ! -d "$HOME/.config/rose/chrome-profile" ] && [ -d "$HOME/.config/google-chrome" ]; then
+  echo "-- migrating Chrome profile to CDP dir (one-time, logins kept)"
+  mkdir -p "$HOME/.config/rose"
+  mv "$HOME/.config/google-chrome" "$HOME/.config/rose/chrome-profile"
+fi
+# chrome-cdp must own the profile: a manually started Chrome without the flag
+# holds the SingletonLock and the unit would crash-loop.
+pkill -f 'chrome' 2>/dev/null || true
+sleep 1
 echo "-- restart services"
 systemctl --user daemon-reload
 systemctl --user restart xvnc.service
-systemctl --user restart grounding.service
+systemctl --user enable --now chrome-cdp.service
+echo "-- wait for CDP http://127.0.0.1:9222/json/version (first launch builds caches)"
+for i in $(seq 1 20); do
+  if curl -sf http://127.0.0.1:9222/json/version >/dev/null 2>&1; then
+    echo "-- CDP endpoint live"
+    break
+  fi
+  sleep 1
+  if [ "$i" -eq 20 ]; then
+    echo "WARN: CDP endpoint not responding - journalctl --user -u chrome-cdp.service -n 30" >&2
+  fi
+done
 systemctl --user restart rosed.service
 sleep 4
 echo "-- verify"
 grep -H ExecStart ~/.config/systemd/user/rosed.service
 echo "xvnc: $(systemctl --user is-active xvnc.service)"
-echo "grounding: $(systemctl --user is-active grounding.service)"
+echo "chrome-cdp: $(systemctl --user is-active chrome-cdp.service)"
 echo "rosed: $(systemctl --user is-active rosed.service)"
-echo "grounding health: $(curl -s http://127.0.0.1:8791/health)"
+echo "CDP: $(curl -s http://127.0.0.1:9222/json/version | head -c 120)"
 HEALTH="$(curl -s http://127.0.0.1:8787/api/health)"
 echo "health: $HEALTH"
 echo "$HEALTH" | grep -q "\"version\":\"$VER\"" || {

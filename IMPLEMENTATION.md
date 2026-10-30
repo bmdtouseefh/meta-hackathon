@@ -107,12 +107,15 @@ meta-hackathon/
 |---|---|
 | `rose-core` | `serde`, `serde_json`, `thiserror`, `chrono`, `uuid`. **No Tokio, no I/O, no other rose crate.** |
 | `rose-desktop-x11` | `rose-core`, `x11rb`, `image`, `tokio`, `tracing` |
+| `rose-desktop-cdp` | `rose-core`, `chromiumoxide` (CDP protocol only, not an agent framework), `tokio`, `tracing`, `serde_json`, `futures`, `which`, `chrono` |
+| `rose-grid` | `rose-core`, `image` (constant 64x36 numbered grid overlay; the pixel-side grounding, instant and dependency-light). |
+| `rose-desktop-auto` | `rose-core`, `rose-desktop-x11`, `rose-desktop-cdp`, `tokio`, `tracing`. Router only: X11 default, CDP when a Chrome window is frontmost. |
 | `rose-desktop-fake` | `rose-core`, `image`, `tokio` |
 | `rose-models` | `rose-core`, `reqwest` (rustls), `serde_json`, `tokio`, `tracing`, `base64` |
 | `rose-governor` | `rose-core` only. **Pure & synchronous: no I/O, no async, no models.** |
-| `rose-agent` | `rose-core`, `rose-governor`, `tokio`, `tracing`. **Never** `rose-desktop-*`, `rose-models`, `rose-web`, `rusqlite`. |
+| `rose-agent` | `rose-core`, `rose-governor`, `tokio`, `tracing`. **Never** `rose-desktop-*`, `rose-models`, `rose-web`, `rusqlite`. Houses the `Lease` (takeover) type. |
 | `rose-store` | `rose-core`, `rusqlite` (bundled), `tokio`, `tracing` |
-| `rose-web` | `rose-core`, `rose-agent`, `rose-store`, `axum`, `tokio`, `tracing`. Calls agent/store traits only — never the desktop or models directly. |
+| `rose-web` | `rose-core`, `rose-agent` (`Lease`), `rose-store`, `axum`, `tokio`, `tracing`. Calls agent/store traits only — never the desktop or models directly. |
 | `apps/rosed` | Everything (it is the composition root), `anyhow`, `clap`, `toml`, `tracing-subscriber` |
 
 ### Cargo features (on `apps/rosed`, wired to crate features where needed)
@@ -372,13 +375,16 @@ Config shape (extend, don't reshape):
   `rosed click X Y`, `rosed type "text"`, `rosed key Return` subcommands on
   the same backend (essential debugging tools, keep forever).
   *Touch:* `apps/rosed`, backend crates. *Accept:* E2E-1 items 1–3.
-- [ ] **T1.4 Web shell + live view + takeover.** Embedded single-page UI:
+- [x] **T1.4 Web shell + live view + takeover.** Embedded single-page UI:
   header (status, Take Control/Hand Back, Stop), live frame canvas
-  (`WS /desktop/frames`), instruction box (disabled logic OK — tasks don't
-  run yet), empty timeline. Lease logic in `rose-agent` (`Lease` type):
-  human input via WS executes only under human lease; agent input only under
-  agent lease; takeover takes effect between actions.
-  *Touch:* `rose-web`, `ui/`, `rose-agent` (lease only). *Accept:* E2E-1 complete.
+  (1s `/api/frame` poll, not WS — matches the existing UI rhythm),
+  instruction box, timeline. Lease logic in `rose-agent` (`Lease` type):
+  human input via POST `/desktop/input` (fractions of the live image, mapped
+  onto a fresh frame server-side) executes only under human lease; the agent
+  loop pauses at its next checkpoint instead of dying and resumes with a
+  fresh observation on hand-back. *Touch:* `rose-web`, `ui/`, `rose-agent`
+  (lease only). *Accept:* `cargo test -p rose-web -p rose-agent -p rosed`
+  green (takeover gating + pause/resume), E2E-1 items 4–6 manual.
 
 ### M2 — State, Governor, loop skeleton (fake models)
 - [ ] **T2.1 `SqliteStore`.** §4 schema, `Store` impl, artifact file layout.

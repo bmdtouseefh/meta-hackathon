@@ -5,8 +5,10 @@ edition.workspace = true
 license.workspace = true
 
 [features]
-default = ["desktop-x11", "web-ui", "models-meta"]
+default = ["desktop-x11", "desktop-cdp", "desktop-auto", "web-ui", "models-meta"]
 desktop-x11 = []
+desktop-cdp = []
+desktop-auto = []
 web-ui = []
 models-meta = []
 video = []
@@ -14,7 +16,11 @@ skills = []
 
 [dependencies]
 rose-core = { path = "../../crates/rose-core" }
+rose-agent = { path = "../../crates/rose-agent" }
 rose-desktop-fake = { path = "../../crates/rose-desktop-fake" }
+rose-desktop-cdp = { path = "../../crates/rose-desktop-cdp" }
+rose-desktop-auto = { path = "../../crates/rose-desktop-auto" }
+rose-grid = { path = "../../crates/rose-grid" }
 rose-desktop-x11 = { path = "../../crates/rose-desktop-x11" }
 rose-models = { path = "../../crates/rose-models" }
 rose-store = { path = "../../crates/rose-store" }

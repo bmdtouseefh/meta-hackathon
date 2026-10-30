@@ -9,10 +9,13 @@ mod shell;
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
 use clap::{Parser, Subcommand};
+use rose_agent::{Driver, Lease};
 use rose_core::{Action, Actor, DesktopBackend, Element, Policy, RoseConfig, StepSummary, Target};
+use rose_desktop_auto::AutoDesktop;
+use rose_desktop_cdp::CdpDesktop;
 use rose_desktop_fake::FakeDesktop;
 use rose_desktop_x11::X11Desktop;
-use rose_models::{resolve_element, FakeBrain, GroundingClient, ModelReply, MuseClient};
+use rose_models::{resolve_element, FakeBrain, ModelReply, MuseClient};
 use rose_store::TraceStore;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -179,8 +182,7 @@ impl rose_web::TraceSource for TraceAdapter {
 }
 
 /// Narrow adapter: composition root (the one place allowed to touch
-/// backends) exposing snapshots to the web layer. Input injection stays
-/// out until the T1.4 takeover lease gates it.
+/// backends) exposing snapshots to the web layer.
 struct BackendSource {
     backend: Arc<dyn DesktopBackend>,
     display: String,
@@ -190,12 +192,12 @@ struct BackendSource {
 
 #[async_trait]
 impl rose_web::FrameSource for BackendSource {
+    /// Live view shows the same numbered grid the brain sees, never a
+    /// raw frame (a frame that cannot be gridded is an error, not a
+    /// raw fallback).
     async fn jpeg(&self) -> std::result::Result<Vec<u8>, String> {
-        self.backend
-            .capture()
-            .await
-            .map(|f| f.jpeg)
-            .map_err(|e| e.to_string())
+        let frame = self.backend.capture().await.map_err(|e| e.to_string())?;
+        rose_grid::annotate_grid_jpeg(&frame.jpeg)
     }
 
     fn display(&self) -> String {
@@ -207,6 +209,82 @@ impl rose_web::FrameSource for BackendSource {
     }
 }
 
+/// Human takeover input: maps live-view fractions onto a fresh frame and
+/// dispatches through the same `act()` path as the agent, audited as
+/// `Actor::Human`. The endpoints check the lease first; this re-checks,
+/// so input landing between hand-back and dispatch is refused, not acted.
+struct ControlSource {
+    backend: Arc<dyn DesktopBackend>,
+    lease: Lease,
+}
+
+impl ControlSource {
+    fn require_human(&self) -> std::result::Result<(), String> {
+        if self.lease.holder() == Driver::Human {
+            Ok(())
+        } else {
+            Err("agent holds the desktop - take control first".to_string())
+        }
+    }
+
+    /// Fresh frame so fractions map to the backend's *current* geometry
+    /// (X11 pixels vs CDP viewport vs auto's per-window switch).
+    async fn frame(&self) -> std::result::Result<rose_core::Frame, String> {
+        self.require_human()?;
+        self.backend.capture().await.map_err(|e| e.to_string())
+    }
+
+    fn point(frame: &rose_core::Frame, x: f64, y: f64) -> Target {
+        let px = (x.clamp(0.0, 1.0) * frame.width as f64).round() as u32;
+        let py = (y.clamp(0.0, 1.0) * frame.height as f64).round() as u32;
+        Target::Point { x: px, y: py }
+    }
+
+    async fn dispatch(&self, action: Action) -> std::result::Result<(), String> {
+        self.require_human()?;
+        tracing::info!(?action, actor = "human", "takeover input");
+        self.backend
+            .act(&action, Actor::Human)
+            .await
+            .map_err(|e| e.to_string())
+    }
+}
+
+#[async_trait]
+impl rose_web::HumanInput for ControlSource {
+    async fn click_frac(&self, x: f64, y: f64, double: bool) -> std::result::Result<(), String> {
+        let frame = self.frame().await?;
+        let target = Self::point(&frame, x, y);
+        let action = if double {
+            Action::DoubleClick { target }
+        } else {
+            Action::Click {
+                target,
+                button: rose_core::MouseButton::Left,
+            }
+        };
+        self.dispatch(action).await
+    }
+
+    async fn type_text(&self, text: &str) -> std::result::Result<(), String> {
+        self.dispatch(Action::Type {
+            text: text.to_string(),
+        })
+        .await
+    }
+
+    async fn press_keys(&self, keys: Vec<String>) -> std::result::Result<(), String> {
+        self.dispatch(Action::PressKey { keys }).await
+    }
+
+    async fn scroll_frac(&self, x: f64, y: f64, dy_frac: f64) -> std::result::Result<(), String> {
+        let frame = self.frame().await?;
+        let target = Self::point(&frame, x, y);
+        let dy = (dy_frac * frame.height as f64).round() as i32;
+        self.dispatch(Action::Scroll { target, dy }).await
+    }
+}
+
 /// Everything the daemon needs, built once at startup.
 #[allow(dead_code)] // brain/store selectors are read via config today
 struct Services {
@@ -215,6 +293,7 @@ struct Services {
     desktop: Arc<dyn DesktopBackend>,
     brain: BrainSvc,
     traces: Arc<TraceStore>,
+    lease: Lease,
 }
 
 fn default_config_path() -> Option<PathBuf> {
@@ -252,7 +331,27 @@ fn make_desktop(config: &RoseConfig) -> Result<Arc<dyn DesktopBackend>> {
     match config.desktop.backend.as_str() {
         "fake" => Ok(Arc::new(FakeDesktop::new())),
         "x11" => Ok(Arc::new(X11Desktop::new(config.desktop.display.clone()))),
-        other => bail!("unknown desktop backend: {other} (want \"x11\" | \"fake\")"),
+        // CDP talks to the VM's existing Chrome (google-chrome-stable) over
+        // its remote-debugging port — no Chromium install, session survives.
+        // Lazy: handshake happens on first capture/act, so rosed starts
+        // even when Chrome isn't up yet.
+        "cdp" => Ok(Arc::new(CdpDesktop::new(
+            &config.cdp.endpoint,
+            config.cdp.launch_if_missing,
+            &config.cdp.chrome_binary,
+        ))),
+        // Hybrid: X11 everywhere (shell-launched apps, dialogs, native
+        // windows keep working), CDP automatically when a Chrome window is
+        // frontmost. Same lazy/no-I/O construction as the others.
+        "auto" => Ok(Arc::new(AutoDesktop::new(
+            &config.desktop.display,
+            &config.cdp.endpoint,
+            config.cdp.launch_if_missing,
+            &config.cdp.chrome_binary,
+        ))),
+        other => {
+            bail!("unknown desktop backend: {other} (want \"x11\" | \"cdp\" | \"auto\" | \"fake\")")
+        }
     }
 }
 
@@ -280,6 +379,7 @@ fn build_services(config: RoseConfig, api_keys: ApiKeys) -> Result<Services> {
         desktop: make_desktop(&config)?,
         brain: make_brain(&config)?,
         traces: make_store(&config),
+        lease: Lease::new(),
         config,
         api_keys,
     })
@@ -312,12 +412,13 @@ struct Stepper {
     env_key: Option<String>,
     endpoint: String,
     model: String,
-    grounding_backend: String,
-    grounding_endpoint: String,
-    grounding_min_conf: u32,
     policy: Policy,
     traces: Arc<TraceStore>,
     shell: shell::ShellRunner,
+    /// Who may inject input. While a human holds it the loop pauses at
+    /// each checkpoint (never killed) and resumes with a fresh observation
+    /// on hand-back.
+    lease: Lease,
     /// Set from the web UI (POST /api/stop); polled at every step
     /// checkpoint and while waiting on the brain or a shell command.
     stop_flag: Arc<std::sync::atomic::AtomicBool>,
@@ -333,6 +434,92 @@ fn shell_needs_approval(policy: &Policy, say: &str, command: &str) -> bool {
     needs_approval(policy, say)
         || needs_approval(policy, command)
         || shell::looks_dangerous(command)
+}
+
+/// Goals that claim something is gone need a read-back, not a narration:
+/// volume panes, tooltips and dialogs all "look dismissed" until a fresh
+/// screenshot proves it. The loop answers with a second consecutive Done
+/// instead of finishing on the first claim.
+fn goal_needs_removal_check(goal: &str) -> bool {
+    let lower = goal.to_lowercase();
+    [
+        "remove",
+        "delete",
+        "dismiss",
+        "close",
+        "hide",
+        "uninstall",
+        "turn off",
+        "disable",
+        "get rid of",
+        "clear",
+        "quit ",
+        "exit ",
+    ]
+    .iter()
+    .any(|k| lower.contains(k))
+}
+
+/// What an action claims to dismiss, if anything: the words after a
+/// dismissal verb in the brain's narration ("Dismissing the indicators
+/// tooltip" -> "indicators tooltip"). Used to verify the *outcome* on the
+/// next observation instead of trusting that pixels moved: if a
+/// distinctive word is still listed as a control, the dismissal did not
+/// take and the brain is told so outright.
+fn dismissal_target(say: &str) -> Option<String> {
+    let lower = say.to_lowercase();
+    // Longest forms first: split_once("dismiss") would also match inside
+    // "dismissing" and leave a stray "ing" in the target.
+    let verbs = [
+        "dismissing",
+        "closing",
+        "removing",
+        "deleting",
+        "hiding",
+        "dismiss",
+        "close",
+        "remove",
+        "delete",
+        "hide",
+    ];
+    let mut rest = None;
+    for verb in verbs {
+        if let Some((before, aft)) = lower.split_once(verb) {
+            // The verb must be a word on its own, not inside another
+            // ("enclosing" contains "closing" — reject it).
+            let ok_before = before.is_empty() || !before.ends_with(|c: char| c.is_alphanumeric());
+            if ok_before {
+                rest = Some(aft);
+                break;
+            }
+        }
+    }
+    let rest = rest?;
+    let words: Vec<&str> = rest
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| {
+            !w.is_empty()
+                && !matches!(
+                    *w,
+                    "the" | "a" | "an" | "this" | "that" | "my" | "its" | "to" | "it"
+                )
+        })
+        .take(4)
+        .collect();
+    if words.is_empty() {
+        return None;
+    }
+    Some(words.join(" "))
+}
+
+/// Words distinctive enough to search control labels for: length 4+,
+/// so "tab" or "bar" never trigger a false still-present.
+fn distinctive_words(target: &str) -> Vec<String> {
+    target
+        .split_whitespace()
+        .filter(|w| w.chars().count() >= 4)
+        .map(str::to_string)
+        .collect()
 }
 
 /// RAII: mark the stepper idle however the run exits.
@@ -566,12 +753,20 @@ impl rose_web::StepRunner for Stepper {
         let mut last_outcome: Option<bool> = None;
         let mut repeats = 0u32;
         let mut replans = 0u32;
+        // Consecutive vision replies that aimed with guessed pixels
+        // instead of grid coordinates (refused, see ModelReply::Act).
+        let mut pixel_rejects = 0u32;
         // Frame captured while settling after the last action; consumed
         // as the next step's observation instead of re-capturing.
         let mut prefetched: Option<rose_core::Frame> = None;
         // The last dispatched action + the frame it was decided on, so
         // the next observation can report (and feed back) its result.
         let mut pending: Option<(u32, String, Vec<u8>, Option<String>, u64)> = None;
+        // Dismissal claimed by the last action ("dismissing the tooltip"):
+        // (step, target words). Consumed on the next observation — if the
+        // screen changed but the target is still listed as a control, the
+        // motion was not progress and the brain is told so outright.
+        let mut pending_dismiss: Option<(u32, String)> = None;
         // Text-first loop: a step starts as a text-only brain call
         // (no screenshot captured, nothing sent to vision). Shell
         // work — launching apps, files, processes — is decided and
@@ -581,8 +776,46 @@ impl rose_web::StepRunner for Stepper {
         let mut vision = false;
         let mut mode_switches = 0u32;
         let mut idx = 0u32;
+        // Read-back arming for removal goals (see goal_needs_removal_check):
+        // the first Done forces a fresh observation instead of finishing;
+        // only a second consecutive Done — after seeing that frame — ends
+        // the run. Any Act/Shell/Look in between disarms (world changed).
+        let mut awaiting_second_done = false;
+        // Takeover pauses the loop (never kills it): announce once per
+        // hold, wait for hand-back (Stop still works while waiting), then
+        // resume with a fresh observation — the human may have changed the
+        // desktop under us, so nothing cached survives.
+        let mut paused = false;
         while idx < self.policy.max_steps {
             check_stop!(idx, acted);
+            if self.lease.holder() != Driver::Agent {
+                if !paused {
+                    emit!(serde_json::json!({
+                        "type": "lease", "step": idx, "holder": "human",
+                        "say": "Takeover — you hold the desktop, Rose is paused (hand back to resume)",
+                    }));
+                    tracing::info!(run_id = %run_id, step = idx, "lease held by human, pausing loop");
+                    paused = true;
+                }
+                if unless_stopped(&self.stop_flag, self.lease.wait_for_agent())
+                    .await
+                    .is_none()
+                {
+                    finish_stopped!(idx, acted);
+                }
+                check_stop!(idx, acted);
+                prefetched = None;
+                pending = None;
+                pending_dismiss = None;
+                last_action = None;
+                last_outcome = None;
+                repeats = 0;
+                replans = 0;
+                pixel_rejects = 0;
+                vision = true;
+                continue;
+            }
+            paused = false;
             let mut seen_frame: Option<rose_core::Frame> = None;
             let mut seen_elements: Option<Vec<Element>> = None;
             let brain_ms: u64;
@@ -725,58 +958,120 @@ impl rose_web::StepRunner for Stepper {
                 emit!(serde_json::json!({
                     "type": "thinking", "step": idx, "mode": "vision",
                 }));
-                // SoM grounding (same idx, never a separate step): parse the
-                // raw frame into numbered elements, send the *annotated* JPEG
-                // to the brain so it picks `element: N` instead of guessing
-                // x,y. A dead sidecar falls back to the raw screenshot.
-                let mut brain_jpeg = frame.jpeg.clone();
-                let mut grounded: Option<Vec<Element>> = None;
-                if self.grounding_backend == "omniparser" {
-                    match GroundingClient::new(&self.grounding_endpoint, self.grounding_min_conf) {
-                        Ok(client) => {
-                            let g_started = std::time::Instant::now();
-                            let overlay_opt =
-                                unless_stopped(&self.stop_flag, client.parse(&frame.jpeg))
-                                    .await
-                                    .flatten();
-                            if let Some(overlay) = overlay_opt {
-                                let ms = g_started.elapsed().as_millis() as u64;
-                                // Persist what the brain is about to see so a
-                                // trace replay shows the badges, not just the
-                                // raw frame (`step-NNN.jpg` stays raw).
-                                let grounded_file =
-                                    trace.as_ref().and_then(|run| {
-                                        run.save_grounded_frame(idx, &overlay.annotated_jpeg)
-                                        .map_err(|e| tracing::warn!(run_id = %run_id, error = %e, "grounded frame save failed"))
-                                        .ok()
-                                    });
-                                // First labels help judge overlay quality from
-                                // the trace alone (cap: full list is in the
-                                // sidecar response, not the chat feed).
-                                let labels: Vec<String> = overlay
-                                    .elements
-                                    .iter()
-                                    .take(8)
-                                    .map(|e| format!("{}:{}", e.id.0, e.label))
-                                    .collect();
+                // Grounding (same idx, never a separate step): the
+                // constant numbered grid FIRST — it is drawn over every
+                // pixel (canvas, native apps, browser alike) and the
+                // brain primarily aims by grid cell `g<col>,<row>` or
+                // pixels read off the labelled axes. The backend's DOM/AX
+                // list, when it has one (CDP/auto-on-Chrome), is only a
+                // supplement: its elements travel as text alongside the
+                // same gridded image, never instead of the grid.
+                // There is no raw brain image in this loop: the only
+                // JPEG handed to the brain is this annotated one, and a
+                // frame that cannot be gridded fails the step instead of
+                // reaching the model raw.
+                let grounding_started = std::time::Instant::now();
+                let brain_jpeg = match rose_grid::annotate_grid_jpeg(&frame.jpeg) {
+                    Ok(annotated) => annotated,
+                    Err(e) => {
+                        let error = format!("grid overlay failed: {e}");
+                        emit!(serde_json::json!({
+                            "type": "failed", "step": idx, "stage": "grounding", "error": error,
+                        }));
+                        finish_err!(error);
+                    }
+                };
+                // Supplementary DOM list (best-effort, never blocks the
+                // grid): a dead/slow/empty DOM just means no list.
+                let grounded: Option<Vec<Element>>;
+                let grounded_dom: bool;
+                let ms = grounding_started.elapsed().as_millis() as u64;
+                let (elements, source) = match tokio::time::timeout(
+                    std::time::Duration::from_secs(15),
+                    self.desktop.dom_overlay(&frame.jpeg),
+                )
+                .await
+                {
+                    Ok(Ok(Some(o))) if !o.elements.is_empty() => (o.elements, "grid+dom"),
+                    Ok(Ok(_)) => (Vec::new(), "grid"),
+                    Ok(Err(e)) => {
+                        tracing::warn!(error = %e, "dom overlay failed, grid only");
+                        (Vec::new(), "grid")
+                    }
+                    Err(_) => {
+                        tracing::warn!("dom overlay timed out, grid only");
+                        (Vec::new(), "grid")
+                    }
+                };
+                let overlay = (elements, brain_jpeg, ms, source);
+                // The annotated JPEG is the ONLY image the brain ever
+                // sees (`step-NNN.jpg` on disk stays the raw capture for
+                // humans; the `-grounded` file is the exact image sent).
+                let (elements, brain_jpeg, ms, source) = overlay;
+                {
+                    let grounded_file = trace.as_ref().and_then(|run| {
+                        run.save_grounded_frame(idx, &brain_jpeg)
+                            .map_err(|e| tracing::warn!(run_id = %run_id, error = %e, "grounded frame save failed"))
+                            .ok()
+                    });
+                    // First labels help judge overlay quality from
+                    // the trace alone (cap: full list is in the backend,
+                    // not the chat feed).
+                    let labels: Vec<String> = elements
+                        .iter()
+                        .take(8)
+                        .map(|e| format!("{}:{}", e.id.0, e.label))
+                        .collect();
+                    emit!(serde_json::json!({
+                        "type": "grounded", "step": idx,
+                        "elements": elements.len(),
+                        "ms": ms, "source": source,
+                        "frame": grounded_file, "labels": labels,
+                    }));
+                    grounded = Some(elements);
+                    grounded_dom = source == "grid+dom";
+                }
+                // Outcome read-back: the last action claimed a dismissal and
+                // the screen did change — but motion is not progress. If a
+                // distinctive word from the target is still listed as a
+                // control, say so outright instead of letting the brain
+                // narrate the flicker as success.
+                if let Some((prev_step, target)) = pending_dismiss.take() {
+                    if last_outcome == Some(true) {
+                        if let Some(els) = grounded.as_deref() {
+                            let still_there: Vec<String> = distinctive_words(&target)
+                                .into_iter()
+                                .filter(|w| els.iter().any(|e| e.label.to_lowercase().contains(w.as_str())))
+                                .collect();
+                            if !still_there.is_empty() {
+                                let say = format!(
+                                    "Note: {} still listed after my click — the screen moved but the dismissal did not take; try a different control (Escape first, then another route)",
+                                    still_there.join(", ")
+                                );
                                 emit!(serde_json::json!({
-                                    "type": "grounded", "step": idx,
-                                    "elements": overlay.elements.len(),
-                                    "ms": ms, "parse_ms": overlay.parse_ms,
-                                    "frame": grounded_file, "labels": labels,
+                                    "type": "verify", "step": idx, "target": target,
+                                    "present": true, "say": say,
                                 }));
-                                if !overlay.elements.is_empty() {
-                                    brain_jpeg = overlay.annotated_jpeg.clone();
-                                    grounded = Some(overlay.elements);
-                                }
+                                history.push(StepSummary {
+                                    idx,
+                                    intent: format!(
+                                        "VERIFY step {prev_step} dismissal failed: {target} still present"
+                                    ),
+                                    say,
+                                });
                             }
-                        }
-                        Err(e) => {
-                            tracing::warn!(error = %e, "bad grounding config, using raw screenshot");
                         }
                     }
                 }
                 let brain_started = std::time::Instant::now();
+                // The grounded element list travels as text with the
+                // screenshot — but only the DOM list: short and semantic.
+                // The grid is axis-numbered lines, so there is no list to
+                // send; the brain picks a cell or reads pixels off it.
+                let grounded_elements: &[Element] = match grounded.as_deref() {
+                    Some(els) if grounded_dom => els,
+                    _ => &[],
+                };
                 // Awaited through unless_stopped: pressing Stop while the
                 // brain thinks abandons the call instead of acting on a
                 // reply the user no longer wants executed.
@@ -784,7 +1079,7 @@ impl rose_web::StepRunner for Stepper {
                     match self.brain {
                         BrainSvc::Fake => self
                             .fake
-                            .next_action(goal, &history, &brain_jpeg)
+                            .next_action(goal, &history, &brain_jpeg, grounded_elements)
                             .await
                             .map_err(|e| e.to_string()),
                         BrainSvc::Muse => match self
@@ -799,7 +1094,7 @@ impl rose_web::StepRunner for Stepper {
                                     .map_err(|e| e.to_string())
                             }) {
                             Ok(client) => client
-                                .next_action(goal, &history, &brain_jpeg)
+                                .next_action(goal, &history, &brain_jpeg, grounded_elements)
                                 .await
                                 .map_err(|e| e.to_string()),
                             Err(e) => Err(e),
@@ -830,7 +1125,9 @@ impl rose_web::StepRunner for Stepper {
                 ModelReply::Look { say } => {
                     // Already looking (vision step) or a spurious look:
                     // drop back to text and let the switch guard stop
-                    // any ping-pong between modes.
+                    // any ping-pong between modes. A look changes nothing,
+                    // but it breaks a Done streak: re-arm the removal check.
+                    awaiting_second_done = false;
                     mode_switches += 1;
                     if mode_switches > 4 {
                         let msg = "Stopped: the brain kept asking to see the desktop without making progress.".to_string();
@@ -853,13 +1150,32 @@ impl rose_web::StepRunner for Stepper {
                         .expect("GUI actions are only handled after a vision step");
                     // Same-idx SoM resolution: the brain picked `element: N`
                     // from this step's overlay. Map it to a click point now.
-                    // Unknown ids replan (never blind-click); pixel replies
-                    // pass through untouched for fallback runs.
+                    // Unknown ids replan (never blind-click). Note whether
+                    // the brain replied with raw pixels: those are refused
+                    // below (grid coordinates only), while element picks
+                    // are about to become points legitimately.
+                    let replied_pixel = matches!(
+                        &action,
+                        Action::Click {
+                            target: Target::Point { .. },
+                            ..
+                        } | Action::DoubleClick {
+                            target: Target::Point { .. }
+                        }
+                    );
                     let mut action = action;
                     if let Some(elements) = seen_elements.take() {
                         let resolve = |t: &Target| -> Option<Target> {
                             match t {
+                                // Element list first (DOM numbers),
+                                // then a grid-cell pick `g<col>,<row>`
+                                // resolved against this frame's geometry.
                                 Target::Element(id) => resolve_element(&elements, &id.0)
+                                    .or_else(|| {
+                                        rose_grid::resolve_grid_cell(
+                                            &id.0, frame.width, frame.height,
+                                        )
+                                    })
                                     .map(|(x, y)| Target::Point { x, y }),
                                 p => Some(p.clone()),
                             }
@@ -904,9 +1220,9 @@ impl rose_web::StepRunner for Stepper {
                             }
                         }
                     } else {
-                        // Grounding was off (or the sidecar was down) and the
-                        // brain still replied `element: N`: nothing to map it
-                        // through, so replan with pixels instead of acting.
+                        // No overlay was recorded for this step and the
+                        // brain still replied `element: N`: nothing to map
+                        // it through, so replan instead of acting.
                         let has_element = match &action {
                             Action::Click { target, .. }
                             | Action::DoubleClick { target }
@@ -920,7 +1236,7 @@ impl rose_web::StepRunner for Stepper {
                             _ => false,
                         };
                         if has_element {
-                            let msg = "I picked an element number but grounding is off; reply with x,y pixels instead".to_string();
+                            let msg = "I picked an element number with no overlay to map it through; reply with a grid cell g<col>,<row>@fx,fy instead".to_string();
                             emit!(serde_json::json!({
                                 "type": "rejected", "step": idx,
                                 "action": describe_action(&action), "say": msg,
@@ -937,7 +1253,44 @@ impl rose_web::StepRunner for Stepper {
                             continue;
                         }
                     }
+                    // Grid coordinates only: a pixel click target here
+                    // means the brain guessed coordinates instead of
+                    // reading the grid (the (1545,386) price-axis
+                    // misclick wasted a whole call that way). Refuse
+                    // and replan — element picks already resolved to
+                    // points above are legitimate, raw pixels are not.
+                    if replied_pixel {
+                        pixel_rejects += 1;
+                        if pixel_rejects > 2 {
+                            let msg = format!(
+                                "Stopped: I kept aiming with guessed pixels instead of grid coordinates ({say}). \
+                                 Take Control from the live view to do it by hand, then Hand Back."
+                            );
+                            emit!(serde_json::json!({
+                                "type": "stuck", "step": idx, "say": msg,
+                                "action": describe_action(&action),
+                            }));
+                            finish_ok!(step_view_steps(&msg, acted, false, false, idx));
+                        }
+                        let msg = "Pixel coordinates are not accepted — aiming by grid instead".to_string();
+                        emit!(serde_json::json!({
+                            "type": "rejected", "step": idx,
+                            "action": describe_action(&action), "say": msg,
+                        }));
+                        history.push(StepSummary {
+                            idx,
+                            intent: format!(
+                                "REJECTED pixel target in {}",
+                                describe_action(&action)
+                            ),
+                            say: "My pixel guess was refused; reply with a grid cell g<col>,<row>@fx,fy or an element number".to_string(),
+                        });
+                        idx += 1;
+                        continue;
+                    }
+                    pixel_rejects = 0;
                     mode_switches = 0;
+                    awaiting_second_done = false;
                     let mut action_text = describe_action(&action);
                     if enter_after {
                         action_text.push_str(" + press Return");
@@ -963,7 +1316,8 @@ impl rose_web::StepRunner for Stepper {
                         if replans > 2 {
                             let msg = format!(
                                 "Stopped: I kept repeating an action that had no visible effect ({action_text}). \
-                                 The target is probably not where I am aiming."
+                                 The target is probably not where I am aiming. \
+                                 Take Control from the live view to do it by hand, then Hand Back."
                             );
                             emit!(serde_json::json!({
                                 "type": "stuck", "step": idx, "say": msg, "action": action_text,
@@ -990,7 +1344,8 @@ impl rose_web::StepRunner for Stepper {
                         if repeats >= 2 {
                             let msg = format!(
                                 "Stopped: I repeated the same action 3 times without it working ({say}). \
-                                 The target may not be where I am clicking."
+                                 The target may not be where I am clicking. \
+                                 Take Control from the live view to do it by hand, then Hand Back."
                             );
                             tracing::warn!(%say, "step loop: repeated action, stopping");
                             emit!(serde_json::json!({
@@ -1053,6 +1408,9 @@ impl rose_web::StepRunner for Stepper {
                     if !waited {
                         prefetched = self.settled_frame().await;
                     }
+                    // Outcome check travels with the action: the next
+                    // observation verifies the named thing is actually gone.
+                    pending_dismiss = dismissal_target(&say).map(|t| (idx, t));
                     pending = Some((
                         idx,
                         action_text,
@@ -1128,6 +1486,7 @@ impl rose_web::StepRunner for Stepper {
                     // reports its desktop result on the next look.)
                     vision = false;
                     mode_switches = 0;
+                    awaiting_second_done = false;
                     if let Some(frame) = seen_frame.take() {
                         let settle_started = std::time::Instant::now();
                         prefetched = self.settled_frame().await;
@@ -1149,6 +1508,21 @@ impl rose_web::StepRunner for Stepper {
                         "type": "decision", "step": idx, "status": "done", "say": say,
                         "brain_ms": brain_ms,
                     }));
+                    if goal_needs_removal_check(goal) && !awaiting_second_done {
+                        awaiting_second_done = true;
+                        history.push(StepSummary {
+                            idx,
+                            intent: format!(
+                                "claimed done ({say}) — verifying the removal on a fresh look"
+                            ),
+                            say: "Claimed done; verifying the removal is real before finishing"
+                                .to_string(),
+                        });
+                        vision = true;
+                        mode_switches = 0;
+                        idx += 1;
+                        continue;
+                    }
                     finish_ok!(step_view_steps(&say, acted, false, true, idx));
                 }
                 ModelReply::Ask { say } => {
@@ -1445,12 +1819,10 @@ async fn main() -> Result<()> {
         env_key: services.api_keys.muse_api_key.clone(),
         endpoint: services.config.models.endpoint.clone(),
         model: services.config.models.model.clone(),
-        grounding_backend: services.config.grounding.backend.clone(),
-        grounding_endpoint: services.config.grounding.endpoint.clone(),
-        grounding_min_conf: services.config.grounding.min_conf,
         policy: services.config.policy.clone(),
         traces: Arc::clone(&services.traces),
         shell: shell::ShellRunner::new(services.config.desktop.display.clone()),
+        lease: services.lease.clone(),
         stop_flag: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
     };
@@ -1466,6 +1838,11 @@ async fn main() -> Result<()> {
             store: Arc::clone(&services.traces),
         })),
         keys,
+        lease: services.lease.clone(),
+        control: Some(Arc::new(ControlSource {
+            backend: Arc::clone(&services.desktop),
+            lease: services.lease.clone(),
+        })),
         env_key_present: services.api_keys.muse_api_key.is_some(),
         backend: services.config.desktop.backend.clone(),
         brain: services.config.models.brain.clone(),
@@ -1492,7 +1869,7 @@ mod tests {
         let cfg: RoseConfig = toml::from_str(text).expect("example must parse");
         assert_eq!(cfg.server.bind, "127.0.0.1:8787");
         assert!(!cfg.server.allow_remote);
-        assert_eq!(cfg.desktop.backend, "x11");
+        assert_eq!(cfg.desktop.backend, "auto");
         assert_eq!(cfg.policy.max_steps, 40);
     }
 
@@ -1524,6 +1901,46 @@ mod tests {
         build_services(cfg, ApiKeys::default()).expect("muse selector builds");
         assert!(needs_approval(&Policy::default(), "Click Pay now"));
         assert!(!needs_approval(&Policy::default(), "Clicking Export"));
+    }
+
+    #[test]
+    fn removal_goals_need_read_back_others_do_not() {
+        assert!(goal_needs_removal_check("remove the volume indicator"));
+        assert!(goal_needs_removal_check("Delete downloaded CSVs"));
+        assert!(goal_needs_removal_check("dismiss the popup"));
+        assert!(goal_needs_removal_check("close the settings tab"));
+        assert!(goal_needs_removal_check("turn off the alarm"));
+        assert!(!goal_needs_removal_check("open the GOOGL chart"));
+        assert!(!goal_needs_removal_check("export March invoices"));
+        assert!(!goal_needs_removal_check("what time is it"));
+    }
+
+    #[test]
+    fn dismissal_target_extracts_the_object() {
+        assert_eq!(
+            dismissal_target("Dismissing the indicators tooltip"),
+            Some("indicators tooltip".to_string())
+        );
+        assert_eq!(
+            dismissal_target("Clicking Vol delete icon"),
+            Some("icon".to_string()),
+            "the clicked control's own name still verifies its removal"
+        );
+        assert_eq!(
+            dismissal_target("Remove the volume pane"),
+            Some("volume pane".to_string())
+        );
+        assert_eq!(
+            dismissal_target("enclosing the dialog"),
+            None,
+            "verb inside another word must not match"
+        );
+        assert_eq!(dismissal_target("Close"), None, "bare verb, no object");
+        assert_eq!(
+            distinctive_words("indicators tooltip"),
+            vec!["indicators".to_string(), "tooltip".to_string()]
+        );
+        assert!(distinctive_words("the tab").is_empty());
     }
 
     fn event_channel() -> (
@@ -1558,12 +1975,10 @@ mod tests {
             env_key: None,
             endpoint: "https://api.meta.ai/v1".to_string(),
             model: "muse-spark-1.3-contributor".to_string(),
-            grounding_backend: "off".to_string(),
-            grounding_endpoint: "http://127.0.0.1:8791".to_string(),
-            grounding_min_conf: 5,
             policy: Policy::default(),
             traces: test_traces(),
             shell: shell::ShellRunner::new(":fake"),
+            lease: Lease::new(),
             stop_flag: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
@@ -1615,7 +2030,9 @@ mod tests {
         use rose_web::StepRunner;
         let pay_click = || rose_models::ModelReply::Act {
             action: rose_core::Action::Click {
-                target: rose_core::Target::Point { x: 10, y: 10 },
+                target: rose_core::Target::Element(rose_core::ElementId(
+                    "g1,1@0.42,0.42".to_string(),
+                )),
                 button: rose_core::MouseButton::Left,
             },
             say: "Clicking Pay now".to_string(),
@@ -1658,7 +2075,10 @@ mod tests {
         // narrated but never finished the job.
         let click = |x| rose_models::ModelReply::Act {
             action: rose_core::Action::Click {
-                target: rose_core::Target::Point { x, y: 10 },
+                target: rose_core::Target::Element(rose_core::ElementId(format!(
+                    "g1,1@{:.2},0.42",
+                    (x % 25) as f32 / 24.0
+                ))),
                 button: rose_core::MouseButton::Left,
             },
             say: format!("Clicking {x}"),
@@ -1702,6 +2122,9 @@ mod tests {
                 "observing",
                 "observed",
                 "thinking",
+                // The grid floor grounds every vision step even with
+                // the default test backend — no raw screenshot is sent.
+                "grounded",
                 "planned",
                 "acting",
                 "acted",
@@ -1709,6 +2132,7 @@ mod tests {
                 "result",
                 "observed",
                 "thinking",
+                "grounded",
                 "planned",
                 "acting",
                 "acted",
@@ -1716,6 +2140,7 @@ mod tests {
                 "result",
                 "observed",
                 "thinking",
+                "grounded",
                 "decision",
             ],
             "{types:?}"
@@ -1739,11 +2164,618 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn takeover_pauses_the_loop_without_killing_it() {
+        use rose_web::StepRunner;
+        // Takeover holds the loop at its next checkpoint; hand-back resumes
+        // the same run, which then finishes normally. Nothing is killed and
+        // no step is lost: the brain never even sees the pause.
+        let lease = Lease::new();
+        let click = rose_models::ModelReply::Act {
+            action: rose_core::Action::Click {
+                target: rose_core::Target::Element(rose_core::ElementId(
+                    "g1,1@0.42,0.42".to_string(),
+                )),
+                button: rose_core::MouseButton::Left,
+            },
+            say: "Clicking".to_string(),
+            enter_after: false,
+        };
+        let stepper = Arc::new(Stepper {
+            // Hand-back forces a fresh vision step, so the script starts
+            // there (no text-mode Look handshake).
+            fake: FakeBrain::scripted(vec![
+                click,
+                rose_models::ModelReply::Done {
+                    say: "Done".to_string(),
+                },
+            ]),
+            lease: lease.clone(),
+            ..test_stepper(BrainSvc::Fake)
+        });
+        lease.take_human();
+        let (tx, mut rx) = event_channel();
+        let run = tokio::spawn({
+            let stepper = Arc::clone(&stepper);
+            async move { stepper.run_step("takeover test", false, None, &tx).await }
+        });
+        // The loop announces the pause and dispatches nothing while held.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert!(
+            !run.is_finished(),
+            "run must wait out the takeover, not exit"
+        );
+        assert_eq!(
+            stepper.fake.call_count(),
+            0,
+            "no brain call while a human holds the desktop"
+        );
+        let events = drain(&mut rx);
+        assert!(
+            events.iter().any(|e| e["type"] == "lease"),
+            "pause is narrated, {events:?}"
+        );
+        assert!(
+            !events.iter().any(|e| e["type"] == "acted"),
+            "nothing acted while paused"
+        );
+        // Hand back: the same run resumes and finishes.
+        lease.hand_back();
+        let view = run.await.expect("join").expect("run");
+        assert_eq!(view["done"], true);
+        assert_eq!(view["acted"], true);
+        assert_eq!(stepper.fake.call_count(), 2, "loop resumed where it paused");
+    }
+
+    #[tokio::test]
+    async fn removal_goal_verifies_on_a_second_look() {
+        use rose_web::StepRunner;
+        // "remove the volume pane" + Done, Done: the first claim arms the
+        // read-back (fresh vision step), the second — after seeing that
+        // frame — finishes. History records the verification.
+        let done = || rose_models::ModelReply::Done {
+            say: "Volume gone".to_string(),
+        };
+        let stepper = Stepper {
+            fake: FakeBrain::scripted(vec![done(), done()]),
+            ..test_stepper(BrainSvc::Fake)
+        };
+        let (tx, mut rx) = event_channel();
+        let view = stepper
+            .run_step("remove the volume pane", false, None, &tx)
+            .await
+            .expect("run");
+        assert_eq!(view["done"], true);
+        assert_eq!(stepper.fake.call_count(), 2, "claim + verified claim");
+        let events = drain(&mut rx);
+        assert_eq!(
+            events.iter().filter(|e| e["type"] == "decision").count(),
+            2,
+            "two done decisions, {events:?}"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| e["type"] == "observed" && e["step"] == 1),
+            "second claim saw a fresh frame, {events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn plain_goal_finishes_on_first_done() {
+        use rose_web::StepRunner;
+        let stepper = Stepper {
+            fake: FakeBrain::scripted(vec![rose_models::ModelReply::Done {
+                say: "Chart is open".to_string(),
+            }]),
+            ..test_stepper(BrainSvc::Fake)
+        };
+        let (tx, _rx) = event_channel();
+        let view = stepper
+            .run_step("open the GOOGL chart", false, None, &tx)
+            .await
+            .expect("run");
+        assert_eq!(view["done"], true);
+        assert_eq!(stepper.fake.call_count(), 1, "no verification round-trip");
+    }
+
+    /// Backend DOM overlay: the Stepper grounds `element: N` from
+    /// `dom_overlay`, sends the gridded frame plus the text list, and
+    /// resolves the pick to a pixel the backend acts on. Proves the whole
+    /// DOM-supplement path end to end.
+    struct DomOverlayStub {
+        inner: FakeDesktop,
+        elements: Vec<rose_core::Element>,
+    }
+
+    fn cell_element() -> rose_core::Element {
+        // FakeDesktop cell 0 spans (40,40,320,370): a resolved click lands
+        // mid-cell and highlights it — pixel proof below.
+        rose_core::Element {
+            id: rose_core::ElementId("cdp-1".to_string()),
+            label: "button: Cell".to_string(),
+            role: Some("button".to_string()),
+            bounds: rose_core::Rect {
+                x: 40,
+                y: 40,
+                width: 320,
+                height: 370,
+            },
+            confidence: 1.0,
+            source: rose_core::ElementSource::Cdp,
+        }
+    }
+
+    #[async_trait]
+    impl DesktopBackend for DomOverlayStub {
+        async fn info(&self) -> rose_core::Result<rose_core::DesktopInfo> {
+            self.inner.info().await
+        }
+        async fn capture(&self) -> rose_core::Result<rose_core::Frame> {
+            self.inner.capture().await
+        }
+        async fn act(
+            &self,
+            action: &rose_core::Action,
+            actor: rose_core::Actor,
+        ) -> rose_core::Result<()> {
+            self.inner.act(action, actor).await
+        }
+        async fn dom_overlay(
+            &self,
+            _frame_jpeg: &[u8],
+        ) -> rose_core::Result<Option<rose_core::DomOverlay>> {
+            Ok(Some(rose_core::DomOverlay {
+                elements: self.elements.clone(),
+            }))
+        }
+    }
+
+    #[tokio::test]
+    async fn dom_overlay_supplements_the_grid_with_element_picks() {
+        use rose_web::StepRunner;
+        let desktop = FakeDesktop::new();
+        let stepper = Stepper {
+            desktop: Arc::new(DomOverlayStub {
+                inner: desktop.clone(),
+                elements: vec![cell_element()],
+            }),
+            fake: FakeBrain::scripted(vec![
+                rose_models::ModelReply::Look {
+                    say: "Need to see the desktop".to_string(),
+                },
+                rose_models::ModelReply::Act {
+                    action: rose_core::Action::Click {
+                        target: rose_core::Target::Element(rose_core::ElementId(
+                            "cdp-1".to_string(),
+                        )),
+                        button: rose_core::MouseButton::Left,
+                    },
+                    say: "Clicking the badged cell".to_string(),
+                    enter_after: false,
+                },
+                rose_models::ModelReply::Done {
+                    say: "Clicked".to_string(),
+                },
+            ]),
+            // The DOM source must carry element grounding alone.
+            ..test_stepper(BrainSvc::Fake)
+        };
+        let (tx, mut rx) = event_channel();
+        let view = stepper
+            .run_step("click the first cell", false, None, &tx)
+            .await
+            .expect("run");
+        assert_eq!(view["done"], true);
+        assert_eq!(view["acted"], true);
+        assert_eq!(
+            desktop.highlighted(),
+            Some(0),
+            "element: cdp-1 resolved to cell 0's pixels"
+        );
+        let (jpeg_len, el_count) = stepper.fake.last_vision().expect("vision recorded");
+        assert!(jpeg_len > 1000, "gridded frame, not empty");
+        assert_eq!(el_count, 1, "element list travelled with the screenshot");
+        let events = drain(&mut rx);
+        let grounded = events
+            .iter()
+            .find(|e| e["type"] == "grounded")
+            .expect("grounded event");
+        assert_eq!(grounded["source"], "grid+dom");
+        assert_eq!(grounded["elements"], 1);
+    }
+
+    #[tokio::test]
+    async fn grid_frame_sends_no_element_text_and_cell_pick_acts() {
+        use rose_web::StepRunner;
+        // FakeDesktop has no DOM list: the brain sees a numbered-grid
+        // frame with no element text and answers with a cell pick.
+        let desktop = FakeDesktop::new();
+        let stepper = Stepper {
+            desktop: Arc::new(desktop.clone()),
+            fake: FakeBrain::scripted(vec![
+                rose_models::ModelReply::Look {
+                    say: "Need to see the desktop".to_string(),
+                },
+                rose_models::ModelReply::Act {
+                    action: rose_core::Action::Click {
+                        target: rose_core::Target::Element(rose_core::ElementId(
+                            "g9,10@0,0".to_string(),
+                        )),
+                        button: rose_core::MouseButton::Left,
+                    },
+                    say: "Clicking the cell I read off the grid".to_string(),
+                    enter_after: false,
+                },
+                rose_models::ModelReply::Done {
+                    say: "Clicked".to_string(),
+                },
+            ]),
+            ..test_stepper(BrainSvc::Fake)
+        };
+        let (tx, mut rx) = event_channel();
+        let view = stepper
+            .run_step("click the first cell", false, None, &tx)
+            .await
+            .expect("run");
+        assert_eq!(view["done"], true);
+        assert_eq!(view["acted"], true);
+        assert_eq!(desktop.highlighted(), Some(0), "cell pick lands in cell 0");
+        let events = drain(&mut rx);
+        let grounded = events
+            .iter()
+            .find(|e| e["type"] == "grounded")
+            .expect("grounded event");
+        assert_eq!(grounded["source"], "grid");
+        let (_, el_count) = stepper.fake.last_vision().expect("vision recorded");
+        assert_eq!(el_count, 0, "grid sends no element text");
+    }
+
+    #[tokio::test]
+    async fn pixel_click_is_rejected_then_grid_pick_acts() {
+        use rose_web::StepRunner;
+        // A guessed-pixel reply is refused without acting (one replan);
+        // the follow-up grid pick acts normally.
+        let desktop = FakeDesktop::new();
+        let stepper = Stepper {
+            desktop: Arc::new(desktop.clone()),
+            fake: FakeBrain::scripted(vec![
+                rose_models::ModelReply::Look {
+                    say: "Need to see the desktop".to_string(),
+                },
+                rose_models::ModelReply::Act {
+                    action: rose_core::Action::Click {
+                        target: rose_core::Target::Point { x: 200, y: 225 },
+                        button: rose_core::MouseButton::Left,
+                    },
+                    say: "Clicking by guessed pixels".to_string(),
+                    enter_after: false,
+                },
+                rose_models::ModelReply::Act {
+                    action: rose_core::Action::Click {
+                        target: rose_core::Target::Element(rose_core::ElementId(
+                            "g9,10@0,0".to_string(),
+                        )),
+                        button: rose_core::MouseButton::Left,
+                    },
+                    say: "Clicking grid cell 9,10".to_string(),
+                    enter_after: false,
+                },
+                rose_models::ModelReply::Done {
+                    say: "Clicked".to_string(),
+                },
+            ]),
+            ..test_stepper(BrainSvc::Fake)
+        };
+        let (tx, mut rx) = event_channel();
+        let view = stepper
+            .run_step("click the first cell", false, None, &tx)
+            .await
+            .expect("run");
+        assert_eq!(view["done"], true);
+        assert_eq!(view["acted"], true);
+        assert_eq!(desktop.highlighted(), Some(0), "only the grid pick acted");
+        let events = drain(&mut rx);
+        let rejected = events
+            .iter()
+            .find(|e| e["type"] == "rejected")
+            .expect("pixel reply rejected");
+        assert_eq!(rejected["action"], "click (200, 225) [Left]");
+        assert!(
+            rejected["say"].as_str().unwrap_or("").contains("Pixel"),
+            "{rejected}"
+        );
+    }
+
+    #[tokio::test]
+    async fn repeated_pixel_clicks_stop_the_run() {
+        use rose_web::StepRunner;
+        // Three pixel replies in a row: refused, refused, stuck-stop —
+        // never acted on.
+        let pixel = || rose_models::ModelReply::Act {
+            action: rose_core::Action::Click {
+                target: rose_core::Target::Point { x: 200, y: 225 },
+                button: rose_core::MouseButton::Left,
+            },
+            say: "Clicking by guessed pixels".to_string(),
+            enter_after: false,
+        };
+        let desktop = FakeDesktop::new();
+        let stepper = Stepper {
+            desktop: Arc::new(desktop.clone()),
+            fake: FakeBrain::scripted(vec![
+                rose_models::ModelReply::Look {
+                    say: "Need to see the desktop".to_string(),
+                },
+                pixel(),
+                pixel(),
+                pixel(),
+                rose_models::ModelReply::Done {
+                    say: "Clicked".to_string(),
+                },
+            ]),
+            ..test_stepper(BrainSvc::Fake)
+        };
+        let (tx, _rx) = event_channel();
+        let view = stepper
+            .run_step("click the first cell", false, None, &tx)
+            .await
+            .expect("run");
+        assert_eq!(view["acted"], false);
+        assert_eq!(desktop.highlighted(), None, "no pixel click ever acted");
+        assert!(
+            view["say"].as_str().unwrap_or("").contains("guessed pixels"),
+            "{view}"
+        );
+    }
+
+    #[tokio::test]
+    async fn grid_cell_pick_resolves_to_cell_centre() {
+        use rose_web::StepRunner;
+        // The brain names a cell from the numbered axes ("g5,5"); the
+        // Stepper clicks that cell's centre (112,112 on the 1600x900
+        // fake frame), which lands inside FakeDesktop cell 0.
+        let desktop = FakeDesktop::new();
+        let stepper = Stepper {
+            desktop: Arc::new(desktop.clone()),
+            fake: FakeBrain::scripted(vec![
+                rose_models::ModelReply::Look {
+                    say: "Need to see the desktop".to_string(),
+                },
+                rose_models::ModelReply::Act {
+                    action: rose_core::Action::Click {
+                        target: rose_core::Target::Element(rose_core::ElementId(
+                            "g5,5".to_string(),
+                        )),
+                        button: rose_core::MouseButton::Left,
+                    },
+                    say: "Clicking grid cell 5,5".to_string(),
+                    enter_after: false,
+                },
+                rose_models::ModelReply::Done {
+                    say: "Clicked".to_string(),
+                },
+            ]),
+            ..test_stepper(BrainSvc::Fake)
+        };
+        let (tx, _rx) = event_channel();
+        let view = stepper
+            .run_step("click cell 5,5", false, None, &tx)
+            .await
+            .expect("run");
+        assert_eq!(view["done"], true);
+        assert_eq!(view["acted"], true);
+        assert_eq!(
+            desktop.highlighted(),
+            Some(0),
+            "grid cell g5,5 centre lands in cell 0"
+        );
+    }
+
+    #[tokio::test]
+    async fn vision_steps_always_send_a_gridded_screenshot() {
+        use rose_web::StepRunner;
+        // No DOM list on the fake desktop: the brain still only ever
+        // receives the numbered-grid frame (source "grid"), never raw.
+        let stepper = Stepper {
+            fake: FakeBrain::scripted(vec![
+                rose_models::ModelReply::Look {
+                    say: "Need to see the desktop".to_string(),
+                },
+                rose_models::ModelReply::Done {
+                    say: "Seen it".to_string(),
+                },
+            ]),
+            ..test_stepper(BrainSvc::Fake)
+        };
+        let (tx, mut rx) = event_channel();
+        let view = stepper
+            .run_step("look at the desktop", false, None, &tx)
+            .await
+            .expect("run");
+        assert_eq!(view["done"], true);
+        let events = drain(&mut rx);
+        let grounded = events
+            .iter()
+            .find(|e| e["type"] == "grounded")
+            .expect("grounded event on every vision step");
+        assert_eq!(grounded["source"], "grid");
+        let (jpeg_len, _) = stepper.fake.last_vision().expect("vision recorded");
+        assert!(jpeg_len > 1000, "gridded frame, not empty");
+    }
+
+    /// A frame the grid cannot annotate must fail the step loudly instead
+    /// of burning a ~30s brain call on a raw screenshot with no grounding.
+    struct CorruptFrameDesktop {
+        inner: FakeDesktop,
+    }
+
+    #[async_trait]
+    impl DesktopBackend for CorruptFrameDesktop {
+        async fn info(&self) -> rose_core::Result<rose_core::DesktopInfo> {
+            self.inner.info().await
+        }
+        async fn capture(&self) -> rose_core::Result<rose_core::Frame> {
+            Ok(rose_core::Frame {
+                id: rose_core::FrameId::new(),
+                captured_at: chrono::Utc::now(),
+                width: 1600,
+                height: 900,
+                jpeg: b"not a jpeg".to_vec(),
+                active_window: None,
+            })
+        }
+        async fn act(
+            &self,
+            action: &rose_core::Action,
+            actor: rose_core::Actor,
+        ) -> rose_core::Result<()> {
+            self.inner.act(action, actor).await
+        }
+    }
+
+    #[tokio::test]
+    async fn grid_failure_fails_before_any_brain_call() {
+        use rose_web::StepRunner;
+        let stepper = Stepper {
+            desktop: Arc::new(CorruptFrameDesktop {
+                inner: FakeDesktop::new(),
+            }),
+            // Look first: text mode hands off to vision, where grounding
+            // fails on the corrupt frame.
+            fake: FakeBrain::scripted(vec![
+                rose_models::ModelReply::Look {
+                    say: "Need to see the desktop".to_string(),
+                },
+                rose_models::ModelReply::Done {
+                    say: "Done".to_string(),
+                },
+            ]),
+            ..test_stepper(BrainSvc::Fake)
+        };
+        let (tx, mut rx) = event_channel();
+        let err = stepper
+            .run_step("click the first cell", false, None, &tx)
+            .await
+            .expect_err("grid failure must fail the step, not fall back to raw");
+        assert!(err.contains("grid overlay failed"), "{err}");
+        assert_eq!(
+            stepper.fake.last_vision(),
+            Some((0, 0)),
+            "only the empty text handshake ran; no vision call saw the raw frame"
+        );
+        let events = drain(&mut rx);
+        assert!(
+            events
+                .iter()
+                .any(|e| e["type"] == "failed" && e["stage"] == "grounding"),
+            "failure is streamed with its stage, {events:?}"
+        );
+    }
+
+    fn tooltip_element() -> rose_core::Element {
+        rose_core::Element {
+            id: rose_core::ElementId("cdp-2".to_string()),
+            label: "tooltip: Help".to_string(),
+            role: Some("tooltip".to_string()),
+            bounds: rose_core::Rect {
+                x: 460,
+                y: 60,
+                width: 200,
+                height: 60,
+            },
+            confidence: 1.0,
+            source: rose_core::ElementSource::Cdp,
+        }
+    }
+
+    fn dismiss_then_done_script(say: &str) -> Vec<rose_models::ModelReply> {
+        vec![
+            rose_models::ModelReply::Look {
+                say: "Need to see the desktop".to_string(),
+            },
+            rose_models::ModelReply::Act {
+                action: rose_core::Action::Click {
+                    target: rose_core::Target::Element(rose_core::ElementId(
+                            "g9,10@0,0".to_string(),
+                        )),
+                    button: rose_core::MouseButton::Left,
+                },
+                say: say.to_string(),
+                enter_after: false,
+            },
+            rose_models::ModelReply::Done {
+                say: "Done".to_string(),
+            },
+        ]
+    }
+
+    #[tokio::test]
+    async fn dismissal_still_present_is_flagged_not_trusted() {
+        use rose_web::StepRunner;
+        // The click lands (frame changes) but the tooltip is still listed:
+        // motion without progress must be said outright.
+        let desktop = FakeDesktop::new();
+        let stepper = Stepper {
+            desktop: Arc::new(DomOverlayStub {
+                inner: desktop.clone(),
+                elements: vec![cell_element(), tooltip_element()],
+            }),
+            fake: FakeBrain::scripted(dismiss_then_done_script("Dismissing the help tooltip")),
+            ..test_stepper(BrainSvc::Fake)
+        };
+        let (tx, mut rx) = event_channel();
+        let view = stepper
+            .run_step("click the tooltip", false, None, &tx)
+            .await
+            .expect("run");
+        assert_eq!(view["done"], true);
+        let events = drain(&mut rx);
+        let verify = events
+            .iter()
+            .find(|e| e["type"] == "verify")
+            .expect("verify event");
+        assert_eq!(verify["present"], true);
+        assert!(
+            verify["say"].as_str().unwrap_or("").contains("tooltip"),
+            "{verify}"
+        );
+    }
+
+    #[tokio::test]
+    async fn dismissal_gone_passes_quietly() {
+        use rose_web::StepRunner;
+        // Same click, but the tooltip is gone from the next listing:
+        // nothing to flag, no verify event.
+        let desktop = FakeDesktop::new();
+        let stepper = Stepper {
+            desktop: Arc::new(DomOverlayStub {
+                inner: desktop.clone(),
+                elements: vec![cell_element()],
+            }),
+            fake: FakeBrain::scripted(dismiss_then_done_script("Dismissing the help tooltip")),
+            ..test_stepper(BrainSvc::Fake)
+        };
+        let (tx, mut rx) = event_channel();
+        let view = stepper
+            .run_step("click the tooltip", false, None, &tx)
+            .await
+            .expect("run");
+        assert_eq!(view["done"], true);
+        let events = drain(&mut rx);
+        assert!(
+            !events.iter().any(|e| e["type"] == "verify"),
+            "gone target needs no flag, {events:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn loop_stops_when_the_same_click_repeats() {
         use rose_web::StepRunner;
         let click = || rose_models::ModelReply::Act {
             action: rose_core::Action::Click {
-                target: rose_core::Target::Point { x: 10, y: 10 },
+                target: rose_core::Target::Element(rose_core::ElementId(
+                    "g1,1@0.42,0.42".to_string(),
+                )),
                 button: rose_core::MouseButton::Left,
             },
             say: "Clicking the browser icon".to_string(),
@@ -1786,7 +2818,13 @@ mod tests {
         use rose_web::StepRunner;
         let click = |x, y| rose_models::ModelReply::Act {
             action: rose_core::Action::Click {
-                target: rose_core::Target::Point { x, y },
+                target: rose_core::Target::Element(rose_core::ElementId(format!(
+                    "g{},{}@{:.2},{:.2}",
+                    x / 25 + 1,
+                    y / 25 + 1,
+                    (x % 25) as f32 / 24.0,
+                    (y % 25) as f32 / 24.0
+                ))),
                 button: rose_core::MouseButton::Left,
             },
             say: format!("Clicking {x},{y}"),
@@ -1837,7 +2875,11 @@ mod tests {
         use rose_web::StepRunner;
         let click = |x| rose_models::ModelReply::Act {
             action: rose_core::Action::Click {
-                target: rose_core::Target::Point { x, y: 225 },
+                target: rose_core::Target::Element(rose_core::ElementId(format!(
+                    "g{},10@{:.2},0",
+                    x / 25 + 1,
+                    (x % 25) as f32 / 24.0
+                ))),
                 button: rose_core::MouseButton::Left,
             },
             say: format!("Clicking {x}"),
@@ -2056,6 +3098,25 @@ mod tests {
         cfg.desktop.backend = "x11".to_string();
         cfg.models.brain = "fake".to_string();
         build_services(cfg, ApiKeys::default()).expect("x11 selector builds");
+    }
+
+    #[test]
+    fn cdp_selector_constructs_without_chrome() {
+        // Construction is lazy: no CDP handshake until first capture/act,
+        // so rosed starts even when Chrome isn't up yet.
+        let mut cfg = RoseConfig::default();
+        cfg.desktop.backend = "cdp".to_string();
+        cfg.models.brain = "fake".to_string();
+        build_services(cfg, ApiKeys::default()).expect("cdp selector builds");
+    }
+
+    #[test]
+    fn auto_selector_constructs_without_display_or_chrome() {
+        // Router is lazy on both sides: X per call, CDP on first Chrome capture.
+        let mut cfg = RoseConfig::default();
+        cfg.desktop.backend = "auto".to_string();
+        cfg.models.brain = "fake".to_string();
+        build_services(cfg, ApiKeys::default()).expect("auto selector builds");
     }
 
     #[test]

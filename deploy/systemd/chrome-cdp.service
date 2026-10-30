@@ -1,0 +1,23 @@
+[Unit]
+Description=Rose Chrome (CDP, port 9222) for rose-desktop-cdp
+After=xvnc.service
+Wants=xvnc.service
+
+[Service]
+Type=simple
+Environment=DISPLAY=:1
+# The VM's existing google-chrome-stable, launched with remote debugging so
+# rose-desktop-cdp (chromiumoxide) can drive it. Same profile as a manual
+# launch, so logins persist; do NOT run a second Chrome on this profile.
+# Chrome refuses --remote-debugging-port on its *default* profile dir, so the
+# CDP browser lives in ~/.config/rose/chrome-profile (seeded one-time from
+# the default profile by setup.sh/deploy.sh, logins included). Human logins
+# happen once via VNC/Rose live view; Rose reuses the session after that.
+# If Chrome is already running without the flag, stop it first:
+#   pkill -f chrome; systemctl --user start chrome-cdp
+ExecStart=/usr/bin/google-chrome-stable --remote-debugging-port=9222 --disable-gpu --disable-dev-shm-usage --no-first-run --user-data-dir=%h/.config/rose/chrome-profile
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=default.target

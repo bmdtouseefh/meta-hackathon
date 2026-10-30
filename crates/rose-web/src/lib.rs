@@ -1,10 +1,11 @@
 //! HTTP API + embedded static UI (IMPLEMENTATION.md T1.4, shell first).
 //!
 //! Calls agent/store traits only — never the desktop or models directly.
-//! The one exception is [`FrameSource`]: a narrow snapshot seam the
-//! composition root (`apps/rosed`) adapts a backend to. Input injection
-//! (click/type via the page) is NOT exposed here; it waits for the T1.4
-//! takeover lease, which gates every input through the agent.
+//! The exceptions are [`FrameSource`] (a narrow snapshot seam) and
+//! [`HumanInput`] (human takeover input): both are implemented in
+//! `apps/rosed` (the one place allowed to touch backends). Takeover input
+//! executes only while the [`Lease`] holder is human; agent steps pause
+//! for the duration and resume (with a fresh observation) on hand-back.
 
 use async_trait::async_trait;
 use axum::{
@@ -13,6 +14,7 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
+use rose_agent::{Driver, Lease};
 use std::sync::Arc;
 
 /// Read-only snapshot of the desktop for the live view. Implemented in
@@ -34,6 +36,19 @@ pub trait FrameSource: Send + Sync {
 /// arrive can narrate the run in chat while it is still happening.
 /// Without this the whole loop was one blocking request: the user saw
 /// nothing until it finished, and a mid-loop failure lost every step.
+/// Human takeover input: the composition root adapts a backend to this.
+/// Calls execute with `Actor::Human` through the same `act()` path as the
+/// agent (one input channel, one audit log). The endpoints below only call
+/// this while the [`Lease`] holder is human; the adapter re-checks.
+#[async_trait]
+pub trait HumanInput: Send + Sync {
+    /// Map live-view fractions (0..1) onto a fresh frame, then act.
+    async fn click_frac(&self, x: f64, y: f64, double: bool) -> Result<(), String>;
+    async fn type_text(&self, text: &str) -> Result<(), String>;
+    async fn press_keys(&self, keys: Vec<String>) -> Result<(), String>;
+    async fn scroll_frac(&self, x: f64, y: f64, dy_frac: f64) -> Result<(), String>;
+}
+
 pub type StepEventSender = tokio::sync::mpsc::UnboundedSender<serde_json::Value>;
 
 /// Emit one progress event. Never blocks and never fails the run:
@@ -157,6 +172,8 @@ pub struct AppState {
     pub stepper: Option<Arc<dyn StepRunner>>,
     pub traces: Option<Arc<dyn TraceSource>>,
     pub keys: KeySlot,
+    pub lease: Lease,
+    pub control: Option<Arc<dyn HumanInput>>,
     pub env_key_present: bool,
     pub backend: String,
     pub brain: String,
@@ -169,15 +186,31 @@ const APP_JS: &str = include_str!("../../../ui/app.js");
 const STYLE_CSS: &str = include_str!("../../../ui/style.css");
 
 pub fn router(state: AppState) -> Router {
+    // UI assets carry no-store: the JS/CSS are embedded in the binary and
+    // change with it, but browsers otherwise cache /app.js across deploys
+    // and new UI behaviour never arrives.
     Router::new()
-        .route("/", get(|| async { Html(INDEX_HTML) }))
+        .route(
+            "/",
+            get(|| async { ([(header::CACHE_CONTROL, "no-store")], Html(INDEX_HTML)) }),
+        )
         .route(
             "/app.js",
-            get(|| async { ([(header::CONTENT_TYPE, "text/javascript")], APP_JS) }),
+            get(|| async {
+                (
+                    [(header::CACHE_CONTROL, "no-store")],
+                    ([(header::CONTENT_TYPE, "text/javascript")], APP_JS),
+                )
+            }),
         )
         .route(
             "/style.css",
-            get(|| async { ([(header::CONTENT_TYPE, "text/css")], STYLE_CSS) }),
+            get(|| async {
+                (
+                    [(header::CACHE_CONTROL, "no-store")],
+                    ([(header::CONTENT_TYPE, "text/css")], STYLE_CSS),
+                )
+            }),
         )
         .route("/api/status", get(api_status))
         .route("/api/health", get(api_health))
@@ -204,6 +237,9 @@ pub fn router(state: AppState) -> Router {
             "/api/runs/{id}/frames/{step}/grounded",
             get(api_run_grounded_frame),
         )
+        .route("/desktop/takeover", post(api_takeover))
+        .route("/desktop/handback", post(api_handback))
+        .route("/desktop/input", post(api_input))
         .with_state(state)
 }
 
@@ -214,6 +250,7 @@ async fn api_status(axum::extract::State(s): axum::extract::State<AppState>) -> 
         "status": "idle",
         "backend": s.backend,
         "brain": s.brain,
+        "lease": s.lease.holder().as_str(),
         "display": s.source.as_ref().map(|f| f.display()).unwrap_or_default(),
         "width": width,
         "height": height,
@@ -386,6 +423,103 @@ async fn api_stop(axum::extract::State(s): axum::extract::State<AppState>) -> im
             tracing::info!(stopping, "stop requested from UI");
             Json(serde_json::json!({"stopping": stopping})).into_response()
         }
+    }
+}
+
+/// Human takes the desktop. The agent loop pauses at its next checkpoint
+/// (an in-flight atomic action still finishes); input below only works
+/// while the lease is held here. Idempotent.
+async fn api_takeover(
+    axum::extract::State(s): axum::extract::State<AppState>,
+) -> impl IntoResponse {
+    if s.control.is_none() {
+        return err(StatusCode::SERVICE_UNAVAILABLE, "takeover input not configured");
+    }
+    s.lease.take_human();
+    tracing::info!("takeover: human holds the desktop, agent paused");
+    Json(serde_json::json!({"holder": Driver::Human.as_str()})).into_response()
+}
+
+/// Human hands back. The agent loop resumes and re-observes before acting.
+async fn api_handback(
+    axum::extract::State(s): axum::extract::State<AppState>,
+) -> impl IntoResponse {
+    s.lease.hand_back();
+    tracing::info!("handback: agent holds the desktop, loop resumes");
+    Json(serde_json::json!({"holder": Driver::Agent.as_str()})).into_response()
+}
+
+fn frac(v: &serde_json::Value) -> Option<f64> {
+    v.as_f64().filter(|f| f.is_finite())
+}
+
+fn err(status: StatusCode, msg: impl Into<String>) -> axum::response::Response {
+    (status, Json(serde_json::json!({"error": msg.into()}))).into_response()
+}
+
+/// Live-view input while the lease is human-held. Coordinates arrive as
+/// fractions of the live image (0..1); the adapter maps them onto a fresh
+/// frame, so X11 pixels, CDP viewports and the auto router all work without
+/// the UI knowing the current backend or its size. Anything else is 409:
+/// agent steps keep their exclusive input while the agent holds the lease.
+async fn api_input(
+    axum::extract::State(s): axum::extract::State<AppState>,
+    Json(body): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    if s.lease.holder() != Driver::Human {
+        return err(StatusCode::CONFLICT, "agent holds the desktop - take control first");
+    }
+    let control = match &s.control {
+        Some(c) => Arc::clone(c),
+        None => {
+            return err(StatusCode::SERVICE_UNAVAILABLE, "takeover input not configured");
+        }
+    };
+    let kind = body.get("kind").and_then(|v| v.as_str()).unwrap_or("");
+    let result = match kind {
+        "click" | "double_click" => {
+            let (Some(x), Some(y)) = (body.get("x").and_then(frac), body.get("y").and_then(frac))
+            else {
+                return err(StatusCode::BAD_REQUEST, "click needs x/y fractions 0..1");
+            };
+            control.click_frac(x, y, kind == "double_click").await
+        }
+        "type" => match body.get("text").and_then(|v| v.as_str()) {
+            Some(t) if !t.is_empty() && t.chars().count() <= 200 => control.type_text(t).await,
+            _ => {
+                return err(StatusCode::BAD_REQUEST, "type needs 1..200 chars of text");
+            }
+        },
+        "key" => match body.get("keys").and_then(|v| v.as_array()) {
+            Some(keys) if !keys.is_empty() && keys.len() <= 4 => {
+                let keys: Vec<String> = keys
+                    .iter()
+                    .filter_map(|k| k.as_str().map(str::to_string))
+                    .collect();
+                if keys.is_empty() {
+                    return err(StatusCode::BAD_REQUEST, "key needs 1..4 key names");
+                }
+                control.press_keys(keys).await
+            }
+            _ => {
+                return err(StatusCode::BAD_REQUEST, "key needs 1..4 key names");
+            }
+        },
+        "scroll" => {
+            let (Some(x), Some(y), Some(dy)) = (
+                body.get("x").and_then(frac),
+                body.get("y").and_then(frac),
+                body.get("dy").and_then(frac),
+            ) else {
+                return err(StatusCode::BAD_REQUEST, "scroll needs x/y/dy fractions");
+            };
+            control.scroll_frac(x, y, dy).await
+        }
+        _ => return err(StatusCode::BAD_REQUEST, "kind: click | double_click | type | key | scroll"),
+    };
+    match result {
+        Ok(()) => Json(serde_json::json!({"ok": true})).into_response(),
+        Err(e) => err(StatusCode::BAD_GATEWAY, e),
     }
 }
 
@@ -613,6 +747,8 @@ mod tests {
             stepper: None,
             traces: None,
             keys: KeySlot::default(),
+            lease: Lease::new(),
+            control: None,
             env_key_present: false,
             backend: "fake".to_string(),
             brain: "fake".to_string(),
@@ -935,5 +1071,118 @@ mod tests {
             .as_str()
             .expect("error")
             .contains("kaboom"));
+    }
+
+    struct StubControl {
+        log: std::sync::Mutex<Vec<String>>,
+    }
+    #[async_trait]
+    impl HumanInput for StubControl {
+        async fn click_frac(&self, x: f64, y: f64, double: bool) -> Result<(), String> {
+            self.log
+                .lock()
+                .expect("log")
+                .push(format!("click {x:.2} {y:.2} {double}"));
+            Ok(())
+        }
+        async fn type_text(&self, text: &str) -> Result<(), String> {
+            self.log.lock().expect("log").push(format!("type {text}"));
+            Ok(())
+        }
+        async fn press_keys(&self, keys: Vec<String>) -> Result<(), String> {
+            self.log
+                .lock()
+                .expect("log")
+                .push(format!("key {}", keys.join("+")));
+            Ok(())
+        }
+        async fn scroll_frac(&self, x: f64, y: f64, dy_frac: f64) -> Result<(), String> {
+            self.log
+                .lock()
+                .expect("log")
+                .push(format!("scroll {x:.2} {y:.2} {dy_frac:.2}"));
+            Ok(())
+        }
+    }
+
+    /// Takeover flips the lease; input works only while human-held.
+    #[tokio::test]
+    async fn takeover_gates_input_and_handback_restores() {
+        let control = Arc::new(StubControl {
+            log: std::sync::Mutex::new(Vec::new()),
+        });
+        let mut st = state(None);
+        st.control = Some(control.clone());
+        let port = spawn(st).await;
+
+        // Agent holds it: input is refused, takeover flips, handback restores.
+        let (head, body) = get(port, "/api/status").await;
+        assert!(head.contains("200 OK"), "{head}");
+        let v: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        assert_eq!(v["lease"], "agent");
+
+        let (head, _) = post(
+            port,
+            "/desktop/input",
+            r#"{"kind":"click","x":0.5,"y":0.5}"#,
+        )
+        .await;
+        assert!(head.contains("409"), "{head}");
+
+        let (head, body) = post(port, "/desktop/takeover", "{}").await;
+        assert!(head.contains("200 OK"), "{head}");
+        let v: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        assert_eq!(v["holder"], "human");
+
+        let (head, body) = get(port, "/api/status").await;
+        assert!(head.contains("200 OK"), "{head}");
+        let v: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        assert_eq!(v["lease"], "human");
+
+        let (head, _) = post(
+            port,
+            "/desktop/input",
+            r#"{"kind":"click","x":0.25,"y":0.75}"#,
+        )
+        .await;
+        assert!(head.contains("200 OK"), "{head}");
+        let (head, _) = post(
+            port,
+            "/desktop/input",
+            r#"{"kind":"key","keys":["Escape"]}"#,
+        )
+        .await;
+        assert!(head.contains("200 OK"), "{head}");
+        // Bad shapes are 400, never dispatched.
+        let (head, _) = post(port, "/desktop/input", r#"{"kind":"click"}"#).await;
+        assert!(head.contains("400"), "{head}");
+        let (head, _) = post(port, "/desktop/input", r#"{"kind":"nope"}"#).await;
+        assert!(head.contains("400"), "{head}");
+        assert_eq!(
+            *control.log.lock().expect("log"),
+            vec!["click 0.25 0.75 false", "key Escape"],
+        );
+
+        let (head, body) = post(port, "/desktop/handback", "{}").await;
+        assert!(head.contains("200 OK"), "{head}");
+        let v: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        assert_eq!(v["holder"], "agent");
+        let (head, _) = post(
+            port,
+            "/desktop/input",
+            r#"{"kind":"click","x":0.5,"y":0.5}"#,
+        )
+        .await;
+        assert!(head.contains("409"), "{head}");
+    }
+
+    /// No control adapter: takeover reports 503 instead of flipping.
+    #[tokio::test]
+    async fn takeover_needs_a_control_adapter() {
+        let port = spawn(state(None)).await;
+        let (head, _) = post(port, "/desktop/takeover", "{}").await;
+        assert!(head.contains("503"), "{head}");
+        let (head, _) = post(port, "/desktop/handback", "{}").await;
+        assert!(head.contains("200 OK"), "{head}");
     }
 }

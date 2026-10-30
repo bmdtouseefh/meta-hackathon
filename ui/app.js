@@ -116,6 +116,13 @@ function createRunCard(goal) {
     elapsed.textContent = `${Math.round((Date.now() - startedAt) / 1000)}s`;
   }, 500);
   const rows = new Map();
+  let latestStep = -1;
+  const setRowCollapsed = (row, collapsed) => {
+    // First child is the step header; it always stays visible.
+    row.childNodes.forEach((child, i) => {
+      if (i > 0) child.classList.toggle("hidden", collapsed);
+    });
+  };
   const cardApi = {
     stepsEl: steps,
     touched: false,
@@ -131,11 +138,21 @@ function createRunCard(goal) {
         row.className =
           "border-l-2 border-neutral-300 dark:border-neutral-600 pl-2 flex flex-col gap-0.5";
         const headRow = document.createElement("div");
-        headRow.className = "text-xs font-semibold uppercase tracking-wide opacity-60";
+        headRow.className = "text-xs font-semibold uppercase tracking-wide opacity-60 cursor-pointer select-none";
         headRow.textContent = `Step ${step + 1}`;
+        headRow.title = "Show/hide this step";
+        headRow.onclick = () => {
+          const bodyHidden = row.childNodes[1]?.classList.contains("hidden") ?? false;
+          setRowCollapsed(row, !bodyHidden);
+        };
         row.appendChild(headRow);
         steps.appendChild(row);
         rows.set(step, row);
+      }
+      if (step > latestStep) {
+        // New latest step: it stays open, older rows collapse to headers.
+        latestStep = step;
+        rows.forEach((r, s) => setRowCollapsed(r, s !== step));
       }
       return rows.get(step);
     },
@@ -166,18 +183,9 @@ function renderEvent(card, ev) {
       break;
     case "observed": {
       const win = ev.active_window ? ` · active window: “${ev.active_window}”` : "";
-      line(row, `👀 Saw ${ev.width}×${ev.height} screenshot (${ev.frame_bytes} bytes)${win}`, "text-sm");
-      if (ev.frame && ev.run_id) {
-        const a = document.createElement("a");
-        a.href = `/api/runs/${encodeURIComponent(ev.run_id)}/frames/${ev.step}`;
-        a.target = "_blank";
-        a.rel = "noopener";
-        a.className = "text-xs underline opacity-80";
-        a.textContent = "🖼 View the raw screenshot";
-        row.appendChild(a);
-      }
+      line(row, `👀 Saw ${ev.width}×${ev.height} screenshot (${ev.frame_bytes} bytes)${win} — the gridded copy below is what the brain gets`, "text-sm");
       const hist = ev.history && ev.history.length ? ev.history.join(" → ") : "(empty — first step)";
-      line(row, `↩ Fed back to brain: this screenshot + history: ${hist}`, "text-xs opacity-70");
+      line(row, `↩ Fed back to brain: gridded screenshot + history: ${hist}`, "text-xs opacity-70");
       break;
     }
     case "thinking":
@@ -195,22 +203,23 @@ function renderEvent(card, ev) {
     case "grounded": {
       const n = ev.elements || 0;
       const ms = ev.ms != null ? ` in ${ev.ms}ms` : "";
+      const src = ev.source ? ` via ${ev.source}` : "";
       if (n > 0) {
-        line(row, `🎯 Overlay: ${n} numbered element${n === 1 ? "" : "s"}${ms} — brain picks a number, no pixel guessing`, "text-sm");
+        line(row, `🎯 Numbered 64×36 grid applied${ms}${src}, plus ${n} listed element${n === 1 ? "" : "s"} — brain aims by grid cell, element number, or pixels off the axes`, "text-sm");
         if (ev.labels && ev.labels.length) {
           line(row, ev.labels.join(" · "), "text-xs font-mono opacity-80");
         }
-        if (ev.frame && ev.run_id) {
-          const a = document.createElement("a");
-          a.href = `/api/runs/${encodeURIComponent(ev.run_id)}/frames/${ev.step}/grounded`;
-          a.target = "_blank";
-          a.rel = "noopener";
-          a.className = "text-xs underline opacity-80";
-          a.textContent = "🎯 View the annotated screenshot the brain saw";
-          row.appendChild(a);
-        }
       } else {
-        line(row, `🎯 Overlay: no elements found${ms} — falling back to raw pixels`, "text-sm opacity-70");
+        line(row, `🎯 Numbered 64×36 grid applied${ms}${src} — brain aims by grid cell g<col>,<row> or pixels off the axes (no raw screenshot is ever sent)`, "text-sm");
+      }
+      if (ev.frame && ev.run_id) {
+        const a = document.createElement("a");
+        a.href = `/api/runs/${encodeURIComponent(ev.run_id)}/frames/${ev.step}/grounded`;
+        a.target = "_blank";
+        a.rel = "noopener";
+        a.className = "text-xs underline opacity-80";
+        a.textContent = "🎯 View the gridded screenshot the brain saw";
+        row.appendChild(a);
       }
       break;
     }
@@ -259,6 +268,12 @@ function renderEvent(card, ev) {
       break;
     case "approval":
       line(row, `⚠️ Paused for approval: ${ev.say} — ${ev.action}`, "text-sm font-semibold text-amber-600 dark:text-amber-400");
+      break;
+    case "lease":
+      line(row, `⏸ ${ev.say}`, "text-sm font-medium text-amber-600 dark:text-amber-400");
+      break;
+    case "verify":
+      line(row, `🔍 Verify: ${ev.say}`, "text-sm font-medium text-amber-600 dark:text-amber-400");
       break;
     case "stuck":
       line(row, `⚠️ Stuck: ${ev.say}`, "text-sm font-semibold text-amber-600 dark:text-amber-400");
@@ -593,6 +608,7 @@ async function refreshStatus() {
       `backend=${s.backend} · ${s.version}`;
     document.getElementById("display-name").textContent = s.display ? `· ${s.display}` : "";
     dot.className = DOT + "bg-neutral-400";
+    setControlUI(s.lease === "human");
   } catch (e) {
     document.getElementById("status-text").textContent = "rosed unreachable";
     dot.className = DOT + "bg-amber-500";
@@ -617,6 +633,130 @@ async function refreshFrame() {
     document.getElementById("frame-note").style.display = "none";
   } catch (e) { /* backend not up yet */ }
 }
+
+// ---- takeover: you drive, Rose pauses (never killed) -----------------------
+// The button toggles the control lease; while held, clicks / wheel / keys
+// on the live view POST to /desktop/input and ride the same audited act()
+// path as the agent, with Actor::Human. Coordinates go as fractions of the
+// live image so X11 pixels, CDP viewports and the auto router all work
+// without the UI knowing the backend or its size.
+let controlling = false;
+
+function setControlUI(held) {
+  controlling = held;
+  const btn = document.getElementById("take-control");
+  const badge = document.getElementById("control-badge");
+  const img = document.getElementById("frame");
+  const hint = document.getElementById("control-hint");
+  btn.textContent = held ? "Hand Back" : "Take Control";
+  btn.title = held
+    ? "Return the desktop to Rose (it re-observes and resumes)"
+    : "Drive the desktop yourself — the agent pauses, nothing is killed";
+  badge.textContent = held ? "YOU CONTROL" : "VIEW-ONLY";
+  badge.className = "rounded px-2 py-0.5 text-xs font-semibold text-white " +
+    (held ? "bg-green-600" : "bg-red-600");
+  img.style.cursor = held ? "crosshair" : "";
+  hint.textContent = held
+    ? "You hold the desktop: click to click, double-click to double-click, wheel to scroll, type to type. Hand Back to resume Rose."
+    : "Exactly what Rose sees. Take Control to drive it yourself through the same audited path — the agent pauses, never killed.";
+}
+
+async function toggleControl() {
+  const to = controlling ? "/desktop/handback" : "/desktop/takeover";
+  try {
+    const r = await fetch(to, { method: "POST" });
+    const j = await checked(r);
+    setControlUI(j.holder === "human");
+  } catch (e) {
+    bubble(`⚠️ Takeover failed: ${e.message}`);
+  }
+}
+
+async function checked(r) {
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(j.error || `HTTP ${r.status}`);
+  return j;
+}
+
+async function postInput(body) {
+  const r = await fetch("/desktop/input", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  await checked(r);
+}
+
+async function sendClick(kind, e) {
+  if (!controlling) return;
+  const { x, y } = frameFrac(e);
+  try {
+    await postInput({ kind, x, y });
+  } catch (err) {
+    bubble(`⚠️ ${kind === "click" ? "Click" : "Double-click"} not delivered: ${err.message}`);
+  }
+}
+
+function frameFrac(e) {
+  const rect = document.getElementById("frame").getBoundingClientRect();
+  const x = Math.min(1, Math.max(0, (e.clientX - rect.left) / rect.width));
+  const y = Math.min(1, Math.max(0, (e.clientY - rect.top) / rect.height));
+  return { rect, x, y };
+}
+
+document.getElementById("frame").addEventListener("click", async (e) => {
+  sendClick("click", e);
+});
+
+document.getElementById("frame").addEventListener("dblclick", async (e) => {
+  e.preventDefault();
+  sendClick("double_click", e);
+});
+
+document.getElementById("frame").addEventListener("wheel", async (e) => {
+  if (!controlling) return;
+  e.preventDefault();
+  const { rect, x, y } = frameFrac(e);
+  try {
+    await postInput({ kind: "scroll", x, y, dy: e.deltaY / rect.height });
+  } catch (err) {
+    bubble(`⚠️ Scroll not delivered: ${err.message}`);
+  }
+}, { passive: false });
+
+const TAKEOVER_KEYMAP = {
+  Enter: "Return", Escape: "Escape", Tab: "Tab", Backspace: "Backspace",
+  Delete: "Delete", ArrowLeft: "Left", ArrowRight: "Right",
+  ArrowUp: "Up", ArrowDown: "Down", Home: "Home", End: "End",
+  PageUp: "Page_Up", PageDown: "Page_Down", " ": "space",
+};
+
+document.addEventListener("keydown", async (e) => {
+  if (!controlling) return;
+  // Never hijack typing in the composer, search, key field, or dialogs.
+  const t = e.target;
+  if (t && (t.tagName === "TEXTAREA" || t.tagName === "INPUT" || t.tagName === "SELECT")) return;
+  if (!document.getElementById("setup-modal").classList.contains("hidden")) return;
+  if (e.metaKey) return;
+  try {
+    if (!e.ctrlKey && !e.altKey && e.key.length === 1) {
+      e.preventDefault();
+      await postInput({ kind: "type", text: e.key });
+    } else {
+      const keys = [];
+      if (e.ctrlKey) keys.push("ctrl");
+      if (e.altKey) keys.push("alt");
+      if (e.shiftKey) keys.push("shift");
+      const base = TAKEOVER_KEYMAP[e.key] || (e.key.length === 1 ? e.key : null);
+      if (!base) return;
+      keys.push(base);
+      e.preventDefault();
+      await postInput({ kind: "key", keys });
+    }
+  } catch (err) {
+    bubble(`⚠️ Key not delivered: ${err.message}`);
+  }
+});
 
 function saveKey() {
   const v = document.getElementById("api-key").value.trim();

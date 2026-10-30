@@ -108,18 +108,18 @@
     </div>
   </main>
 
-  <!-- desktop: equal half with the chat, live view-only, toggled by the Desktop button -->
+  <!-- desktop: equal half with the chat, live view + takeover input -->
   <aside id="desk-panel" class="card flex min-h-0 min-w-0 flex-1 flex-col overflow-y-auto rounded-none p-5" style="border:0;contain:layout style">
     <div class="mb-2 flex items-center justify-between">
       <span class="t-title">Live desktop <span id="display-name" class="muted text-xs font-medium"></span></span>
-      <span class="rounded bg-red-600 px-2 py-0.5 text-xs font-semibold text-white">VIEW-ONLY</span>
+      <span id="control-badge" class="rounded bg-red-600 px-2 py-0.5 text-xs font-semibold text-white">VIEW-ONLY</span>
     </div>
     <div class="overflow-hidden rounded-lg border bg-black" style="border-color:var(--line)">
       <img id="frame" alt="live desktop" class="w-full hidden">
       <div id="frame-note" class="muted p-4 text-center text-xs">waiting for backend frames…</div>
     </div>
-    <p class="muted mt-2 text-xs">Exactly what Rose sees. Take Control routes input through the same audited path (T1.4).</p>
-    <button disabled title="Take Control lands in T1.4 (lease)" class="btn-ghost mt-2 w-full rounded-lg px-3 py-2 font-semibold opacity-60">Take Control</button>
+    <p id="control-hint" class="muted mt-2 text-xs">Exactly what Rose sees. Take Control to drive it yourself through the same audited path — the agent pauses, never killed.</p>
+    <button id="take-control" onclick="toggleControl()" class="btn-ghost mt-2 w-full rounded-lg px-3 py-2 font-semibold">Take Control</button>
   </aside>
 </div>
 

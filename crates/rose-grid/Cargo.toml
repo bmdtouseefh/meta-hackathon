@@ -1,0 +1,9 @@
+[package]
+name = "rose-grid"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+rose-core = { path = "../rose-core" }
+image = { version = "0.25", features = ["jpeg"] }

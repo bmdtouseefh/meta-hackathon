@@ -17,8 +17,8 @@ Reply with exactly ONE JSON object, nothing else. Shapes:
   "say": "Clicking Export" }
 { "status": "act",  "action": "double_click", "element": 3,
   "say": "Opening the Chrome desktop icon" }
-{ "status": "act",  "action": "click", "x": 812, "y": 240,
-  "say": "Clicking Export (no overlay)" }
+{ "status": "act",  "action": "click", "element": "g14,3@0.25,0.8",
+  "say": "Clicking the control low in grid cell column 14, row 3" }
 { "status": "act",  "action": "type",  "text": "invoice march",
   "say": "Typing the search text" }
 { "status": "act",  "action": "type",  "text": "example.com",  "enter": true,
@@ -34,15 +34,42 @@ Reply with exactly ONE JSON object, nothing else. Shapes:
 
 Rules — fewest steps wins. Every reply costs a full
 screenshot-and-think round-trip, so do not spend steps on ceremony:
-- numbered boxes: the screenshot has red boxes with white-on-black number
-  badges. To click something with a badge, reply with its number:
-  {"action":"click","element":7}. Never guess x,y when a badge is visible.
-  No badge on the target (or no boxes at all) means the overlay found
-  nothing: fall back to pixel form {"action":"click","x":812,"y":240}.
-- pixel fallback: "click" targets the CENTRE of the target, in screenshot
-  pixels. Coordinates MUST stay inside the screen: x in 0..1599, y in 0..899.
-  Never emit coordinates outside that box. The bottom panel/taskbar
-  lives around y 860..899.
+- coordinate grid FIRST: EVERY screenshot you receive carries the same
+  64x36 grid — you never see a raw, ungridded screenshot. Thin red lines
+  at 1/64 of the width and 1/36 of the height, column numbers 1..64
+  printed along the TOP edge, row numbers 1..36 down the LEFT edge.
+  Cells are small (about 25x21 px on a browser viewport), so read the
+  number printed directly above/beside your target — never count lines
+  from a corner. Aim by grid first, always, two ways in order:
+  1. Grid cell + sub-cell fraction (best, use it for every click):
+     name the cell containing your target, then say where inside that
+     cell the target's centre sits: fractions across and down the cell,
+     0,0 = top-left, 1,1 = bottom-right. Reply
+     {"action":"click","element":"g<COL>,<ROW>@<FX>,<FY>"} (e.g.
+     "g14,3@0.25,0.8" = a quarter across, near the bottom of cell 14,3).
+     Small icons and text rows (an indicator legend, a toolbar button)
+     rarely sit at a cell centre — ALWAYS add the @fraction when the
+     target is smaller than the cell or off its centre; the click lands
+     on that exact spot inside the cell.
+  2. Grid cell alone, {"action":"click","element":"g14,3"}: clicks the
+     cell centre. Only for targets that fill the cell.
+  NEVER reply with raw pixel coordinates ("x"/"y") for a click: the
+  system refuses guessed pixels without acting. Every click target is
+  a grid cell (with its @fraction) or an element number below — read
+  the column/row numbers printed on the axes instead of estimating
+  absolute pixels.
+- element list SECOND: when the message also lists
+  "[N] role: name @ (x,y,WxH)" lines (browser DOM elements), it is a
+  supplement to the grid, not a replacement: prefer a grid cell when
+  the target's position is clear from the screenshot; use
+  {"action":"click","element":7} when a list entry is unambiguous and
+  the target is hard to pin to one cell (tiny or overlapping controls).
+  Never guess x,y freely when a grid cell or list entry covers the
+  target.
+- target centre: whichever way you pick (cell fraction or element
+  number), aim at the CENTRE of the target control, not its edge. The
+  bottom panel/taskbar lives near the last grid rows on desktop
+  screenshots.
 - Opening an app (e.g. a browser): a panel/dock launcher takes ONE
   "click"; an icon on the desktop itself takes "double_click" — a
   single click only selects it and opens nothing. Do NOT reply
@@ -52,7 +79,10 @@ screenshot-and-think round-trip, so do not spend steps on ceremony:
   screenshot shows a loading spinner/splash and nothing actionable.
 - If history says your last action had NO visible change, it missed.
   Never repeat the same (or nearly the same) click — the system will
-  reject the repeat. Change route: double_click instead of click,
+  reject the repeat. To dismiss a tooltip/dialog/popover, press Escape
+  FIRST (many popups, especially canvas-drawn ones, have no clickable
+  close control at all); only click at an X if Escape did nothing.
+  Otherwise change route: double_click instead of click,
   keyboard instead of pixels, or the Applications/Whisker menu
   (open it, type the app name, press Return).
 - You have a real shell ("shell" action, bash, DISPLAY already set,

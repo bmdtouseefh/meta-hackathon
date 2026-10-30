@@ -24,21 +24,22 @@ cargo build --release --target "$TARGET" -p rosed
 
 echo "==> staging $DEB"
 rm -rf .pkg-stage dist
-mkdir -p .pkg-stage/DEBIAN \
+  mkdir -p .pkg-stage/DEBIAN \
   .pkg-stage/usr/bin \
+  .pkg-stage/usr/local/bin \
   .pkg-stage/usr/lib/systemd/user \
   .pkg-stage/usr/share/doc/rose \
   dist
 
 cp -f "target/$TARGET/release/rosed" .pkg-stage/usr/bin/rosed
 chmod 755 .pkg-stage/usr/bin/rosed
-cp -f deploy/systemd/xvnc.service deploy/systemd/rosed.service deploy/systemd/grounding.service .pkg-stage/usr/lib/systemd/user/
+cp -f deploy/systemd/xvnc.service deploy/systemd/rosed.service deploy/systemd/chrome-cdp.service .pkg-stage/usr/lib/systemd/user/
 chmod 644 .pkg-stage/usr/lib/systemd/user/*.service
+# google-chrome wrapper: forces all launches into the shared CDP profile
+# (/usr/local/bin precedes /usr/bin on PATH).
+cp -f deploy/google-chrome-wrapper.sh .pkg-stage/usr/local/bin/google-chrome
+chmod 755 .pkg-stage/usr/local/bin/google-chrome
 cp -f config/rose.example.toml .pkg-stage/usr/share/doc/rose/
-# Lite SoM grounding sidecar (no ML weights): unit runs it from here.
-mkdir -p .pkg-stage/usr/share/rose/grounding-worker
-cp -f grounding-worker/app.py grounding-worker/detector.py grounding-worker/requirements.txt grounding-worker/README.md .pkg-stage/usr/share/rose/grounding-worker/
-chmod 644 .pkg-stage/usr/share/rose/grounding-worker/*
 cat > .pkg-stage/usr/share/doc/rose/copyright <<'EOF'
 Rose - AI agent for an Ubuntu VM (XFCE over TigerVNC).
 Upstream: see repository. License: MIT OR Apache-2.0.

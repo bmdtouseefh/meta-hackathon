@@ -124,7 +124,7 @@ cmd_status() {
   step "services (systemd --user)"
   if loginctl show-user "$USER" 2>/dev/null | grep -q 'Linger=yes'; then pass "linger enabled";
   else warnc "linger not enabled (sudo loginctl enable-linger $USER)"; fi
-  for svc in xvnc rosed; do
+  for svc in xvnc chrome-cdp rosed; do
     if systemctl --user list-unit-files 2>/dev/null | grep -q "^$svc.service"; then
       STATE="$(systemctl --user is-active "$svc" 2>/dev/null || true)"
       ENABLED="$(systemctl --user is-enabled "$svc" 2>/dev/null || true)"
@@ -144,6 +144,18 @@ cmd_status() {
     fi
   done
 
+  step "Chrome CDP (http://127.0.0.1:9222, for desktop.backend=cdp/auto)"
+  if [ "$(command -v google-chrome)" = "/usr/local/bin/google-chrome" ]; then
+    pass "google-chrome resolves to the wrapper (shell launches join the CDP browser)"
+  else
+    failc "google-chrome resolves to $(command -v google-chrome || echo missing), want the /usr/local/bin wrapper - rerun ./deploy/setup.sh"
+  fi
+  if curl -sf http://127.0.0.1:9222/json/version >>"$LOG_FILE" 2>&1; then
+    pass "CDP endpoint live: $(curl -sf http://127.0.0.1:9222/json/version 2>/dev/null | head -c 120)"
+  else
+    failc "CDP endpoint down (rosed backend=cdp/auto needs it) - journalctl --user -u chrome-cdp -n 30"
+  fi
+
   step "rosed binary + config"
   if [ -x "$HOME/.local/bin/rosed" ]; then
     pass "~/.local/bin/rosed exists"
@@ -159,16 +171,16 @@ cmd_status() {
 
   step "network (localhost-only is correct)"
   # $4 is the local address in both ss -tlnH and netstat -tln output.
-  local_addrs="$( (ss -tlnH 2>/dev/null || netstat -tln 2>/dev/null) | awk '{print $4}' | grep -E ':(5901|8787)$' || true)"
+  local_addrs="$( (ss -tlnH 2>/dev/null || netstat -tln 2>/dev/null) | awk '{print $4}' | grep -E ':(5901|8787|9222)$' || true)"
   if [ -z "$local_addrs" ]; then
-    warnc "nothing listening on 5901/8787 yet (services not started?)"
+    warnc "nothing listening on 5901/8787/9222 yet (services not started?)"
   else
     echo "$local_addrs" | sed 's/^/  [listener] /' | tee -a "$LOG_FILE"
     # Strip [] so [::1]:5901 compares equal to loopback ::1 (ss brackets IPv6).
-    bad_addrs="$(echo "$local_addrs" | sed 's/[][]//g' | grep -vE '^(127\.0\.0\.1|::1):(5901|8787)$' || true)"
+    bad_addrs="$(echo "$local_addrs" | sed 's/[][]//g' | grep -vE '^(127\.0\.0\.1|::1):(5901|8787|9222)$' || true)"
     if [ -n "$bad_addrs" ]; then
       failc "non-localhost listener (must bind localhost + tunnel only): $bad_addrs"
-    else pass "5901/8787 localhost-only"; fi
+    else pass "5901/8787/9222 localhost-only"; fi
   fi
 
   say ""
@@ -186,8 +198,7 @@ cmd_install() {
   run_step "1/9 apt packages (install)" sudo apt install -y \
     xfce4 tigervnc-standalone-server dbus-x11 x11-xserver-utils \
     ffmpeg fonts-liberation fonts-dejavu curl git \
-    build-essential pkg-config libssl-dev sqlite3 \
-    tesseract-ocr tesseract-ocr-eng
+    build-essential pkg-config libssl-dev sqlite3
 
   step "2/9 Google Chrome (.deb, not snap)"
   if have google-chrome; then
@@ -202,6 +213,17 @@ cmd_install() {
     run_step "2/9 Chrome deps (apt -f)" sudo apt -f install -y
     have google-chrome || { fail "google-chrome still missing after install - see $LOG_FILE"; exit 1; }
     ok "installed: $(google-chrome --version)"
+  fi
+  step "2/9b google-chrome wrapper (all launches join the shared CDP profile)"
+  if [ ! -f "$SCRIPT_DIR/google-chrome-wrapper.sh" ]; then
+    fail "missing $SCRIPT_DIR/google-chrome-wrapper.sh - copy the whole deploy/ folder, preserving structure"
+    exit 1
+  fi
+  run_step "2/9b install wrapper" sudo install -m 755 "$SCRIPT_DIR/google-chrome-wrapper.sh" /usr/local/bin/google-chrome
+  if [ "$(command -v google-chrome)" = "/usr/local/bin/google-chrome" ]; then
+    pass "google-chrome resolves to the wrapper (shared CDP profile)"
+  else
+    failc "google-chrome resolves to $(command -v google-chrome), want the /usr/local/bin wrapper"
   fi
 
   step "3/9 Rust toolchain (builds rosed)"
@@ -273,7 +295,7 @@ EOF
   fi
 
   step "9/9 systemd --user units + lingering"
-  for unit in xvnc rosed grounding; do
+  for unit in xvnc rosed chrome-cdp; do
     if [ ! -f "$SCRIPT_DIR/systemd/$unit.service" ]; then
       fail "missing $SCRIPT_DIR/systemd/$unit.service"
       fail "you copied setup.sh without its sibling systemd/ dir - copy the whole deploy/ folder, preserving structure:"
@@ -285,7 +307,7 @@ EOF
   mkdir -p "$HOME/.config/systemd/user"
   cp -f "$SCRIPT_DIR/systemd/xvnc.service" "$HOME/.config/systemd/user/xvnc.service"
   cp -f "$SCRIPT_DIR/systemd/rosed.service" "$HOME/.config/systemd/user/rosed.service"
-  cp -f "$SCRIPT_DIR/systemd/grounding.service" "$HOME/.config/systemd/user/grounding.service"
+  cp -f "$SCRIPT_DIR/systemd/chrome-cdp.service" "$HOME/.config/systemd/user/chrome-cdp.service"
   ok "installed user units"
   run_step "9/9 daemon-reload" systemctl --user daemon-reload
   # Stale locks from a killed run make vncserver exit 1 on restart. Clean first.
@@ -293,6 +315,32 @@ EOF
   vncserver -kill :1 >>"$LOG_FILE" 2>&1 || true
   rm -f /tmp/.X1-lock /tmp/.X11-unix/X1 || true
   run_step "9/9 enable+start xvnc" systemctl --user enable --now xvnc.service
+  # chrome-cdp must own the Chrome profile: a manually started Chrome without
+  # --remote-debugging-port holds the SingletonLock and the unit would
+  # crash-loop. Same profile, so logins survive the switch.
+  # One-time migration: Chrome refuses remote debugging on its default
+  # profile dir, so chrome-cdp uses ~/.config/rose/chrome-profile.
+  # Move the existing profile (logins survive) the first time.
+  if [ ! -d "$HOME/.config/rose/chrome-profile" ] && [ -d "$HOME/.config/google-chrome" ]; then
+    info "migrating Chrome profile to CDP dir (one-time, logins kept)..."
+    mkdir -p "$HOME/.config/rose"
+    mv "$HOME/.config/google-chrome" "$HOME/.config/rose/chrome-profile"
+  fi
+  info "stopping any Chrome without remote debugging (profile lock)..."
+  pkill -f 'chrome' >>"$LOG_FILE" 2>&1 || true
+  sleep 1
+  run_step "9/9 enable+start chrome-cdp" systemctl --user enable --now chrome-cdp.service
+  info "waiting for CDP http://127.0.0.1:9222/json/version (first launch builds caches)..."
+  for i in $(seq 1 20); do
+    if curl -sf http://127.0.0.1:9222/json/version >>"$LOG_FILE" 2>&1; then
+      ok "CDP endpoint live ($(google-chrome --version 2>/dev/null || echo chrome))"
+      break
+    fi
+    sleep 1
+    if [ "$i" -eq 20 ]; then
+      warn "CDP endpoint not responding yet - journalctl --user -u chrome-cdp -n 30"
+    fi
+  done
   if [ -x "$HOME/.local/bin/rosed" ]; then
     if ! systemctl --user enable --now rosed.service 2>&1 | tee -a "$LOG_FILE" | sed 's/^/  | /'; then
       # Expected before M1/M2: rosed bails on unimplemented backends (T1.2/T3.1).
@@ -302,23 +350,6 @@ EOF
   else
     warn "skipping rosed.service start (binary not installed yet)"
   fi
-  step "10/10 grounding-worker (lite SoM parser, 4 CPU / 4 GB)"
-  if have python3 && [ -f "$REPO_ROOT/grounding-worker/requirements.txt" ]; then
-    export PATH="$HOME/.local/bin:$PATH"
-    have uv || curl -LsSf https://astral.sh/uv/install.sh | sh
-    export PATH="$HOME/.local/bin:$PATH"
-    VENV="$HOME/.local/share/rose/grounding-venv"
-    info "\$ uv venv + uv pip install -r grounding-worker/requirements.txt"
-    if uv venv "$VENV" 2>&1 | tee -a "$LOG_FILE" | sed 's/^/  | /' \
-      && uv pip install --python "$VENV/bin/python" -r "$REPO_ROOT/grounding-worker/requirements.txt" 2>&1 | tee -a "$LOG_FILE" | sed 's/^/  | /'; then
-      run_step "10/10 enable+start grounding" systemctl --user enable --now grounding.service
-    else
-      warn "grounding-worker uv install failed - grounding backend stays off (config grounding.backend)"
-    fi
-  else
-    warn "skipping grounding-worker (no python3 or no grounding-worker/requirements.txt)"
-  fi
-
   say ""
   ok "setup done. Verifying with --status..."
   if ! cmd_status; then

@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 rose-core = { path = "../rose-core" }
+rose-agent = { path = "../rose-agent" }
 async-trait = "0.1"
 axum = "0.8"
 futures-core = "0.3"

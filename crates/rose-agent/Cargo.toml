@@ -3,3 +3,10 @@ name = "rose-agent"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+
+[dependencies]
+rose-core = { path = "../rose-core" }
+tokio = { version = "1", features = ["sync"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt", "sync", "time"] }

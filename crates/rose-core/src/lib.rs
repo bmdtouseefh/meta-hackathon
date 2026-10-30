@@ -174,6 +174,21 @@ pub trait DesktopBackend: Send + Sync {
     async fn capture(&self) -> Result<Frame>;
     /// Perform ONE atomic action.
     async fn act(&self, action: &Action, actor: Actor) -> Result<()>;
+    /// DOM/AX overlay for the given frame JPEG: exact elements.
+    /// `Ok(None)` = this backend has no DOM (X11/fake): callers use the
+    /// numbered grid instead. Default: none.
+    async fn dom_overlay(&self, _frame_jpeg: &[u8]) -> Result<Option<DomOverlay>> {
+        Ok(None)
+    }
+}
+
+/// Backend-provided grounding: exact elements for the current frame.
+/// There is no annotated JPEG here: the brain picks `element: N` from
+/// the text list (which carries each box) and Rust resolves the point —
+/// drawing badges would only mask the page. Numbering is 1..N per frame.
+#[derive(Debug, Clone)]
+pub struct DomOverlay {
+    pub elements: Vec<Element>,
 }
 
 // ---------- perception / grounding (Phase 2+ seams; Phase 1 uses raw points) ----------
@@ -182,6 +197,8 @@ pub trait DesktopBackend: Send + Sync {
 pub enum ElementSource {
     Vision,
     Sam,
+    Cdp,
+    Grid,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -451,7 +468,8 @@ pub struct ServerConfig {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DesktopConfig {
-    /// "x11" | "fake".
+    /// "x11" (full desktop) | "cdp" (browser only) | "auto" (x11, CDP when
+    /// a Chrome window is frontmost) | "fake".
     pub backend: String,
     pub display: String,
     pub width: u32,
@@ -478,35 +496,39 @@ fn default_muse_model() -> String {
     "muse-spark-1.3-contributor".to_string()
 }
 
-fn default_grounding_endpoint() -> String {
-    "http://127.0.0.1:8791".to_string()
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct GroundingConfig {
-    /// "omniparser" (grounding-worker sidecar) | "off" | "fake".
-    #[serde(default = "default_grounding_backend")]
-    pub backend: String,
-    /// Sidecar base URL (POST {endpoint}/parse, GET {endpoint}/health).
-    #[serde(default = "default_grounding_endpoint")]
-    pub endpoint: String,
-    /// Minimum element confidence to offer to the brain (0-1000 scale
-    /// uses 0..1000 ints in JSON; stored here as 0..100 for TOML).
-    #[serde(default = "default_grounding_min_conf")]
-    pub min_conf: u32,
-}
-
-fn default_grounding_backend() -> String {
-    "off".to_string()
-}
-
-fn default_grounding_min_conf() -> u32 {
-    5
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DataConfig {
     pub dir: String,
+}
+
+fn default_cdp_endpoint() -> String {
+    "http://127.0.0.1:9222".to_string()
+}
+
+/// CDP connection to the VM's existing Chrome (google-chrome-stable with
+/// `--remote-debugging-port`). No Chromium install: chromiumoxide speaks
+/// CDP to any recent Chrome. `launch_if_missing` spawns the detected
+/// chrome binary headed (X11 :1, 1600x900) only when the endpoint refuses.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CdpConfig {
+    #[serde(default = "default_cdp_endpoint")]
+    pub endpoint: String,
+    #[serde(default)]
+    pub launch_if_missing: bool,
+    /// Override chrome binary auto-detect
+    /// (`google-chrome-stable` | `google-chrome` | `chromium-browser` | ...).
+    #[serde(default)]
+    pub chrome_binary: String,
+}
+
+impl Default for CdpConfig {
+    fn default() -> Self {
+        Self {
+            endpoint: default_cdp_endpoint(),
+            launch_if_missing: false,
+            chrome_binary: String::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -514,20 +536,13 @@ pub struct RoseConfig {
     pub server: ServerConfig,
     pub desktop: DesktopConfig,
     pub models: ModelsConfig,
+    // No grounding config: vision grounding is fixed — DOM/AX element
+    // list when the backend has one, numbered grid on the screenshot
+    // otherwise (and always under it). Nothing to tune, no raw mode.
     #[serde(default)]
-    pub grounding: GroundingConfig,
+    pub cdp: CdpConfig,
     pub policy: Policy,
     pub data: DataConfig,
-}
-
-impl Default for GroundingConfig {
-    fn default() -> Self {
-        Self {
-            backend: default_grounding_backend(),
-            endpoint: default_grounding_endpoint(),
-            min_conf: default_grounding_min_conf(),
-        }
-    }
 }
 
 impl Default for RoseConfig {
@@ -548,7 +563,7 @@ impl Default for RoseConfig {
                 endpoint: default_muse_endpoint(),
                 model: default_muse_model(),
             },
-            grounding: GroundingConfig::default(),
+            cdp: CdpConfig::default(),
             policy: Policy::default(),
             data: DataConfig {
                 dir: "~/.local/share/rose".to_string(),
