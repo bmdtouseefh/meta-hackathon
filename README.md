@@ -23,7 +23,7 @@ Rose is the alternative built for that case:
 
 **1. Rose drives (video → skill).** Record → Generate steps in Skill Studio (click a step to seek the video moment it came from) → correct, set `{{params}}`, approve gated steps → Run. Morning screening, invoice exports, folder triage — replay with new inputs.
 
-**2. Your agent drives (MCP).** Point any MCP client at the VM and it gets eyes and hands: screenshot, click/type/key/scroll/drag/wait, shell, plus `test.start`/`test.finish` so the Web UI shows exactly what the agent did, step by step.
+**2. Your agent drives (MCP).** Point any MCP client at the VM and it gets eyes and hands: screenshot, click/type/key/scroll/drag/wait, shell, plus `test.start`/`test.finish` so the Web UI shows exactly what the agent did, step by step. The agent can recursively improve itself mid-run: revise a learned skill via `skill.update`, and write its own helper scripts via `shell.exec` to replace slow GUI steps with fast deterministic checks.
 
 Both ride the same audited `act()` path: one atomic action at a time, Governor approval gates on irreversible steps, human Take Control / Hand Back lease at any moment, full trace persisted per run.
 
@@ -32,7 +32,11 @@ Both ride the same audited `act()` path: one atomic action at a time, Governor a
 Fresh Ubuntu Server (local VM or EC2):
 
 ```bash
-./deploy/setup.sh            # desktop, Chrome, rosed service, config
+./deploy/setup.sh            # OS deps once (sudo): desktop, Chrome, VNC
+# then install rosed from the GitHub release (user, no sudo)
+# grab rose_*_x86_64.tar.gz from https://github.com/bmdtouseefh/meta-hackathon/releases/latest, then:
+tar xzf rose_*_x86_64.tar.gz && cd rose-* && ./install.sh
+# or in one go from a checkout: ./deploy/setup.sh --tarball=dist/rose_*_x86_64.tar.gz
 ```
 
 Tunnel in (localhost-only is the security boundary — never expose the ports):
@@ -54,7 +58,8 @@ Then either type an instruction and hit Run, or record yourself doing the task w
 Update an existing VM:
 
 ```bash
-./deploy/deploy.sh <user@host>
+./deploy/deploy.sh <user@host>   # from a checkout: build, scp, install
+# or on the VM: download the newer rose_*_x86_64.tar.gz from Releases, then tar xzf + ./install.sh
 ```
 
 Offline dev (no X server, no API key):
@@ -71,7 +76,7 @@ cargo run -p rosed
   "url": "http://127.0.0.1:8787/mcp", "transport": "streamable-http" } } }
 ```
 
-Tool loop: `test.start` → `desktop.screenshot` (gridded — pass a cell like `g14,3` straight to the action tools) → act → `test.finish` with a verdict. `GET /mcp/tools` lists the catalog. `shell.exec` (30s timeout, destructive commands refused) launches the app under test. `GET /api/status` reports backend, brain, and MCP tool count.
+Tool loop: `test.start` → `desktop.screenshot` (gridded — pass a cell like `g14,3` straight to the action tools) → act → `test.finish` with a verdict. `GET /mcp/tools` lists the catalog. `shell.exec` (30s timeout, destructive commands refused) launches the app under test — and lets the agent leave behind scripts that shortcut the GUI next run (query a file/DB instead of reading a screen). `skill.update` lets it fold those shortcuts back into the skill, so replays get faster and more deterministic. `GET /api/status` reports backend, brain, and MCP tool count.
 
 ## The video → skill loop
 
