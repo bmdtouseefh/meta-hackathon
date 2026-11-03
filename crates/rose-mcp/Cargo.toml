@@ -1,0 +1,19 @@
+[package]
+name = "rose-mcp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+rose-core = { path = "../rose-core" }
+rose-grid = { path = "../rose-grid" }
+async-trait = "0.1"
+base64 = "0.22"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["process", "rt", "time"] }
+tracing = "0.1"
+
+[dev-dependencies]
+chrono = "0.4"
+tokio = { version = "1", features = ["macros", "rt"] }

@@ -1,15 +1,16 @@
 //! Constant reference grid overlay: the pixel-side grounding.
 //!
-//! A fixed 64x36 grid (columns at 1/64 of the width, rows at 1/36 of the
-//! height — 25x21 px cells on a 1600x762 frame) drawn on EVERY screenshot
+//! A fixed 67x39 grid (columns at 1/67 of the width, rows at 1/39 of the
+//! height — ~24x20 px cells on a 1600x762 frame) drawn on EVERY screenshot
 //! the brain sees — there is no raw path. Thin lines plus axis numbers
-//! only: column numbers 1..=64 along the top edge, row numbers 1..=36
-//! down the left edge. Tabs in all 2304 cell interiors bury the page
+//! only: column numbers 1..=67 along the top edge, row numbers 1..=39
+//! down the left edge. Tabs in all 2613 cell interiors would bury the page
 //! (price labels, toolbar, chart); numbers on the two axes do not, and
 //! they make every cell addressable: the brain picks a cell
 //! (`g<col>,<row>`, resolved via `cell_bounds`) and can aim inside it
 //! with a sub-cell fraction (`g<col>,<row>@fx,fy`) instead of
-//! wild-guessing coordinates. (64x36 replaces 32x18: cell-centre clicks
+//! wild-guessing coordinates. (67x39 replaces 64x36: finer cells pin
+//! small controls better. 64x36 replaced 32x18: cell-centre clicks
 //! on 50x42 px cells missed 15-25 px controls by up to a whole cell.)
 //!
 //! The grid is constant: same fractions every frame, every viewport.
@@ -17,33 +18,25 @@
 
 use rose_core::Rect;
 
-/// Grid columns (x). Lines sit at multiples of 1/64 of the frame width.
-pub const GRID_COLS: u32 = 64;
-/// Grid rows (y). Lines sit at multiples of 1/36 of the frame height.
-pub const GRID_ROWS: u32 = 36;
+/// Grid columns (x). Lines sit at multiples of 1/67 of the frame width.
+pub const GRID_COLS: u32 = 67;
+/// Grid rows (y). Lines sit at multiples of 1/39 of the frame height.
+pub const GRID_ROWS: u32 = 39;
 
 /// Bounds of cell `(col, row)` (0-based) in a `width`x`height` frame.
-/// Cells tile the frame exactly: the last column/row absorb any remainder
-/// pixels. Pure geometry — the contract the brain relies on when it reads
+/// Cells tile the frame with fractional edges (`col*w/COLS`), so the
+/// drawn grid lines and these bounds always agree and neighbouring cells
+/// differ by at most 1 px; the last column/row absorb any remainder.
+/// Pure geometry — the contract the brain relies on when it reads
 /// coordinates off the lines.
 pub fn cell_bounds(col: u32, row: u32, width: u32, height: u32) -> Option<Rect> {
     if col >= GRID_COLS || row >= GRID_ROWS || width == 0 || height == 0 {
         return None;
     }
-    let cw = width / GRID_COLS;
-    let ch = height / GRID_ROWS;
-    let x = col * cw;
-    let y = row * ch;
-    let w = if col + 1 == GRID_COLS {
-        width.saturating_sub(x)
-    } else {
-        cw
-    };
-    let h = if row + 1 == GRID_ROWS {
-        height.saturating_sub(y)
-    } else {
-        ch
-    };
+    let x = col * width / GRID_COLS;
+    let y = row * height / GRID_ROWS;
+    let w = (col + 1) * width / GRID_COLS - x;
+    let h = (row + 1) * height / GRID_ROWS - y;
     if w < 2 || h < 2 {
         return None;
     }
@@ -55,9 +48,19 @@ pub fn cell_bounds(col: u32, row: u32, width: u32, height: u32) -> Option<Rect> 
     })
 }
 
-/// 5x7 bitmap digits (rows top-to-bottom, 5 bits each) drawn at 1x —
-/// small single-pixel strokes, not the old scaled-up 3x5 blocks. The
-/// only glyphs the axis labels need; hand-rolled, no font deps.
+/// Axis label font: Liberation Sans Bold, embedded (see `fonts/README.md`).
+/// Metric-compatible with Arial Bold, so the labels read as Arial to
+/// both humans and OCR — the old hand-drawn 5x7 bitmaps were legible to
+/// the model up close but hostile to OCR. Rendered at LABEL_PX with
+/// antialiased coverage over the black tab.
+const FONT_BYTES: &[u8] = include_bytes!("../fonts/LiberationSans-Bold.ttf");
+/// Label cap size in px. Two digits ("67") span ~15 px — fits a ~23 px
+/// cell with the tab padding, and stays inside the axis bands.
+const LABEL_PX: f32 = 13.0;
+
+/// 5x7 bitmap digits (rows top-to-bottom, 5 bits each), legacy fallback.
+/// Used only if the embedded font fails to parse (never expected — the
+/// bytes are fixed at compile time); keeps labels total, not silent.
 const DIGITS: [[u8; 7]; 10] = [
     [
         0b01110, 0b10001, 0b10011, 0b10101, 0b11001, 0b10001, 0b01110,
@@ -96,8 +99,77 @@ const DIGIT_H: u32 = 7;
 const DIGIT_ADV: u32 = 7;
 
 /// Draw `n` at (`x`,`y`) over a black tab so the number reads on light
-/// and dark pages alike.
+/// and dark pages alike. Vector path first (Arial-metric glyphs, OCR
+/// friendly); bitmap fallback if the embedded font ever fails to parse.
 fn draw_label(img: &mut image::RgbImage, x: u32, y: u32, n: u32) {
+    if draw_vector_label(img, x, y, n) {
+        return;
+    }
+    draw_bitmap_label(img, x, y, n);
+}
+
+fn draw_vector_label(img: &mut image::RgbImage, x: u32, y: u32, n: u32) -> bool {
+    use ab_glyph::{Font, FontRef, Glyph, PxScale, ScaleFont};
+    use image::Rgb;
+    static FONT: std::sync::OnceLock<Option<FontRef<'static>>> = std::sync::OnceLock::new();
+    let Some(font) = FONT
+        .get_or_init(|| FontRef::try_from_slice(FONT_BYTES).ok())
+        .as_ref()
+    else {
+        return false;
+    };
+    // Manual shaping (digits need no kerning): pen across the baseline,
+    // union the raster bounds, then shift top-left onto (x, y).
+    let text = n.to_string();
+    let scaled = font.as_scaled(PxScale::from(LABEL_PX));
+    let mut pen_x = 0.0f32;
+    let mut pixels: Vec<(i32, i32, u8)> = Vec::new();
+    let (mut min_x, mut min_y, mut max_x, mut max_y) = (i32::MAX, i32::MAX, i32::MIN, i32::MIN);
+    for ch in text.chars() {
+        let id = font.glyph_id(ch);
+        let glyph = Glyph {
+            id,
+            scale: PxScale::from(LABEL_PX),
+            position: ab_glyph::point(pen_x, scaled.ascent()),
+        };
+        pen_x += scaled.h_advance(id);
+        let Some(outline) = font.outline_glyph(glyph) else {
+            continue;
+        };
+        let bounds = outline.px_bounds();
+        let (bx, by) = (bounds.min.x.floor() as i32, bounds.min.y.floor() as i32);
+        outline.draw(|dx, dy, coverage| {
+            let gx = bx + dx as i32;
+            let gy = by + dy as i32;
+            min_x = min_x.min(gx);
+            min_y = min_y.min(gy);
+            max_x = max_x.max(gx);
+            max_y = max_y.max(gy);
+            pixels.push((gx, gy, (coverage * 255.0).round().clamp(0.0, 255.0) as u8));
+        });
+    }
+    if pixels.is_empty() || min_x > max_x {
+        return false;
+    }
+    let (w, h) = (img.width() as i32, img.height() as i32);
+    let (ox, oy) = (x as i32 - min_x, y as i32 - min_y);
+    for ty in (y as i32 - 1)..=(max_y + oy + 1) {
+        for tx in (x as i32 - 1)..=(max_x + ox + 1) {
+            if tx >= 0 && ty >= 0 && tx < w && ty < h {
+                img.put_pixel(tx as u32, ty as u32, Rgb([0, 0, 0]));
+            }
+        }
+    }
+    for (gx, gy, v) in pixels {
+        let (px, py) = (gx + ox, gy + oy);
+        if px >= 0 && py >= 0 && px < w && py < h {
+            img.put_pixel(px as u32, py as u32, Rgb([v, v, v]));
+        }
+    }
+    true
+}
+
+fn draw_bitmap_label(img: &mut image::RgbImage, x: u32, y: u32, n: u32) {
     use image::Rgb;
     let (w, h) = (img.width(), img.height());
     let lw = (if n >= 10 { 2 } else { 1 }) * DIGIT_ADV - (DIGIT_ADV - DIGIT_W);
@@ -152,7 +224,7 @@ pub fn grid_cell_of(raw: &str) -> Option<(u32, u32)> {
 /// Resolve a grid-cell pick to a pixel in a `width`x`height` frame (the
 /// Stepper's click point). Plain `g<col>,<row>` clicks the cell centre;
 /// `g<col>,<row>@fx,fy` (fractions 0..=1 across/down the cell) aims
-/// inside the cell — a 25x21 px cell still swallows a toolbar icon
+/// inside the cell — a ~24x20 px cell still swallows a toolbar icon
 /// whole, and the fraction is what pins it. A malformed fraction is
 /// `None` (replan), never a silent centre click.
 pub fn resolve_grid_cell(raw: &str, width: u32, height: u32) -> Option<(u32, u32)> {
@@ -180,7 +252,7 @@ pub fn resolve_grid_cell(raw: &str, width: u32, height: u32) -> Option<(u32, u32
 }
 
 /// Draw the constant grid onto a copy of `frame_jpeg`: thin lines plus
-/// axis numbers (columns 1..=64 across the top, rows 1..=36 down the
+/// axis numbers (columns 1..=67 across the top, rows 1..=39 down the
 /// left). Cell interiors stay clean. Returns JPEG quality 85, same as
 /// captures.
 pub fn annotate_grid_jpeg(frame_jpeg: &[u8]) -> std::result::Result<Vec<u8>, String> {
@@ -246,41 +318,41 @@ mod tests {
 
     #[test]
     fn grid_geometry_is_constant() {
-        // 25px cells at server geometry, tiling exactly.
+        // ~23 px cells at server geometry, tiling exactly.
         assert_eq!(
             cell_bounds(0, 0, 1600, 900),
             Some(Rect {
                 x: 0,
                 y: 0,
-                width: 25,
-                height: 25
+                width: 23,
+                height: 23
             })
         );
         assert_eq!(
-            cell_bounds(63, 35, 1600, 900),
+            cell_bounds(66, 38, 1600, 900),
             Some(Rect {
-                x: 1575,
-                y: 875,
-                width: 25,
-                height: 25
+                x: 1576,
+                y: 876,
+                width: 24,
+                height: 24
             })
         );
         // Out of range.
-        assert_eq!(cell_bounds(64, 0, 1600, 900), None);
-        assert_eq!(cell_bounds(0, 36, 1600, 900), None);
+        assert_eq!(cell_bounds(67, 0, 1600, 900), None);
+        assert_eq!(cell_bounds(0, 39, 1600, 900), None);
         assert_eq!(cell_bounds(0, 0, 0, 900), None);
     }
 
     #[test]
     fn grid_scales_but_fractions_hold() {
         // CDP viewport: cells shrink, tiling stays exact, no gaps.
-        let last = cell_bounds(63, 35, 1600, 762).expect("cell");
+        let last = cell_bounds(66, 38, 1600, 762).expect("cell");
         assert_eq!(last.x + last.width, 1600);
         assert_eq!(last.y + last.height, 762);
-        // Same fractions regardless of size: col 11 starts at 11/64 width.
+        // Same fractions regardless of size: col 11 starts at 11/67 width.
         let c = cell_bounds(11, 4, 1600, 762).expect("cell");
-        assert_eq!(c.x, 11 * (1600 / 64));
-        assert_eq!(c.y, 4 * (762 / 36));
+        assert_eq!(c.x, 11 * 1600 / 67);
+        assert_eq!(c.y, 4 * 762 / 39);
     }
 
     #[test]
@@ -298,9 +370,9 @@ mod tests {
                 .expect("decode")
                 .to_rgb8();
         assert_eq!((back.width(), back.height()), (800, 450));
-        // Grid line present at first column edge (x = 800/64 = 12).
+        // Grid line present at first column edge (x = 800/67 = 11).
         let lined = (0..450).any(|y| {
-            let p = back.get_pixel(12, y);
+            let p = back.get_pixel(11, y);
             p[0] > 100 && p[1] < 80 && p[2] < 80
         });
         assert!(lined, "grid line drawn");
@@ -313,16 +385,16 @@ mod tests {
             })
         });
         assert!(!tabbed, "numbers on the axes only, never in cell interiors");
-        // Axis numbers ARE drawn small (5x7 digits): near-white pixels
-        // inside the top band (first row, y 2..9) and the left band.
+        // Axis numbers ARE drawn (Arial-metric vector labels, ~13 px):
+        // near-white pixels inside the top band and the left band.
         let top_numbered = (0..800).any(|x| {
-            (2..9).any(|y| {
+            (2..18).any(|y| {
                 let p = back.get_pixel(x, y);
                 p[0] > 200 && p[1] > 200 && p[2] > 200
             })
         });
         assert!(top_numbered, "column numbers along the top");
-        let left_numbered = (2..16).any(|x| {
+        let left_numbered = (2..24).any(|x| {
             (0..450).any(|y| {
                 let p = back.get_pixel(x, y);
                 p[0] > 200 && p[1] > 200 && p[2] > 200
@@ -336,9 +408,9 @@ mod tests {
         assert_eq!(grid_cell_of("g14,3"), Some((14, 3)));
         assert_eq!(grid_cell_of("g1x18"), Some((1, 18)));
         assert_eq!(grid_cell_of("14,3"), Some((14, 3)));
-        assert_eq!(grid_cell_of("g64,36"), Some((64, 36)));
-        assert_eq!(grid_cell_of("g65,3"), None);
-        assert_eq!(grid_cell_of("g14,37"), None);
+        assert_eq!(grid_cell_of("g67,39"), Some((67, 39)));
+        assert_eq!(grid_cell_of("g68,3"), None);
+        assert_eq!(grid_cell_of("g14,40"), None);
         assert_eq!(grid_cell_of("g0,3"), None);
         assert_eq!(grid_cell_of("7"), None);
         assert_eq!(grid_cell_of("e-7"), None);
@@ -347,20 +419,20 @@ mod tests {
 
     #[test]
     fn grid_cells_resolve_centre_and_subcell() {
-        // 1600x762 frame: cells 25x21 (last row taller).
-        // Centre of cell (1,1): (12, 10).
-        assert_eq!(resolve_grid_cell("g1,1", 1600, 762), Some((12, 10)));
-        // Sub-cell aim: cell (3,7) spans x 50..75, y 126..147;
+        // 1600x762 frame: cells ~24x20.
+        // Centre of cell (1,1): (11, 9).
+        assert_eq!(resolve_grid_cell("g1,1", 1600, 762), Some((11, 9)));
+        // Sub-cell aim: cell (3,7) spans x 47..71, y 117..136;
         // @0,1 is its bottom-left inner corner.
-        assert_eq!(resolve_grid_cell("g3,7@0,1", 1600, 762), Some((50, 146)));
+        assert_eq!(resolve_grid_cell("g3,7@0,1", 1600, 762), Some((47, 135)));
         assert_eq!(
             resolve_grid_cell("g3,7@0.5,0.5", 1600, 762),
-            Some((62, 136))
+            Some((59, 126))
         );
         // Malformed fractions replan, never silently centre-click.
         assert_eq!(resolve_grid_cell("g3,7@2,0", 1600, 762), None);
         assert_eq!(resolve_grid_cell("g3,7@0.5", 1600, 762), None);
         assert_eq!(resolve_grid_cell("g3,7@a,b", 1600, 762), None);
-        assert_eq!(resolve_grid_cell("g65,7", 1600, 762), None);
+        assert_eq!(resolve_grid_cell("g68,7", 1600, 762), None);
     }
 }

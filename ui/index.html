@@ -2,14 +2,19 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>Rose — VM agent</title>
 <script src="https://cdn.tailwindcss.com"></script>
 <script>
-  tailwind.config = { darkMode: 'class' };
-  const theme = localStorage.getItem('rose-theme')
-    || (matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light');
-  if (theme === 'dark') document.documentElement.classList.add('dark');
+  // Tailwind is a CDN convenience only: if it ever fails to load (offline
+  // mobile browser, content blocker), the page must still work — the
+  // drawer/backdrop/controls below depend only on style.css + this script.
+  try { tailwind.config = { darkMode: 'class' }; } catch (e) {}
+  try {
+    const theme = localStorage.getItem('rose-theme')
+      || (matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light');
+    if (theme === 'dark') document.documentElement.classList.add('dark');
+  } catch (e) {}
   function toggleTheme() {
     const dark = document.documentElement.classList.toggle('dark');
     localStorage.setItem('rose-theme', dark ? 'dark' : 'light');
@@ -27,9 +32,31 @@
     }
   }
   function toggleRuns() {
-    // Rail mode: sidebar collapses to a slim strip, the ☰ stays exactly
-    // where it was (top-left, above New chat). Nothing unmounts.
+  // Desktop: rail mode collapses the sidebar to a slim strip.
+  // Mobile: the sidebar is a drawer, rail would just hide New chat —
+  // so the inner menu button closes the drawer instead. Nothing unmounts.
+    const sb = document.getElementById('chat-sidebar');
+    if (matchMedia('(max-width: 767px)').matches && sb && sb.classList.contains('mobile-open')) {
+      toggleSidebarMobile(false);
+      return;
+    }
     document.getElementById('chat-sidebar').classList.toggle('rail');
+  }
+  // Mobile (<768px): the chat-history sidebar is an off-canvas drawer,
+  // not a flex column — chat keeps the full width. Desktop is unaffected.
+  // Rail is desktop-only: opening the drawer always clears it, so New chat
+  // can never be hidden on mobile. Backdrop visibility is derived from the
+  // drawer state, never toggled independently, so it can't get stuck.
+  function toggleSidebarMobile(open) {
+    const sb = document.getElementById('chat-sidebar');
+    const bd = document.getElementById('sidebar-backdrop');
+    const btn = document.getElementById('hamburger');
+    if (!sb) return;
+    const willOpen = open !== undefined ? open : !sb.classList.contains('mobile-open');
+    sb.classList.toggle('mobile-open', willOpen);
+    sb.classList.toggle('rail', false);
+    if (bd) bd.classList.toggle('hidden', !willOpen);
+    if (btn) btn.setAttribute('aria-expanded', String(willOpen));
   }
 </script>
 <link rel="stylesheet" href="/style.css">
@@ -38,6 +65,7 @@
 
 <header class="z-10 flex-none border-b py-2" style="border-color:var(--line);background:var(--card)">
   <div class="flex w-full flex-wrap items-center gap-2 px-2">
+    <button id="hamburger" onclick="toggleSidebarMobile()" class="btn-ghost rounded-lg px-2.5 py-1.5 md:hidden" title="Chat history" aria-label="Toggle chat history" aria-expanded="false" aria-controls="chat-sidebar"><svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16M4 12h16M4 17h16"/></svg></button>
     <span class="t-display">Rose</span>
     <span id="status-pill" aria-hidden="true" class="flex items-center gap-2 rounded-full border px-3 py-1" style="display:none;border-color:var(--line)">
       <span id="status-dot" class="inline-block size-2 rounded-full bg-neutral-400"></span>
@@ -45,7 +73,7 @@
     </span>
     <span class="flex-1"></span>
     <span id="backend-text" class="muted t-caption hidden sm:block"></span>
-    <button onclick="toggleTheme()" class="btn-ghost rounded-lg px-2.5 py-1.5" title="toggle light/dark">◐</button>
+    <button onclick="toggleTheme()" class="btn-ghost rounded-lg px-2.5 py-1.5" title="toggle light/dark"><svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="8"/><path d="M12 4a8 8 0 0 1 0 16z" fill="currentColor" stroke="none"/></svg></button>
     <button onclick="toggleSetup(true)" class="btn-ghost rounded-lg px-3 py-1.5" title="Setup: API keys &amp; brain">Setup</button>
     <button onclick="toggleDesktop()" class="btn-ghost rounded-lg px-3 py-1.5" title="Show or hide the live desktop preview (right panel, view-only)">Desktop</button>
     <button id="stop" onclick="stopRun()" disabled title="Stop the current run at its next checkpoint" class="rounded-lg bg-red-600 px-3.5 py-1.5 font-semibold text-white disabled:opacity-40">Stop</button>
@@ -53,20 +81,23 @@
 </header>
 
 <!-- setup modal: keys (memory-only) + config management (GET/PUT /api/config when backend supports it) -->
-<div id="setup-modal" class="hidden fixed inset-0 z-20 flex items-center justify-center p-4 bg-black/50">
-  <div class="card w-full max-w-[min(36rem,96%)] max-h-[92vh] overflow-y-auto thin-scroll rounded-xl p-6">
+<div id="setup-modal" class="hidden fixed inset-0 z-20 flex items-center justify-center p-2 sm:p-4 bg-black/50">
+  <div class="card w-full max-w-[min(36rem,96%)] max-h-[92vh] overflow-y-auto thin-scroll rounded-xl p-4 sm:p-6">
     <h2 class="t-display">Setup</h2>
     <p class="muted mt-1 text-xs">Keys live in server memory for this session only — never written to disk, logs, or traces.</p>
     <div class="mt-3 flex gap-2" role="tablist">
       <button id="tab-keys" onclick="setupTab('keys')" class="btn-accent t-caption rounded-lg px-3 py-1.5 font-semibold">Keys</button>
       <button id="tab-config" onclick="setupTab('config')" class="btn-ghost t-caption rounded-lg px-3 py-1.5 font-semibold">Config</button>
       <span class="flex-1"></span>
-      <span id="config-dirty" class="hidden t-caption font-semibold text-amber-600">● unsaved</span>
+      <span id="config-dirty" class="hidden t-caption font-semibold text-amber-600"><span class="inline-block w-2 h-2 rounded-full bg-amber-500 mr-1" aria-hidden="true"></span>unsaved</span>
     </div>
     <div id="pane-keys">
       <label class="t-title mt-4 block text-sm" for="api-key">Muse API key</label>
       <input id="api-key" type="password" autocomplete="off" placeholder="sk-…" class="mt-1 w-full rounded-lg border bg-transparent px-3 py-2 text-sm outline-none" style="border-color:var(--line)">
       <div class="mt-1.5 text-xs"><span id="key-state" class="font-semibold text-red-500">missing</span> <span class="muted">· brain: <span class="font-semibold">muse</span> (fake needs no key)</span></div>
+      <label class="t-title mt-4 block text-sm" for="video-api-key">Video API key <span class="muted font-normal">(optional — empty = same as Muse key)</span></label>
+      <input id="video-api-key" type="password" autocomplete="off" placeholder="empty = same as Muse key" class="mt-1 w-full rounded-lg border bg-transparent px-3 py-2 text-sm outline-none" style="border-color:var(--line)">
+      <div class="mt-1.5 text-xs"><span id="video-key-state" class="font-semibold text-red-500">missing</span> <span class="muted">· video → instructions (falls back to the Muse key)</span></div>
       <div class="mt-4 flex flex-wrap justify-end gap-2">
         <button onclick="clearKey()" class="btn-ghost rounded-lg px-4 py-2 font-semibold">Clear</button>
         <button onclick="toggleSetup(false)" class="btn-ghost rounded-lg px-4 py-2 font-semibold">Cancel</button>
@@ -86,32 +117,41 @@
           <label class="t-caption flex items-center gap-2"><input id="cfg-allow-remote" type="checkbox" oninput="markDirty()"> allow_remote <span class="muted">(refuse 0.0.0.0 unless checked)</span></label>
         </div>
       </details>
-      <details open class="card mt-2 rounded-xl"><summary class="t-title cursor-pointer px-3 py-2">Desktop &amp; browser (CDP)</summary>
+      <details open class="card mt-2 rounded-xl"><summary class="t-title cursor-pointer px-3 py-2">Desktop</summary>
         <div class="grid gap-2 px-3 pb-3">
-          <div class="grid grid-cols-2 gap-2">
-            <label class="t-caption">Backend<select id="cfg-backend" onchange="markDirty()" class="cfg-input mt-1"><option value="auto" selected>auto (X11 + CDP when Chrome frontmost)</option><option value="x11">x11 (full desktop)</option><option value="cdp">cdp (browser tabs only)</option><option value="fake">fake (offline dev)</option></select></label>
+          <div class="grid grid-cols-1 sm:grid-cols-2 gap-2">
+            <label class="t-caption">Backend<select id="cfg-backend" onchange="markDirty()" class="cfg-input mt-1"><option value="x11" selected>x11 (full desktop, grid clicking)</option><option value="fake">fake (offline dev)</option></select></label>
             <label class="t-caption">Display<input id="cfg-display" value=":1" oninput="markDirty()" class="cfg-input mt-1 font-mono"></label>
           </div>
-          <div class="grid grid-cols-2 gap-2">
+          <div class="grid grid-cols-1 sm:grid-cols-2 gap-2">
             <label class="t-caption">Width<input id="cfg-width" type="number" value="1600" oninput="markDirty()" class="cfg-input mt-1 font-mono"></label>
             <label class="t-caption">Height<input id="cfg-height" type="number" value="900" oninput="markDirty()" class="cfg-input mt-1 font-mono"></label>
           </div>
-          <label class="t-caption">CDP endpoint<input id="cfg-cdp" value="http://127.0.0.1:9222" oninput="markDirty()" class="cfg-input mt-1 font-mono"></label>
-          <label class="t-caption flex items-center gap-2"><input id="cfg-launch" type="checkbox" oninput="markDirty()"> launch_if_missing</label>
         </div>
       </details>
-      <details open class="card mt-2 rounded-xl"><summary class="t-title cursor-pointer px-3 py-2">Brain (models)</summary>
+      <details open class="card mt-2 rounded-xl"><summary class="t-title cursor-pointer px-3 py-2">Brain model</summary>
         <div class="grid gap-2 px-3 pb-3">
-          <div class="grid grid-cols-2 gap-2">
+          <div class="grid grid-cols-1 sm:grid-cols-2 gap-2">
             <label class="t-caption">Brain<select id="cfg-brain" onchange="markDirty()" class="cfg-input mt-1"><option value="muse" selected>muse (needs key)</option><option value="fake">fake (no key)</option></select></label>
             <label class="t-caption">Model<input id="cfg-model" value="muse-spark-1.3-contributor" oninput="markDirty()" class="cfg-input mt-1 font-mono"></label>
           </div>
-          <label class="t-caption">Endpoint<input id="cfg-endpoint" value="https://api.meta.ai/v1" oninput="markDirty()" class="cfg-input mt-1 font-mono"></label>
-          <div id="brain-note" class="muted t-caption">muse brain reads the key from Setup → Keys or <span class="font-mono">ROSE_MUSE_API_KEY</span>.</div>
+          <label class="t-caption">Base URL (Meta default, any OpenAI-compatible works)<input id="cfg-endpoint" value="https://api.meta.ai/v1" placeholder="https://api.meta.ai/v1" oninput="markDirty()" class="cfg-input mt-1 font-mono"></label>
+          <div id="brain-note" class="muted t-caption">muse brain reads the key from Setup → Keys or <span class="font-mono">ROSE_MUSE_API_KEY</span>. Override the base URL with <span class="font-mono">ROSE_MODELS_ENDPOINT</span> / <span class="font-mono">OPENAI_BASE_URL</span> or here (also accepts <span class="font-mono">base_url</span> in TOML).</div>
+        </div>
+      </details>
+      <details open class="card mt-2 rounded-xl"><summary class="t-title cursor-pointer px-3 py-2">Video model — video → instructions</summary>
+        <div class="grid gap-2 px-3 pb-3">
+          <label class="t-caption">Model<input id="cfg-video-model" value="" placeholder="same as Brain model" oninput="markDirty()" class="cfg-input mt-1 font-mono"></label>
+          <label class="t-caption">Base URL<input id="cfg-video-endpoint" value="" placeholder="same as Brain base URL" oninput="markDirty()" class="cfg-input mt-1 font-mono"></label>
+          <div class="flex flex-wrap items-center gap-2">
+            <button onclick="useSameModelAsBrain()" class="btn-ghost t-caption rounded-lg px-3 py-1.5 font-semibold" title="Copy the Brain model + base URL into the Video fields">Same as Brain</button>
+            <span class="muted t-caption">Empty = follow Brain. Set both to pin video to another provider (needs its key in Setup → Keys).</span>
+          </div>
+          <div id="video-note" class="muted t-caption">Pins video drafting with <span class="font-mono">ROSE_MODELS_VIDEO_MODEL</span> / <span class="font-mono">ROSE_MODELS_VIDEO_ENDPOINT</span> or the fields above. Empty follows the Brain settings.</div>
         </div>
       </details>
       <details open class="card mt-2 rounded-xl"><summary class="t-title cursor-pointer px-3 py-2">Policy (Governor)</summary>
-        <div class="grid grid-cols-3 gap-2 px-3 pb-3">
+        <div class="grid grid-cols-1 sm:grid-cols-3 gap-2 px-3 pb-3">
           <label class="t-caption">max_steps<input id="cfg-steps" type="number" value="40" min="1" max="200" oninput="markDirty()" class="cfg-input mt-1 font-mono"></label>
           <label class="t-caption">max_minutes<input id="cfg-minutes" type="number" value="15" min="1" max="120" oninput="markDirty()" class="cfg-input mt-1 font-mono"></label>
           <label class="t-caption">max_model_calls<input id="cfg-calls" type="number" value="60" min="1" max="500" oninput="markDirty()" class="cfg-input mt-1 font-mono"></label>
@@ -130,13 +170,57 @@
   </div>
 </div>
 
+<!-- skill doc modal: markdown doc + per-step video snips -->
+<div id="skill-doc-modal" class="hidden fixed inset-0 z-20 flex items-center justify-center p-2 sm:p-4 bg-black/50">
+  <div class="card w-full max-w-[min(44rem,96%)] max-h-[92vh] overflow-y-auto thin-scroll rounded-xl p-4 sm:p-6">
+    <div class="flex items-center gap-2">
+      <h2 id="skill-doc-title" class="t-display flex-1 truncate">Skill</h2>
+        <button onclick="copySkillDoc()" class="btn-ghost t-caption rounded-lg px-3 py-1.5" title="Copy markdown to clipboard"><svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15V6a2 2 0 0 1 2-2h9"/></svg> Copy</button>
+      <button onclick="editSkillDoc()" class="btn-ghost t-caption rounded-lg px-3 py-1.5" title="Edit skill name and instructions">Edit</button>
+      <button onclick="toggleSkillDoc(false)" class="btn-ghost rounded-lg px-4 py-2 font-semibold">Close</button>
+    </div>
+    <div id="skill-doc-body" class="mt-3 flex flex-col gap-4"></div>
+    <div id="skill-doc-edit" class="mt-3 hidden flex-col gap-2">
+      <label class="muted t-caption" for="skill-doc-name">Skill name</label>
+      <input id="skill-doc-name" class="cfg-input t-caption">
+      <label class="muted t-caption" for="skill-doc-text">Instructions (skill doc)</label>
+      <textarea id="skill-doc-text" rows="10" class="cfg-input t-caption mt-1 font-mono"></textarea>
+      <div class="flex flex-wrap items-center gap-2">
+        <button onclick="saveSkillDoc()" class="btn-accent t-caption rounded-lg px-3 py-1.5 font-semibold">Save</button>
+        <button onclick="cancelSkillDocEdit()" class="btn-ghost t-caption rounded-lg px-3 py-1.5">Cancel</button>
+        <span id="skill-doc-msg" class="muted t-caption"></span>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- maximized live desktop: the same #frame node docks here for detail,
+     so there is no second fetch and Take Control keeps working -->
+<div id="frame-modal" class="hidden fixed inset-0 z-40 items-center justify-center p-2 sm:p-4 bg-black/70" onclick="if(event.target===this)toggleFrameModal(false)">
+  <div class="card flex max-h-[96vh] w-full max-w-[min(110rem,98%)] flex-col overflow-hidden rounded-xl p-3 sm:p-4">
+    <div class="flex items-center gap-2 pb-2">
+      <span class="t-title flex-1">Live desktop <span id="display-name-max" class="muted text-xs font-medium"></span></span>
+      <span id="control-badge-max" class="rounded bg-red-600 px-2 py-0.5 text-xs font-semibold text-white">VIEW-ONLY</span>
+      <button id="take-control-max" onclick="toggleControl()" class="btn-ghost rounded-lg px-3 py-1.5 font-semibold">Take Control</button>
+      <button onclick="toggleFrameModal(false)" class="btn-ghost rounded-lg px-4 py-2 font-semibold" title="Close (Esc)">Close</button>
+    </div>
+    <div id="frame-max-slot" class="thin-scroll flex min-h-0 flex-1 items-center justify-center overflow-auto rounded-lg border bg-black" style="border-color:var(--line)">
+      <div id="frame-max-note" class="muted p-4 text-center text-xs">waiting for backend frames…</div>
+    </div>
+    <p class="muted mt-2 text-xs">Same live view, enlarged — Take Control works here too: click to click, double-click to double-click, wheel to scroll.</p>
+  </div>
+</div>
+
+<!-- mobile drawer backdrop (only shown when the history drawer is open) -->
+<div id="sidebar-backdrop" class="hidden fixed inset-0 z-30 bg-black/50 md:hidden" onclick="toggleSidebarMobile(false)"></div>
+
 <!-- app shell: full-bleed, fixed height, only #thread scrolls the story -->
 <div class="z-10 flex min-h-0 w-full flex-1 gap-px overflow-hidden" style="background:var(--line)">
-  <!-- chat history sidebar: slim rail, ☰ stays top-left above New chat -->
+  <!-- chat history sidebar: slim rail, menu icon stays top-left above New chat -->
   <aside id="chat-sidebar" class="card flex w-[clamp(12rem,15%,16rem)] flex-none flex-col overflow-hidden rounded-none min-h-0" style="border:0">
     <div class="rail-top flex-none p-3">
       <div class="flex items-center">
-        <button onclick="toggleRuns()" title="Collapse chat history" class="btn-ghost rounded-lg px-2.5 py-1.5">☰</button>
+        <button onclick="toggleRuns()" title="Collapse chat history" class="btn-ghost rounded-lg px-2.5 py-1.5"><svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16M4 12h16M4 17h16"/></svg></button>
       </div>
       <button onclick="newChat()" title="Start a new chat"
         class="rail-hide btn-accent mt-2 w-full rounded-lg px-3 py-2 text-sm font-semibold">New chat</button>
@@ -151,34 +235,37 @@
 
   <!-- conversation: equal half with the desktop panel, layout-contained -->
   <main class="card flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden rounded-none" style="border:0;contain:layout style">
-    <div class="flex-none border-b px-5 py-4" style="border-color:var(--line)">
+    <div class="flex-none border-b px-3 py-3 sm:px-5 sm:py-4" style="border-color:var(--line)">
       <div class="mx-auto w-full max-w-[42rem]">
         <div class="t-title">What should Rose do?</div>
-        <div class="muted text-sm">Type a goal below and hit Enter. Rose narrates each step here and pauses for approval before anything irreversible.</div>
+        <div class="muted hidden text-sm sm:block">Type a goal below and hit Enter. Rose narrates each step here and pauses for approval before anything irreversible.</div>
       </div>
     </div>
 
     <!-- THE scroll area: fixed 42rem measure, centered -->
-    <div id="thread" class="thin-scroll mx-auto flex min-h-0 w-full max-w-[42rem] flex-1 flex-col gap-4 overflow-y-auto px-4 py-6">
+    <div id="thread" class="thin-scroll mx-auto flex min-h-0 w-full max-w-[42rem] flex-1 flex-col gap-4 overflow-y-auto px-3 py-4 sm:px-4 sm:py-6">
       <div id="live-tail" class="contents"></div>
     </div>
 
     <!-- composer: the primary control, fixed -->
-    <div class="flex-none border-t px-5 py-4" style="border-color:var(--line)">
+    <div class="composer-wrap flex-none border-t px-3 py-3 sm:px-5 sm:py-4" style="border-color:var(--line)">
       <div class="mx-auto flex w-full max-w-[42rem] items-end gap-2 rounded-xl border px-3 py-2" style="border-color:var(--line);background:var(--bg)">
         <textarea id="composer" rows="2" placeholder="Tell Rose what to do…" class="max-h-[30vh] min-h-[2.75rem] w-full flex-1 resize-none bg-transparent text-sm outline-none placeholder:opacity-60"></textarea>
-        <button class="btn-ghost rounded-full px-2.5 py-1.5 text-xs" disabled title="Voice arrives in Phase 2">🎙</button>
-        <button onclick="send()" class="btn-accent flex-none rounded-lg px-5 py-2 font-semibold">Run</button>
+        <button class="btn-ghost rounded-full px-2.5 py-1.5 text-xs" disabled title="Voice arrives in Phase 2"><svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><rect x="9" y="3" width="6" height="11" rx="3"/><path d="M6 11a6 6 0 0 0 12 0M12 17v4"/></svg></button>
+        <button onclick="send()" class="btn-accent flex-none rounded-lg px-4 py-2 font-semibold sm:px-5">Run</button>
       </div>
-      <div id="queue-note" class="muted mx-auto mt-1.5 w-full max-w-[42rem] text-xs">Rose replies with a short summary when a run ends. Step-by-step feedback streams live under Details in the run card — minimize it any time, or expand it later to inspect a run.</div>
+      <div id="queue-note" class="muted mx-auto mt-1.5 hidden w-full max-w-[42rem] text-xs sm:block">Rose replies with a short summary when a run ends. Step-by-step feedback streams live under Details in the run card — minimize it any time, or expand it later to inspect a run.</div>
     </div>
   </main>
 
   <!-- desktop: equal half with the chat, live view + takeover input -->
-  <aside id="desk-panel" class="card flex min-h-0 min-w-0 flex-1 flex-col overflow-y-auto rounded-none p-5" style="border:0;contain:layout style">
-    <div class="mb-2 flex items-center justify-between">
+  <aside id="desk-panel" class="card flex min-h-0 min-w-0 flex-1 flex-col overflow-y-auto rounded-none p-3 sm:p-5" style="border:0;contain:layout style">
+    <div class="mb-2 flex items-center justify-between gap-2">
       <span class="t-title">Live desktop <span id="display-name" class="muted text-xs font-medium"></span></span>
+      <span class="flex-1"></span>
+      <button onclick="toggleFrameModal(true)" class="btn-ghost rounded-lg px-3 py-1.5" title="Enlarge the live desktop in a popup for detail"><svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M9 4H4v5M15 4h5v5M9 20H4v-5M15 20h5v-5"/></svg> Maximize</button>
       <span id="control-badge" class="rounded bg-red-600 px-2 py-0.5 text-xs font-semibold text-white">VIEW-ONLY</span>
+      <button onclick="toggleDesktop()" class="btn-ghost rounded-lg px-3 py-1.5 md:hidden" title="Close desktop panel">Close</button>
     </div>
     <div class="overflow-hidden rounded-lg border bg-black" style="border-color:var(--line)">
       <img id="frame" alt="live desktop" class="w-full hidden">
@@ -186,69 +273,95 @@
     </div>
     <p id="control-hint" class="muted mt-2 text-xs">Exactly what Rose sees. Take Control to drive it yourself through the same audited path — the agent pauses, never killed.</p>
     <button id="take-control" onclick="toggleControl()" class="btn-ghost mt-2 w-full rounded-lg px-3 py-2 font-semibold">Take Control</button>
+    <button onclick="toggleVideoSkill(true)" class="btn-accent mt-2 w-full rounded-lg px-3 py-2 font-semibold" title="Upload a narrated recording and turn it into an editable skill">Video to skill</button>
 
-      <!-- video → instructions: under the live desktop, shares the right rail's scroll.
-           Backend: POST /api/videos?filename= upload, POST :id/instructions runs
-           Spark native video (frames + narration, no SAM) and saves steps.json,
-           PUT :id/draft saves edits (all under <data>/videos/<id>/).
-           Local object URLs + labeled offline mock remain for no-backend mode. -->
-    <section id="video-workflow" class="card mt-4 overflow-hidden rounded-xl" style="border-color:var(--line)">
+    <!-- skills & workflows: saved, reusable instruction sets (SQLite on
+         rosed, so they survive restarts). Creating/editing happens in the
+         Video to skill popup — this list manages them: run, view doc,
+         rename, delete. -->
+    <section id="skills-workflow" class="card mt-4 overflow-hidden rounded-xl" style="border-color:var(--line)">
       <div class="flex items-center gap-2 border-b px-3 py-2" style="border-color:var(--line)">
-        <span class="t-title">🎬 Video → instructions</span>
-        <span id="video-count" class="t-caption rounded px-1.5 py-0.5" style="background:var(--line)">0</span>
+        <span class="t-title"><svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 4l8 4-8 4-8-4z"/><path d="M4 12l8 4 8-4M4 16l8 4 8-4"/></svg> Skills &amp; workflows</span>
+        <span id="skill-count" class="t-caption rounded px-1.5 py-0.5" style="background:var(--line)">0</span>
         <span class="flex-1"></span>
-        <span id="video-backend" class="muted t-caption">local only</span>
+        <span id="skill-backend" class="muted t-caption">local only</span>
       </div>
-      <div id="dropzone" class="m-3 cursor-pointer rounded-xl border-2 border-dashed px-3 py-4 text-center"
-        style="border-color:var(--line)"
-        onclick="document.getElementById('video-file').click()"
-        ondragover="event.preventDefault()"
-        ondrop="dropVideos(event)">
-        <div class="t-body font-semibold">Drop a narrated recording here, or <span style="color:var(--accent)"><u>browse</u></span></div>
-        <div class="muted t-caption mt-0.5">mp4 / webm / mov · uploads to rosed (/api/videos) when available, local otherwise</div>
-        <input id="video-file" type="file" accept="video/*" multiple class="hidden" onchange="pickVideos(this)">
+      <div class="flex flex-wrap gap-2 px-3 pt-3">
+        <button onclick="videoSkillNew()" class="btn-ghost t-caption rounded-lg px-3 py-1.5"><svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg> New skill</button>
       </div>
-      <div id="video-list" class="flex flex-col gap-2 px-3 pb-1"></div>
-      <div id="video-empty" class="muted t-caption px-3 pb-3">No videos yet — upload one to draft agent instructions from it.</div>
-      <div id="video-detail" class="hidden border-t px-3 py-3" style="border-color:var(--line)">
-        <div class="flex items-center gap-2">
-          <span id="vd-name" class="t-title flex-1 truncate">video.mp4</span>
-          <span id="vd-status" class="t-caption rounded px-2 py-0.5 font-semibold" style="background:var(--line)">queued</span>
-        </div>
-        <video id="vd-player" controls playsinline class="mt-2 w-full rounded-lg bg-black" style="aspect-ratio:16/9;max-height:38vh"></video>
-        <div class="muted t-caption mt-1">Click a step to seek — transcript + evidence stay in sync (Skill Studio preview).</div>
-        <!-- actions: always visible (never hidden below the fold); Save and
-             Send stay disabled until the draft has steps. -->
-        <div class="mt-2 flex flex-wrap gap-2">
-          <button id="vd-generate" onclick="runPipeline(selectedVideo())" class="btn-accent t-caption rounded-lg px-3 py-1.5 font-semibold">⚙ Generate instructions</button>
-          <button onclick="cancelPipeline()" class="btn-ghost t-caption rounded-lg px-3 py-1.5">Cancel</button>
-          <button id="vd-save" onclick="saveDraft()" class="btn-ghost t-caption rounded-xl px-4 py-2 font-semibold" disabled>Save draft</button>
-          <button id="vd-send" onclick="useInChat()" class="t-caption rounded-xl bg-green-700 px-4 py-2 font-semibold text-white" disabled>➤ Send to Rose as instructions</button>
-        </div>
-        <div id="vd-saved" class="mt-1 hidden text-xs font-semibold text-green-600">Draft saved.</div>
-        <div class="mt-2 rounded-lg p-2" style="background:var(--bg)">
-          <div class="flex items-center gap-2">
-            <span id="vd-stage" class="t-caption font-semibold">Waiting…</span>
-            <span class="flex-1"></span>
-            <span id="vd-pct" class="muted t-caption">0%</span>
-          </div>
-          <div class="mt-1 h-1.5 overflow-hidden rounded-full" style="background:var(--line)">
-            <div id="vd-bar" class="h-full rounded-full transition-all" style="width:0%;background:var(--accent)"></div>
-          </div>
-          <div id="vd-log" class="muted t-caption mt-1 whitespace-pre-wrap font-mono"></div>
-        </div>
-        <div id="vd-steps-wrap" class="mt-3 hidden">
-          <div class="flex items-center gap-2">
-            <span class="t-title">Draft instructions</span>
-            <span id="vd-conf" class="muted t-caption"></span>
-            <span class="flex-1"></span>
-            <button onclick="addStep()" class="btn-ghost t-caption rounded px-2 py-1">+ step</button>
-          </div>
-          <div id="vd-steps" class="mt-2 flex flex-col gap-2"></div>
-        </div>
-      </div>
+      <div id="skill-list" class="flex flex-col gap-2 px-3 py-3"></div>
+      <div id="skill-empty" class="muted t-caption px-3 pb-3">No skills yet — make one with Video to skill, or write one by hand with New skill.</div>
     </section>
   </aside>
+</div>
+
+<!-- video → skill popup: upload on top, editable skill doc below, same modal -->
+<div id="video-skill-modal" class="hidden fixed inset-0 z-30 flex items-center justify-center p-2 sm:p-4 bg-black/50">
+  <div class="card w-full max-w-[min(44rem,96%)] max-h-[92vh] overflow-y-auto thin-scroll rounded-xl p-4 sm:p-6">
+    <div class="flex items-center gap-2">
+      <h2 class="t-display flex-1">Video to skill</h2>
+      <button onclick="toggleVideoSkill(false)" class="btn-ghost rounded-lg px-4 py-2 font-semibold">Close</button>
+    </div>
+    <p class="muted mt-1 text-xs">Upload a narrated recording up top — the skill doc below stays editable in this same popup.</p>
+    <div id="vs-dropzone" class="m-3 cursor-pointer rounded-xl border-2 border-dashed px-3 py-4 text-center"
+      style="border-color:var(--line)"
+      onclick="document.getElementById('video-file').click()"
+      ondragover="event.preventDefault()"
+      ondrop="dropVideos(event)">
+      <div class="t-body font-semibold">Drop a narrated recording here, or <span style="color:var(--accent)"><u>browse</u></span></div>
+      <div class="muted t-caption mt-0.5">mp4 / webm / mov · uploads to rosed (/api/videos) when available, local otherwise</div>
+      <input id="video-file" type="file" accept="video/*" multiple class="hidden" onchange="pickVideos(this)">
+    </div>
+    <div id="video-list" class="flex flex-col gap-2 px-3 pb-1"></div>
+    <div id="video-empty" class="muted t-caption px-3 pb-3">No videos yet — upload one to draft agent instructions from it.</div>
+    <div id="video-detail" class="hidden border-t px-3 py-3" style="border-color:var(--line)">
+      <div class="flex items-center gap-2">
+        <span id="vd-name" class="t-title flex-1 truncate">video.mp4</span>
+        <span id="vd-status" class="t-caption rounded px-2 py-0.5 font-semibold" style="background:var(--line)">queued</span>
+      </div>
+      <video id="vd-player" controls playsinline class="mt-2 w-full rounded-lg bg-black" style="aspect-ratio:16/9;max-height:38vh"></video>
+      <div class="muted t-caption mt-1">Click a step to seek — transcript + evidence stay in sync.</div>
+      <div class="mt-2 flex flex-wrap gap-2">
+        <button id="vd-generate" onclick="runPipeline(selectedVideo())" class="btn-accent t-caption rounded-lg px-3 py-1.5 font-semibold">Generate instructions</button>
+        <button onclick="cancelPipeline()" class="btn-ghost t-caption rounded-lg px-3 py-1.5">Cancel</button>
+        <button id="vd-save" onclick="saveDraft()" class="btn-ghost t-caption rounded-xl px-4 py-2 font-semibold" disabled>Save draft</button>
+        <button id="vd-send" onclick="useInChat()" class="t-caption rounded-xl bg-green-700 px-4 py-2 font-semibold text-white" disabled>Send to Rose as instructions</button>
+        <button id="vd-toskill" onclick="videoToSkillMcp()" class="btn-ghost t-caption rounded-xl px-4 py-2 font-semibold">Video → skill.md (MCP)</button>
+      </div>
+      <div id="vd-saved" class="mt-1 hidden text-xs font-semibold text-green-600">Draft saved.</div>
+      <div class="mt-2 rounded-lg p-2" style="background:var(--bg)">
+        <div class="flex items-center gap-2">
+          <span id="vd-stage" class="t-caption font-semibold">Waiting…</span>
+          <span class="flex-1"></span>
+          <span id="vd-pct" class="muted t-caption">0%</span>
+        </div>
+        <div class="mt-1 h-1.5 overflow-hidden rounded-full" style="background:var(--line)">
+          <div id="vd-bar" class="h-full rounded-full transition-all" style="width:0%;background:var(--accent)"></div>
+        </div>
+        <div id="vd-log" class="muted t-caption mt-1 whitespace-pre-wrap font-mono"></div>
+      </div>
+      <div id="vd-steps-wrap" class="mt-3 hidden">
+        <div class="flex items-center gap-2">
+          <span class="t-title">Draft instructions</span>
+          <span id="vd-conf" class="muted t-caption"></span>
+          <span class="flex-1"></span>
+          <button onclick="addStep()" class="btn-ghost t-caption rounded px-2 py-1">+ step</button>
+        </div>
+        <div id="vd-steps" class="mt-2 flex flex-col gap-2"></div>
+      </div>
+    </div>
+    <div class="mt-4 border-t pt-4" style="border-color:var(--line)">
+      <div class="t-title">Skill doc (editable)</div>
+      <p class="muted t-caption mt-0.5">Generalized instructions with your wording retained — edit freely, then save.</p>
+      <input id="vs-skill-name" placeholder="Skill name (e.g. morning screener)" class="cfg-input t-caption mt-2">
+      <textarea id="vs-skill-doc" rows="10" placeholder="Skill instructions… (Generate from a video, or write by hand)" class="cfg-input t-caption mt-2 font-mono"></textarea>
+      <div class="mt-2 flex flex-wrap gap-2">
+        <button onclick="videoSkillUseDraft()" class="btn-ghost t-caption rounded-lg px-3 py-1.5">Use video draft</button>
+        <button onclick="videoSkillSave()" class="btn-accent t-caption rounded-lg px-3 py-1.5 font-semibold">Save skill</button>
+        <span id="vs-skill-msg" class="muted t-caption self-center"></span>
+      </div>
+    </div>
+  </div>
 </div>
 
 <script>

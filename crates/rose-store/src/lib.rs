@@ -15,7 +15,7 @@
 //! kill a run — but every failure is logged.
 
 use rose_core::RunId;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -56,10 +56,19 @@ CREATE TABLE IF NOT EXISTS messages (
     ts TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS chats (
-    chat_id TEXT PRIMARY KEY,
-    title TEXT NOT NULL,
-    created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL
+  chat_id TEXT PRIMARY KEY,
+  title TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS skills (
+  id TEXT PRIMARY KEY,
+  name TEXT NOT NULL UNIQUE,
+  instructions TEXT NOT NULL,
+  steps_json TEXT NOT NULL DEFAULT '[]',
+  source TEXT NOT NULL DEFAULT 'manual',
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
 );
 ";
 
@@ -151,6 +160,21 @@ pub struct TraceSummary {
     pub ended_at: Option<String>,
     /// The final reply text (or error), when the run has finished.
     pub say: Option<String>,
+}
+
+/// One saved skill: a named, reusable instruction set (a workflow).
+/// `instructions` is the exact text sent to the agent on a run;
+/// `steps` is the structured draft it came from (usually reviewed
+/// video steps) for preview. Running needs nothing special.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Skill {
+    pub id: String,
+    pub name: String,
+    pub instructions: String,
+    pub steps: Vec<serde_json::Value>,
+    pub source: String,
+    pub created_at: String,
+    pub updated_at: String,
 }
 
 /// One conversation in the sidebar: a chat groups every run/turn
@@ -463,6 +487,184 @@ impl TraceStore {
         by_chat.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
         by_chat.truncate(limit as usize);
         by_chat
+    }
+
+    // ---------- skills (named, reusable workflows) ----------
+    //
+    // A skill is a saved instruction set: the full text sent to the agent
+    // (`instructions`) plus the structured draft steps it came from
+    // (`steps`, usually a reviewed video draft). Running a skill is just
+    // starting a normal run with its instructions — management (save,
+    // list, rename, delete) lives here; execution needs nothing special.
+
+    fn skill_row(row: &rusqlite::Row) -> rusqlite::Result<Skill> {
+        let steps_json: String = row.get(3)?;
+        Ok(Skill {
+            id: row.get(0)?,
+            name: row.get(1)?,
+            instructions: row.get(2)?,
+            steps: serde_json::from_str(&steps_json).unwrap_or_default(),
+            source: row.get(4)?,
+            created_at: row.get(5)?,
+            updated_at: row.get(6)?,
+        })
+    }
+
+    fn validate_skill_input(name: &str, instructions: &str) -> Result<(), String> {
+        if name.trim().is_empty() || name.chars().count() > 100 {
+            return Err("name must be 1..100 chars".to_string());
+        }
+        if instructions.trim().is_empty() || instructions.chars().count() > 8000 {
+            return Err("instructions must be 1..8000 chars".to_string());
+        }
+        Ok(())
+    }
+
+    /// Save a skill. Names are unique (user-facing `Err` otherwise).
+    /// `None` db = files-only mode, which cannot persist skills.
+    pub fn create_skill(
+        &self,
+        name: &str,
+        instructions: &str,
+        steps: &[serde_json::Value],
+        source: &str,
+    ) -> Result<Skill, String> {
+        Self::validate_skill_input(name, instructions)?;
+        let now = chrono::Utc::now().to_rfc3339();
+        let steps_json = serde_json::to_string(steps).map_err(|e| format!("bad steps: {e}"))?;
+        let sched = Skill {
+            id: RunId::new().to_string(),
+            name: name.trim().to_string(),
+            instructions: instructions.trim().to_string(),
+            steps: steps.to_vec(),
+            source: if source.trim().is_empty() {
+                "manual".to_string()
+            } else {
+                source.trim().chars().take(200).collect::<String>()
+            },
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        };
+        let Some(db) = &self.db else {
+            return Err("skills need the database (data dir unavailable)".to_string());
+        };
+        let conn = db.lock().map_err(|e| format!("store busy: {e}"))?;
+        conn.execute(
+            "INSERT INTO skills (id, name, instructions, steps_json, source, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)",
+            rusqlite::params![
+                sched.id,
+                sched.name,
+                sched.instructions,
+                steps_json,
+                sched.source,
+                sched.created_at,
+            ],
+        )
+        .map_err(|e| {
+            if e.to_string().contains("UNIQUE") {
+                format!("a skill named {:?} already exists", sched.name)
+            } else {
+                format!("could not save skill: {e}")
+            }
+        })?;
+        Ok(sched)
+    }
+
+    /// All skills, newest first.
+    pub fn list_skills(&self) -> Vec<Skill> {
+        let Some(db) = &self.db else {
+            return Vec::new();
+        };
+        let Ok(conn) = db.lock() else {
+            return Vec::new();
+        };
+        let Ok(mut stmt) = conn.prepare(
+            "SELECT id, name, instructions, steps_json, source, created_at, updated_at
+             FROM skills ORDER BY created_at DESC",
+        ) else {
+            return Vec::new();
+        };
+        stmt.query_map([], Self::skill_row)
+            .map(|rows| rows.filter_map(|r| r.ok()).collect())
+            .unwrap_or_default()
+    }
+
+    pub fn get_skill(&self, id: &str) -> Option<Skill> {
+        if !valid_run_id(id) {
+            return None;
+        }
+        let db = self.db.as_ref()?;
+        let conn = db.lock().ok()?;
+        conn.query_row(
+            "SELECT id, name, instructions, steps_json, source, created_at, updated_at
+             FROM skills WHERE id = ?1",
+            rusqlite::params![id],
+            Self::skill_row,
+        )
+        .ok()
+    }
+
+    /// Rename / re-text a skill (full replacement of the editable fields).
+    /// `Err` is user-facing (unknown id, bad input, duplicate name).
+    pub fn update_skill(
+        &self,
+        id: &str,
+        name: &str,
+        instructions: &str,
+        steps: &[serde_json::Value],
+    ) -> Result<Skill, String> {
+        if !valid_run_id(id) {
+            return Err("unknown skill".to_string());
+        }
+        Self::validate_skill_input(name, instructions)?;
+        let steps_json = serde_json::to_string(steps).map_err(|e| format!("bad steps: {e}"))?;
+        let Some(db) = &self.db else {
+            return Err("skills need the database (data dir unavailable)".to_string());
+        };
+        // Scope the lock: get_skill below locks again (Mutex is not
+        // reentrant — holding it across the call deadlocks).
+        let n = {
+            let conn = db.lock().map_err(|e| format!("store busy: {e}"))?;
+            conn.execute(
+                "UPDATE skills SET name = ?2, instructions = ?3, steps_json = ?4,
+                 updated_at = ?5 WHERE id = ?1",
+                rusqlite::params![
+                    id,
+                    name.trim(),
+                    instructions.trim(),
+                    steps_json,
+                    chrono::Utc::now().to_rfc3339(),
+                ],
+            )
+            .map_err(|e| {
+                if e.to_string().contains("UNIQUE") {
+                    format!("a skill named {name:?} already exists")
+                } else {
+                    format!("could not save skill: {e}")
+                }
+            })?
+        };
+        if n == 0 {
+            return Err("unknown skill".to_string());
+        }
+        self.get_skill(id)
+            .ok_or_else(|| "skill vanished".to_string())
+    }
+
+    pub fn delete_skill(&self, id: &str) -> bool {
+        if !valid_run_id(id) {
+            return false;
+        }
+        if let Some(db) = &self.db {
+            if let Ok(conn) = db.lock() {
+                return conn
+                    .execute("DELETE FROM skills WHERE id = ?1", rusqlite::params![id])
+                    .map(|n| n > 0)
+                    .unwrap_or(false);
+            }
+        }
+        false
     }
 
     pub fn rename_chat(&self, chat_id: &str, title: &str) -> bool {
@@ -813,6 +1015,42 @@ mod tests {
         assert!(store.events("../etc/passwd").is_none());
         assert!(store.events("a/b").is_none());
         assert!(store.frame_path("../../etc", 0).is_none());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn skills_crud_roundtrip() {
+        let (store, dir) = temp_store("skills");
+        let steps = vec![serde_json::json!({"say": "Open portal", "intent": "open it"})];
+        let skill = store
+            .create_skill("morning screen", "1. open it", &steps, "screening.mp4")
+            .expect("create");
+        assert_eq!(skill.name, "morning screen");
+        assert_eq!(skill.steps.len(), 1);
+        assert_eq!(store.list_skills().len(), 1);
+        // Duplicate names are rejected, user-facing.
+        assert!(store
+            .create_skill("morning screen", "other", &[], "manual")
+            .is_err());
+        let updated = store
+            .update_skill(&skill.id, "evening screen", "1. open it", &steps)
+            .expect("update");
+        assert_eq!(updated.name, "evening screen");
+        assert_eq!(store.get_skill(&skill.id).unwrap().name, "evening screen");
+        assert!(store.delete_skill(&skill.id));
+        assert!(store.get_skill(&skill.id).is_none());
+        assert!(store.list_skills().is_empty());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn skills_reject_bad_input() {
+        let (store, dir) = temp_store("skills-bad");
+        assert!(store.create_skill("", "goal", &[], "manual").is_err());
+        assert!(store.create_skill("n", "", &[], "manual").is_err());
+        assert!(store.create_skill("n", "g", &[], "manual").is_ok());
+        assert!(store.update_skill("nope", "n", "g", &[]).is_err());
+        assert!(!store.delete_skill("../etc"));
         std::fs::remove_dir_all(&dir).ok();
     }
 

@@ -98,7 +98,7 @@ pub fn parse_steps(text: &str) -> Result<Vec<DraftStep>> {
         }
     };
     let mut steps = Vec::new();
-    for (i, item) in arr.iter().take(50).enumerate() {
+    for (i, item) in arr.iter().enumerate() {
         let say = item
             .get("say")
             .and_then(|s| s.as_str())
@@ -107,12 +107,12 @@ pub fn parse_steps(text: &str) -> Result<Vec<DraftStep>> {
         let say = if say.is_empty() {
             format!("Step {}", i + 1)
         } else {
-            truncate(say, 200)
+            say.to_string()
         };
         let intent = item
             .get("intent")
             .and_then(|s| s.as_str())
-            .map(|s| truncate(s.trim(), 500))
+            .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| say.clone());
         steps.push(DraftStep {
@@ -122,7 +122,7 @@ pub fn parse_steps(text: &str) -> Result<Vec<DraftStep>> {
             params: item
                 .get("params")
                 .and_then(|s| s.as_str())
-                .map(|s| truncate(s, 300))
+                .map(|s| s.to_string())
                 .unwrap_or_default(),
             approval: item
                 .get("approval")
@@ -132,7 +132,7 @@ pub fn parse_steps(text: &str) -> Result<Vec<DraftStep>> {
             quote: item
                 .get("quote")
                 .and_then(|s| s.as_str())
-                .map(|s| truncate(s.trim(), 300))
+                .map(|s| s.trim().to_string())
                 .unwrap_or_default(),
         });
     }
@@ -184,7 +184,8 @@ pub async fn extract_instructions(
     filename: &str,
     mp4: &[u8],
 ) -> Result<Vec<DraftStep>> {
-    let endpoint = endpoint.trim_end_matches('/');
+    let normalized = rose_core::ModelsConfig::normalize_base_url(endpoint);
+    let endpoint = normalized.as_str();
     let http = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(300))
         .build()
@@ -353,13 +354,13 @@ mod tests {
     }
 
     #[test]
-    fn caps_at_fifty_steps() {
+    fn keeps_all_steps_no_arbitrary_cap() {
         let mut items = Vec::new();
         for i in 0..70 {
             items.push(format!("{{\"say\": \"s{i}\"}}"));
         }
         let steps = parse_steps(&format!("[{}]", items.join(","))).expect("parse");
-        assert_eq!(steps.len(), 50);
+        assert_eq!(steps.len(), 70);
     }
 
     #[test]

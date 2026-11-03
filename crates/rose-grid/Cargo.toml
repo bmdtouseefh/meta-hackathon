@@ -7,3 +7,4 @@ license.workspace = true
 [dependencies]
 rose-core = { path = "../rose-core" }
 image = { version = "0.25", features = ["jpeg"] }
+ab_glyph = "0.2.32"

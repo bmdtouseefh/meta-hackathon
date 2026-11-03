@@ -24,6 +24,7 @@ use std::sync::Arc;
 /// `apps/rosed` (the one place allowed to touch backends).
 #[async_trait]
 pub trait FrameSource: Send + Sync {
+    /// Raw desktop frame for the live view.
     async fn jpeg(&self) -> std::result::Result<Vec<u8>, String>;
     fn display(&self) -> String;
     fn size(&self) -> (u32, u32);
@@ -177,7 +178,7 @@ impl KeySlot {
 
 /// Live config: GET shows the desired config, PUT validates + persists.
 /// Policy + brain hot-reload into the running loop; backend/display/size/
-/// bind/data/cdp need a `rosed` restart (reported as `restart_needed`).
+/// bind/data need a `rosed` restart (reported as `restart_needed`).
 #[async_trait]
 pub trait ConfigSource: Send + Sync {
     async fn get(&self) -> RoseConfig;
@@ -199,8 +200,12 @@ pub fn validate_config(cfg: &RoseConfig) -> Result<(), String> {
         return Err("refusing non-loopback bind without allow_remote = true".to_string());
     }
     match cfg.desktop.backend.as_str() {
-        "auto" | "x11" | "cdp" | "fake" => {}
-        other => return Err(format!("unknown desktop backend: {other}")),
+        "x11" | "fake" => {}
+        other => {
+            return Err(format!(
+                "unknown desktop backend: {other} (want \"x11\" | \"fake\")"
+            ))
+        }
     }
     if !(640..=7680).contains(&cfg.desktop.width) || !(360..=4320).contains(&cfg.desktop.height) {
         return Err("desktop size looks wrong (want 640..7680 x 360..4320)".to_string());
@@ -209,11 +214,40 @@ pub fn validate_config(cfg: &RoseConfig) -> Result<(), String> {
         "muse" | "fake" => {}
         other => return Err(format!("unknown brain: {other}")),
     }
-    if cfg.models.endpoint.trim().is_empty() {
-        return Err("models.endpoint must not be empty".to_string());
+    // Base URL: Meta is the default; any http(s) OpenAI-compatible base works.
+    // Env overrides (ROSE_MODELS_ENDPOINT / OPENAI_BASE_URL, …) fill an empty
+    // file value, so validate the resolved value, not just the file text.
+    {
+        let endpoint = cfg.models.resolved_endpoint();
+        if endpoint.trim().is_empty() {
+            return Err("models.endpoint (base URL) must not be empty".to_string());
+        }
+        if !(endpoint.starts_with("http://") || endpoint.starts_with("https://")) {
+            return Err(
+                "models.endpoint (base URL) must start with http:// or https://".to_string(),
+            );
+        }
     }
-    if cfg.models.model.trim().is_empty() {
+    if cfg.models.resolved_model().trim().is_empty() {
         return Err("models.model must not be empty".to_string());
+    }
+    // Video model falls back to the brain model when empty, so this only
+    // fails if both are empty (or an env override is whitespace).
+    if cfg.models.resolved_video_model().trim().is_empty() {
+        return Err("models.video_model must not be empty".to_string());
+    }
+    // Same for the video base URL: empty follows the brain base URL, but a
+    // set value must be an http(s) URL.
+    {
+        let endpoint = cfg.models.resolved_video_endpoint();
+        if endpoint.trim().is_empty() {
+            return Err("models.video_endpoint (base URL) must not be empty".to_string());
+        }
+        if !(endpoint.starts_with("http://") || endpoint.starts_with("https://")) {
+            return Err(
+                "models.video_endpoint (base URL) must start with http:// or https://".to_string(),
+            );
+        }
     }
     if !(1..=200).contains(&cfg.policy.max_steps) {
         return Err("policy.max_steps must be 1..200".to_string());
@@ -227,20 +261,14 @@ pub fn validate_config(cfg: &RoseConfig) -> Result<(), String> {
     if cfg.data.dir.trim().is_empty() {
         return Err("data.dir must not be empty".to_string());
     }
-    if cfg.cdp.endpoint.trim().is_empty() {
-        return Err("cdp.endpoint must not be empty".to_string());
-    }
     Ok(())
 }
 
 /// True when applying `next` needs a restart to take effect (anything the
-/// running loop cannot hot-reload: bind, backend, geometry, cdp, data dir).
+/// running loop cannot hot-reload: bind, backend, geometry, data dir).
 /// Policy + models hot-reload, so they never force a restart.
 pub fn config_restart_needed(old: &RoseConfig, next: &RoseConfig) -> bool {
-    old.server != next.server
-        || old.desktop != next.desktop
-        || old.cdp != next.cdp
-        || old.data != next.data
+    old.server != next.server || old.desktop != next.desktop || old.data != next.data
 }
 
 /// One draft instruction derived from a video (Skill Studio step).
@@ -288,6 +316,40 @@ pub trait VideoSource: Send + Sync {
     async fn remove(&self, id: &str) -> bool;
 }
 
+/// Named-skill store seam (implemented in `apps/rosed` over the trace
+/// store's SQLite; the web layer never touches the database itself).
+/// A skill is a saved, reusable instruction set — usually a reviewed
+/// video draft. Running one is just starting a normal run with its
+/// instructions, so execution needs no special path.
+#[async_trait]
+pub trait SkillSource: Send + Sync {
+    async fn list(&self) -> Vec<serde_json::Value>;
+    async fn create(
+        &self,
+        name: &str,
+        instructions: &str,
+        steps: Vec<serde_json::Value>,
+        source: &str,
+    ) -> Result<serde_json::Value, String>;
+    async fn get(&self, id: &str) -> Option<serde_json::Value>;
+    async fn update(
+        &self,
+        id: &str,
+        name: &str,
+        instructions: &str,
+        steps: Vec<serde_json::Value>,
+    ) -> Result<serde_json::Value, String>;
+    async fn remove(&self, id: &str) -> bool;
+    /// JPEG snip from the source recording behind step `n` (0-based),
+    /// extracted on first view and cached. `None` = unknown skill,
+    /// no source video, or ffmpeg unavailable — the doc still stands
+    /// on its lines alone.
+    async fn frame(&self, id: &str, n: usize) -> Option<Vec<u8>> {
+        let _ = (id, n);
+        None
+    }
+}
+
 pub fn sanitize_video_name(name: &str) -> String {
     let base = name
         .rsplit('/')
@@ -327,15 +389,29 @@ pub struct AppState {
     pub stepper: Option<Arc<dyn StepRunner>>,
     pub traces: Option<Arc<dyn TraceSource>>,
     pub keys: KeySlot,
+    /// Optional separate key for video → instructions (Setup → Keys).
+    /// When unset, video calls fall back to `keys`. Never logged/persisted.
+    pub video_keys: KeySlot,
     pub lease: Lease,
     pub control: Option<Arc<dyn HumanInput>>,
     pub config: Option<Arc<dyn ConfigSource>>,
     pub videos: Option<Arc<dyn VideoSource>>,
+    pub skills: Option<Arc<dyn SkillSource>>,
     pub env_key_present: bool,
+    /// `ROSE_VIDEO_API_KEY` (etc.) present in env.
+    pub video_env_key_present: bool,
     pub backend: String,
     pub brain: String,
     pub version: String,
     pub started: std::time::SystemTime,
+    // MCP (AI-agent access): direct backend handle + display + test
+    // sessions + policy. None/disabled = MCP routes return 503.
+    pub mcp_backend: Option<Arc<dyn rose_core::DesktopBackend>>,
+    pub mcp_display: String,
+    pub mcp_session: Option<Arc<dyn rose_mcp::TestSession>>,
+    /// Video -> skill.md service behind the MCP `video.*`/`skill.*` tools.
+    pub mcp_skills: Option<Arc<dyn rose_mcp::SkillService>>,
+    pub mcp_policy: rose_mcp::McpPolicy,
 }
 
 const INDEX_HTML: &str = include_str!("../../../ui/index.html");
@@ -398,6 +474,8 @@ pub fn router(state: AppState) -> Router {
         .route("/desktop/handback", post(api_handback))
         .route("/desktop/input", post(api_input))
         .route("/api/config", get(api_config_get).put(api_config_put))
+        .route("/mcp", post(api_mcp))
+        .route("/mcp/tools", get(api_mcp_tools))
         .merge(videos_router())
         .with_state(state)
 }
@@ -424,6 +502,16 @@ fn videos_router() -> Router<AppState> {
             "/api/videos/{id}/draft",
             post(api_video_draft).put(api_video_draft),
         )
+        .route("/api/skills", get(api_skills_list).post(api_skills_create))
+        .route(
+            "/api/skills/{id}",
+            get(api_skill_get)
+                .put(api_skill_update)
+                .delete(api_skill_delete),
+        )
+        .route("/api/skills/{id}/run", post(api_skill_run))
+        .route("/api/skills/{id}/doc", get(api_skill_doc))
+        .route("/api/skills/{id}/frames/{n}", get(api_skill_frame))
         .layer(DefaultBodyLimit::disable())
 }
 
@@ -439,6 +527,11 @@ async fn api_status(axum::extract::State(s): axum::extract::State<AppState>) -> 
         "width": width,
         "height": height,
         "version": s.version,
+        "mcp": {
+            "endpoint": "/mcp",
+            "protocol": "json-rpc-2.0",
+            "tools": rose_mcp::tool_catalog().len(),
+        },
     }))
 }
 
@@ -485,6 +578,17 @@ async fn api_frame(axum::extract::State(s): axum::extract::State<AppState>) -> i
     }
 }
 
+/// Explicit video key state: "web" (Setup modal) | "env" | "none".
+fn video_key_source(s: &AppState) -> &'static str {
+    if s.video_keys.is_set() {
+        "web"
+    } else if s.video_env_key_present {
+        "env"
+    } else {
+        "none"
+    }
+}
+
 async fn api_keys_get(
     axum::extract::State(s): axum::extract::State<AppState>,
 ) -> impl IntoResponse {
@@ -496,33 +600,105 @@ async fn api_keys_get(
     } else {
         "none"
     };
-    Json(serde_json::json!({ "set": web || s.env_key_present, "source": source }))
+    // Effective video key: explicit video key first, else the brain key.
+    let v_explicit = video_key_source(&s);
+    let (video_set, video_source) = if v_explicit != "none" {
+        (true, v_explicit)
+    } else if web || s.env_key_present {
+        (true, "brain")
+    } else {
+        (false, "none")
+    };
+    Json(serde_json::json!({
+        "set": web || s.env_key_present,
+        "source": source,
+        "video_set": video_set,
+        "video_source": video_source,
+    }))
 }
 
 async fn api_keys_delete(
     axum::extract::State(s): axum::extract::State<AppState>,
 ) -> impl IntoResponse {
     s.keys.clear();
-    tracing::info!("muse api key cleared via UI");
-    Json(serde_json::json!({ "set": false }))
+    s.video_keys.clear();
+    tracing::info!("api keys (brain + video) cleared via UI");
+    Json(serde_json::json!({ "set": false, "video_set": false }))
 }
 
 async fn api_keys_post(
     axum::extract::State(s): axum::extract::State<AppState>,
     Json(body): Json<serde_json::Value>,
 ) -> impl IntoResponse {
-    match body.get("muse_api_key").and_then(|v| v.as_str()) {
-        Some(k) if !k.trim().is_empty() => {
-            s.keys.set(k.trim().to_string());
-            tracing::info!("muse api key set via UI (memory only)");
-            Json(serde_json::json!({ "set": true })).into_response()
-        }
-        _ => (
+    // `video_api_key` is optional: non-empty sets the video slot, empty
+    // clears it (back to following the brain key), absent leaves it alone.
+    // `muse_api_key` keeps its legacy contract: present must be non-empty.
+    let muse = body.get("muse_api_key").and_then(|v| v.as_str());
+    let video = body.get("video_api_key").and_then(|v| v.as_str());
+    if muse.is_none() && video.is_none() {
+        return (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({"error": "muse_api_key missing or empty"})),
         )
-            .into_response(),
+            .into_response();
     }
+    if let Some(k) = muse {
+        if k.trim().is_empty() {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "muse_api_key missing or empty"})),
+            )
+                .into_response();
+        }
+        s.keys.set(k.trim().to_string());
+        tracing::info!("muse api key set via UI (memory only)");
+    }
+    if let Some(k) = video {
+        if k.trim().is_empty() {
+            s.video_keys.clear();
+            tracing::info!("video api key cleared via UI (follows brain key)");
+        } else {
+            s.video_keys.set(k.trim().to_string());
+            tracing::info!("video api key set via UI (memory only)");
+        }
+    }
+    Json(serde_json::json!({ "set": true })).into_response()
+}
+
+/// Build a run goal from a saved skill: instructions plus the full
+/// step list pinned in context. The goal is re-sent verbatim on every
+/// brain call, so the plan can never fall out of context — the failure
+/// mode where the model re-reads steps.json 30+ times cannot happen.
+pub fn skill_run_goal(name: &str, instructions: &str, steps: &[serde_json::Value]) -> String {
+    let mut out = instructions.trim().to_string();
+    if !steps.is_empty() {
+        out.push_str(&format!(
+            "\n\n---\nPlan {:?} (already loaded in full below — never run shell commands to re-read skill/video/plan files; execute the next step with no completed evidence):\n",
+            name.trim()
+        ));
+        for (i, step) in steps.iter().enumerate() {
+            let say = step.get("say").and_then(|v| v.as_str()).unwrap_or("");
+            let intent = step.get("intent").and_then(|v| v.as_str()).unwrap_or("");
+            let params = step.get("params").and_then(|v| v.as_str()).unwrap_or("");
+            let approval = step
+                .get("approval")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            out.push_str(&format!(
+                "{}. {}{} [{}]{}\n",
+                i + 1,
+                if say.is_empty() { "" } else { say },
+                if say.is_empty() || intent.is_empty() || say == intent {
+                    String::new()
+                } else {
+                    format!(" — {intent}")
+                },
+                params,
+                if approval { " (needs approval)" } else { "" }
+            ));
+        }
+    }
+    out
 }
 
 async fn api_step(
@@ -551,7 +727,20 @@ async fn api_step(
         .and_then(|v| v.as_str())
         .filter(|id| !id.trim().is_empty())
         .map(str::to_string);
-    match &s.stepper {
+    start_run(s.stepper.clone(), goal, force, auto_approve, chat_id)
+}
+
+/// Shared run starter: streams NDJSON live (a run takes minutes) with a
+/// terminal `final` event — error included in-band so partial progress
+/// survives a mid-loop failure.
+fn start_run(
+    stepper: Option<Arc<dyn StepRunner>>,
+    goal: String,
+    force: bool,
+    auto_approve: bool,
+    chat_id: Option<String>,
+) -> axum::response::Response {
+    match stepper {
         None => (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(serde_json::json!({"error": "step runner not configured"})),
@@ -563,7 +752,6 @@ async fn api_step(
             // a terminal `final` event carries the step_view result — or
             // the error, in-band, after whatever steps already succeeded.
             let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-            let runner = Arc::clone(runner);
             tokio::spawn(async move {
                 let final_view = match runner
                     .run_step(&goal, force, auto_approve, chat_id.as_deref(), &tx)
@@ -652,8 +840,8 @@ fn err(status: StatusCode, msg: impl Into<String>) -> axum::response::Response {
 
 /// Live-view input while the lease is human-held. Coordinates arrive as
 /// fractions of the live image (0..1); the adapter maps them onto a fresh
-/// frame, so X11 pixels, CDP viewports and the auto router all work without
-/// the UI knowing the current backend or its size. Anything else is 409:
+/// frame, so X11 pixels work without the UI knowing the backend geometry.
+/// Anything else is 409:
 /// agent steps keep their exclusive input while the agent holds the lease.
 async fn api_input(
     axum::extract::State(s): axum::extract::State<AppState>,
@@ -684,24 +872,24 @@ async fn api_input(
             control.click_frac(x, y, kind == "double_click").await
         }
         "type" => match body.get("text").and_then(|v| v.as_str()) {
-            Some(t) if !t.is_empty() && t.chars().count() <= 200 => control.type_text(t).await,
+            Some(t) if !t.is_empty() => control.type_text(t).await,
             _ => {
-                return err(StatusCode::BAD_REQUEST, "type needs 1..200 chars of text");
+                return err(StatusCode::BAD_REQUEST, "type needs non-empty text");
             }
         },
         "key" => match body.get("keys").and_then(|v| v.as_array()) {
-            Some(keys) if !keys.is_empty() && keys.len() <= 4 => {
+            Some(keys) if !keys.is_empty() => {
                 let keys: Vec<String> = keys
                     .iter()
                     .filter_map(|k| k.as_str().map(str::to_string))
                     .collect();
                 if keys.is_empty() {
-                    return err(StatusCode::BAD_REQUEST, "key needs 1..4 key names");
+                    return err(StatusCode::BAD_REQUEST, "key needs at least one key name");
                 }
                 control.press_keys(keys).await
             }
             _ => {
-                return err(StatusCode::BAD_REQUEST, "key needs 1..4 key names");
+                return err(StatusCode::BAD_REQUEST, "key needs at least one key name");
             }
         },
         "scroll" => {
@@ -727,6 +915,56 @@ async fn api_input(
     }
 }
 
+// ---------- MCP (AI-agent access, JSON-RPC 2.0) ----------
+
+/// `POST /mcp`: JSON-RPC 2.0 for MCP clients (`initialize`, `tools/list`,
+/// `tools/call`, `ping`). Optional `?run_id=` (or `params._meta.run_id`)
+/// attributes desktop/shell actions to a test run for the Web UI history.
+/// Same desktop, same `act()` path, same audit log as the built-in agent —
+/// only the planner lives outside this binary.
+async fn api_mcp(
+    axum::extract::State(s): axum::extract::State<AppState>,
+    axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>,
+    Json(body): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    let backend = match &s.mcp_backend {
+        None => {
+            return err(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "no desktop backend configured",
+            )
+        }
+        Some(b) => Arc::clone(b),
+    };
+    let run_id = q.get("run_id").map(String::as_str);
+    match rose_mcp::handle_request_ext(
+        &backend,
+        &s.mcp_session,
+        &s.mcp_skills,
+        &s.mcp_policy,
+        &s.mcp_display,
+        run_id,
+        &body,
+    )
+    .await
+    {
+        Some(resp) => Json(resp).into_response(),
+        // Notification: no response body.
+        None => StatusCode::ACCEPTED.into_response(),
+    }
+}
+
+/// `GET /mcp/tools`: the tool catalog as plain JSON (debugging + onboarding).
+async fn api_mcp_tools() -> impl IntoResponse {
+    let tools: Vec<serde_json::Value> = rose_mcp::tool_catalog()
+        .into_iter()
+        .map(|(name, description, input_schema)| {
+            serde_json::json!({ "name": name, "description": description, "inputSchema": input_schema })
+        })
+        .collect();
+    Json(serde_json::json!({ "tools": tools }))
+}
+
 /// GET /api/config — the desired config (what the Setup pane edits).
 /// Shape: `{config: RoseConfig, source}`. Accepts no input.
 async fn api_config_get(
@@ -746,7 +984,7 @@ async fn api_config_get(
 
 /// PUT /api/config — validate + persist + hot-reload policy/models.
 /// Accepts the nested RoseConfig shape the UI sends (or `{config: {...}}`).
-/// Backend/display/size/bind/data/cdp changes report `restart_needed: true`.
+/// Backend/display/size/bind/data changes report `restart_needed: true`.
 async fn api_config_put(
     axum::extract::State(s): axum::extract::State<AppState>,
     Json(body): Json<serde_json::Value>,
@@ -997,14 +1235,245 @@ async fn api_video_draft(
         Ok(st) => st,
         Err(e) => return err(StatusCode::BAD_REQUEST, format!("invalid steps: {e}")),
     };
-    if steps.len() > 100 {
-        return err(StatusCode::BAD_REQUEST, "too many steps (max 100)");
-    }
     match store.save_draft(&id, steps).await {
         Ok(d) => Json(serde_json::json!({"saved": true, "video": d.meta, "steps": d.steps}))
             .into_response(),
         Err(e) => err(StatusCode::NOT_FOUND, e),
     }
+}
+
+// ---------- skills (named, reusable instruction sets) ----------
+
+macro_rules! skills_store {
+    ($s:expr) => {
+        match $s.skills.clone() {
+            None => {
+                return err(
+                    StatusCode::NOT_FOUND,
+                    "no /api/skills yet (skill backend not wired)",
+                )
+            }
+            Some(store) => store,
+        }
+    };
+}
+
+fn parse_skill_steps(body: &serde_json::Value) -> Result<Vec<serde_json::Value>, String> {
+    let steps_value = body.get("steps").unwrap_or(&serde_json::Value::Null);
+    if steps_value.is_null() {
+        return Ok(Vec::new());
+    }
+    let steps: Vec<serde_json::Value> =
+        serde_json::from_value(steps_value.clone()).map_err(|e| format!("invalid steps: {e}"))?;
+    Ok(steps)
+}
+
+/// GET /api/skills — list saved skills, newest first.
+async fn api_skills_list(
+    axum::extract::State(s): axum::extract::State<AppState>,
+) -> impl IntoResponse {
+    let store = skills_store!(&s);
+    Json(serde_json::json!({"skills": store.list().await})).into_response()
+}
+
+/// POST /api/skills {name, instructions, steps?, source?} — save a skill.
+async fn api_skills_create(
+    axum::extract::State(s): axum::extract::State<AppState>,
+    Json(body): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    let store = skills_store!(&s);
+    let name = body.get("name").and_then(|v| v.as_str()).unwrap_or("");
+    let instructions = body
+        .get("instructions")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let source = body.get("source").and_then(|v| v.as_str()).unwrap_or("");
+    let steps = match parse_skill_steps(&body) {
+        Ok(steps) => steps,
+        Err(e) => return err(StatusCode::BAD_REQUEST, e),
+    };
+    match store.create(name, instructions, steps, source).await {
+        Ok(skill) => Json(serde_json::json!({"saved": true, "skill": skill})).into_response(),
+        Err(e) => err(StatusCode::BAD_REQUEST, e),
+    }
+}
+
+/// GET /api/skills/{id} — one skill with its steps.
+async fn api_skill_get(
+    axum::extract::State(s): axum::extract::State<AppState>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> impl IntoResponse {
+    let store = skills_store!(&s);
+    match store.get(&id).await {
+        Some(skill) => Json(serde_json::json!({"skill": skill})).into_response(),
+        None => err(StatusCode::NOT_FOUND, "unknown skill"),
+    }
+}
+
+/// PUT /api/skills/{id} {name, instructions, steps?} — rename / re-text.
+async fn api_skill_update(
+    axum::extract::State(s): axum::extract::State<AppState>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    Json(body): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    let store = skills_store!(&s);
+    let name = body.get("name").and_then(|v| v.as_str()).unwrap_or("");
+    let instructions = body
+        .get("instructions")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let steps = match parse_skill_steps(&body) {
+        Ok(steps) => steps,
+        Err(e) => return err(StatusCode::BAD_REQUEST, e),
+    };
+    match store.update(&id, name, instructions, steps).await {
+        Ok(skill) => Json(serde_json::json!({"saved": true, "skill": skill})).into_response(),
+        Err(e) => {
+            let status = if e == "unknown skill" {
+                StatusCode::NOT_FOUND
+            } else {
+                StatusCode::BAD_REQUEST
+            };
+            err(status, e)
+        }
+    }
+}
+
+/// Render a skill as a markdown doc: simple numbered lines (never raw
+/// JSON) plus per-step video snips served alongside it. Both humans and
+/// models can read this — it is the shareable face of a skill.
+pub fn skill_markdown(skill: &serde_json::Value) -> String {
+    let name = skill
+        .get("name")
+        .and_then(|v| v.as_str())
+        .unwrap_or("skill");
+    let instructions = skill
+        .get("instructions")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let source = skill.get("source").and_then(|v| v.as_str()).unwrap_or("");
+    let updated = skill
+        .get("updated_at")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let empty = Vec::new();
+    let steps = skill
+        .get("steps")
+        .and_then(|v| v.as_array())
+        .unwrap_or(&empty);
+    let mut out = format!("# {name}\n\n{instructions}\n");
+    if !source.is_empty() || !updated.is_empty() {
+        out.push_str(&format!("\n_Source: {source} · updated {updated}_\n"));
+    }
+    out.push_str("\n## Steps\n");
+    if steps.is_empty() {
+        out.push_str("\n_No recorded steps — follow the instructions above._\n");
+        return out;
+    }
+    for (i, step) in steps.iter().enumerate() {
+        let say = step.get("say").and_then(|v| v.as_str()).unwrap_or("");
+        let intent = step.get("intent").and_then(|v| v.as_str()).unwrap_or("");
+        let params = step.get("params").and_then(|v| v.as_str()).unwrap_or("");
+        let approval = step
+            .get("approval")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let quote = step.get("quote").and_then(|v| v.as_str()).unwrap_or("");
+        let ts = step.get("ts").and_then(|v| v.as_u64()).unwrap_or(0);
+        let title = if say.is_empty() { intent } else { say };
+        let detail = if !intent.is_empty() && intent != say {
+            format!(" — {intent}")
+        } else {
+            String::new()
+        };
+        out.push_str(&format!("\n### {}. {title}{detail}\n", i + 1));
+        if !params.is_empty() {
+            out.push_str(&format!("Params: `{params}`\n"));
+        }
+        if approval {
+            out.push_str("Needs approval.\n");
+        }
+        if !quote.is_empty() || ts > 0 {
+            out.push_str(&format!("Evidence: “{quote}” @ {ts}s\n"));
+        }
+        out.push_str(&format!("![step {}](frames/{i})\n", i + 1));
+    }
+    out
+}
+
+/// GET /api/skills/{id}/doc — the skill as markdown (simple lines +
+/// per-step video snips, never raw JSON).
+async fn api_skill_doc(
+    axum::extract::State(s): axum::extract::State<AppState>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> impl IntoResponse {
+    let store = skills_store!(&s);
+    match store.get(&id).await {
+        Some(skill) => (
+            [(header::CONTENT_TYPE, "text/markdown; charset=utf-8")],
+            skill_markdown(&skill),
+        )
+            .into_response(),
+        None => err(StatusCode::NOT_FOUND, "unknown skill"),
+    }
+}
+
+/// GET /api/skills/{id}/frames/{n} — the video snip behind step n,
+/// extracted from the source recording on first view and cached.
+async fn api_skill_frame(
+    axum::extract::State(s): axum::extract::State<AppState>,
+    axum::extract::Path((id, n)): axum::extract::Path<(String, usize)>,
+) -> impl IntoResponse {
+    let store = skills_store!(&s);
+    match store.frame(&id, n).await {
+        Some(bytes) => (
+            [
+                (header::CONTENT_TYPE, "image/jpeg"),
+                (header::CACHE_CONTROL, "public, max-age=86400"),
+            ],
+            bytes,
+        )
+            .into_response(),
+        None => err(StatusCode::NOT_FOUND, "no frame for that step"),
+    }
+}
+
+/// DELETE /api/skills/{id} — delete a skill.
+async fn api_skill_delete(
+    axum::extract::State(s): axum::extract::State<AppState>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> impl IntoResponse {
+    let store = skills_store!(&s);
+    Json(serde_json::json!({"deleted": store.remove(&id).await})).into_response()
+}
+
+/// POST /api/skills/{id}/run — start a run with the skill's full plan
+/// baked into the goal. The goal is re-sent on every brain call, so the
+/// plan can never fall out of context and the run has no reason to
+/// re-read plan files from disk.
+async fn api_skill_run(
+    axum::extract::State(s): axum::extract::State<AppState>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> impl IntoResponse {
+    let store = skills_store!(&s);
+    let Some(skill) = store.get(&id).await else {
+        return err(StatusCode::NOT_FOUND, "unknown skill");
+    };
+    let name = skill.get("name").and_then(|v| v.as_str()).unwrap_or("");
+    let instructions = skill
+        .get("instructions")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let empty = Vec::new();
+    let steps = skill
+        .get("steps")
+        .and_then(|v| v.as_array())
+        .unwrap_or(&empty);
+    let goal = skill_run_goal(name, instructions, steps);
+    if goal.trim().is_empty() {
+        return err(StatusCode::BAD_REQUEST, "skill has no instructions");
+    }
+    start_run(s.stepper.clone(), goal, false, false, None)
 }
 
 async fn api_chat(
@@ -1231,15 +1700,23 @@ mod tests {
             stepper: None,
             traces: None,
             keys: KeySlot::default(),
+            video_keys: KeySlot::default(),
             lease: Lease::new(),
             control: None,
             config: None,
             videos: None,
+            skills: None,
             env_key_present: false,
+            video_env_key_present: false,
             backend: "fake".to_string(),
             brain: "fake".to_string(),
             version: "0.1.0".to_string(),
             started: std::time::SystemTime::now(),
+            mcp_backend: None,
+            mcp_display: ":1".to_string(),
+            mcp_session: None,
+            mcp_skills: None,
+            mcp_policy: rose_mcp::McpPolicy::default(),
         }
     }
 
@@ -1380,6 +1857,46 @@ mod tests {
         let (_, body) = get(port, "/api/keys").await;
         let v: serde_json::Value = serde_json::from_slice(&body).expect("json");
         assert_eq!(v["set"], false);
+    }
+
+    #[tokio::test]
+    async fn video_key_falls_back_to_brain_key() {
+        let port = spawn(state(None)).await;
+        // No keys at all: video reports none.
+        let (_, body) = get(port, "/api/keys").await;
+        let v: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        assert_eq!(v["video_set"], false);
+        assert_eq!(v["video_source"], "none");
+
+        // Brain key alone: video follows it.
+        let (head, _) = post(port, "/api/keys", r#"{"muse_api_key":"sk-brain"}"#).await;
+        assert!(head.contains("200 OK"), "{head}");
+        let (_, body) = get(port, "/api/keys").await;
+        let v: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        assert_eq!(v["video_set"], true);
+        assert_eq!(v["video_source"], "brain");
+
+        // Explicit video key wins over the brain fallback.
+        let (head, _) = post(port, "/api/keys", r#"{"video_api_key":"sk-video"}"#).await;
+        assert!(head.contains("200 OK"), "{head}");
+        let (_, body) = get(port, "/api/keys").await;
+        let v: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        assert_eq!(v["video_set"], true);
+        assert_eq!(v["video_source"], "web");
+        assert!(!String::from_utf8_lossy(&body).contains("sk-video"));
+
+        // Empty video key clears the slot (back to brain fallback),
+        // without touching the brain key.
+        let (head, _) = post(port, "/api/keys", r#"{"video_api_key":""}"#).await;
+        assert!(head.contains("200 OK"), "{head}");
+        let (_, body) = get(port, "/api/keys").await;
+        let v: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        assert_eq!(v["video_source"], "brain");
+        assert_eq!(v["set"], true, "brain key untouched");
+
+        // Neither key at all is still a 400.
+        let (head, _) = post(port, "/api/keys", r#"{}"#).await;
+        assert!(head.contains("400"), "{head}");
     }
 
     struct StubRunner;
@@ -1733,7 +2250,7 @@ mod tests {
         let (head, _) = put(
             port,
             "/api/config",
-            r#"{"server":{"bind":"nope","allow_remote":false},"desktop":{"backend":"fake","display":":1","width":1600,"height":900},"models":{"brain":"fake","endpoint":"https://api.meta.ai/v1","model":"m"},"policy":{"max_steps":40,"max_minutes":15,"max_model_calls":60,"require_approval_for":[]},"data":{"dir":"/tmp/rose"},"cdp":{"endpoint":"http://127.0.0.1:9222"}}"#,
+            r#"{"server":{"bind":"nope","allow_remote":false},"desktop":{"backend":"fake","display":":1","width":1600,"height":900},"models":{"brain":"fake","endpoint":"https://api.meta.ai/v1","model":"m"},"policy":{"max_steps":40,"max_minutes":15,"max_model_calls":60,"require_approval_for":[]},"data":{"dir":"/tmp/rose"}}"#,
         )
         .await;
         assert!(head.contains("400"), "{head}");
@@ -1741,7 +2258,7 @@ mod tests {
         let (head, _) = put(
             port,
             "/api/config",
-            r#"{"server":{"bind":"0.0.0.0:8787","allow_remote":false},"desktop":{"backend":"fake","display":":1","width":1600,"height":900},"models":{"brain":"fake","endpoint":"https://api.meta.ai/v1","model":"m"},"policy":{"max_steps":40,"max_minutes":15,"max_model_calls":60,"require_approval_for":[]},"data":{"dir":"/tmp/rose"},"cdp":{"endpoint":"http://127.0.0.1:9222"}}"#,
+            r#"{"server":{"bind":"0.0.0.0:8787","allow_remote":false},"desktop":{"backend":"fake","display":":1","width":1600,"height":900},"models":{"brain":"fake","endpoint":"https://api.meta.ai/v1","model":"m"},"policy":{"max_steps":40,"max_minutes":15,"max_model_calls":60,"require_approval_for":[]},"data":{"dir":"/tmp/rose"}}"#,
         )
         .await;
         assert!(head.contains("400"), "{head}");
@@ -1750,7 +2267,7 @@ mod tests {
         let (head, body) = put(
             port,
             "/api/config",
-            r#"{"server":{"bind":"127.0.0.1:8787","allow_remote":false},"desktop":{"backend":"x11","display":":1","width":1600,"height":900},"models":{"brain":"muse","endpoint":"https://api.meta.ai/v1","model":"muse-spark-1.3-contributor"},"policy":{"max_steps":12,"max_minutes":15,"max_model_calls":60,"require_approval_for":["pay"]},"data":{"dir":"~/.local/share/rose"},"cdp":{"endpoint":"http://127.0.0.1:9222"}}"#,
+            r#"{"server":{"bind":"127.0.0.1:8787","allow_remote":false},"desktop":{"backend":"x11","display":":1","width":1600,"height":900},"models":{"brain":"muse","endpoint":"https://api.meta.ai/v1","model":"muse-spark-1.3-contributor"},"policy":{"max_steps":12,"max_minutes":15,"max_model_calls":60,"require_approval_for":["pay"]},"data":{"dir":"~/.local/share/rose"}}"#,
         )
         .await;
         assert!(head.contains("200 OK"), "{head}");
@@ -1762,7 +2279,7 @@ mod tests {
         let (head, body) = put(
             port,
             "/api/config",
-            r#"{"server":{"bind":"127.0.0.1:8787","allow_remote":false},"desktop":{"backend":"fake","display":":1","width":1600,"height":900},"models":{"brain":"fake","endpoint":"https://api.meta.ai/v1","model":"muse-spark-1.3-contributor"},"policy":{"max_steps":12,"max_minutes":15,"max_model_calls":60,"require_approval_for":["pay"]},"data":{"dir":"~/.local/share/rose"},"cdp":{"endpoint":"http://127.0.0.1:9222"}}"#,
+            r#"{"server":{"bind":"127.0.0.1:8787","allow_remote":false},"desktop":{"backend":"fake","display":":1","width":1600,"height":900},"models":{"brain":"fake","endpoint":"https://api.meta.ai/v1","model":"muse-spark-1.3-contributor"},"policy":{"max_steps":12,"max_minutes":15,"max_model_calls":60,"require_approval_for":["pay"]},"data":{"dir":"~/.local/share/rose"}}"#,
         )
         .await;
         assert!(head.contains("200 OK"), "{head}");
@@ -1950,6 +2467,249 @@ mod tests {
         let (head, _) = request(port, "DELETE", &format!("/api/videos/{id}"), None).await;
         assert!(head.contains("200 OK"), "{head}");
         let (head, _) = get(port, &format!("/api/videos/{id}")).await;
+        assert!(head.contains("404"), "{head}");
+    }
+
+    struct StubSkills {
+        items: std::sync::Mutex<std::collections::HashMap<String, serde_json::Value>>,
+    }
+    impl StubSkills {
+        fn new() -> Self {
+            Self {
+                items: std::sync::Mutex::new(std::collections::HashMap::new()),
+            }
+        }
+    }
+    #[async_trait]
+    impl SkillSource for StubSkills {
+        async fn list(&self) -> Vec<serde_json::Value> {
+            let mut v: Vec<serde_json::Value> =
+                self.items.lock().expect("s").values().cloned().collect();
+            v.sort_by(|a, b| b["created_at"].as_str().cmp(&a["created_at"].as_str()));
+            v
+        }
+        async fn create(
+            &self,
+            name: &str,
+            instructions: &str,
+            steps: Vec<serde_json::Value>,
+            source: &str,
+        ) -> Result<serde_json::Value, String> {
+            if name.trim().is_empty() {
+                return Err("name must be 1..100 chars".to_string());
+            }
+            let id = format!("s{}", self.items.lock().expect("s").len() + 1);
+            let skill = serde_json::json!({
+                "id": id, "name": name, "instructions": instructions,
+                "steps": steps, "source": source,
+                "created_at": "2026-01-01T00:00:00Z",
+                "updated_at": "2026-01-01T00:00:00Z",
+            });
+            self.items.lock().expect("s").insert(id, skill.clone());
+            Ok(skill)
+        }
+        async fn get(&self, id: &str) -> Option<serde_json::Value> {
+            self.items.lock().expect("s").get(id).cloned()
+        }
+        async fn update(
+            &self,
+            id: &str,
+            name: &str,
+            instructions: &str,
+            steps: Vec<serde_json::Value>,
+        ) -> Result<serde_json::Value, String> {
+            let mut lock = self.items.lock().expect("s");
+            let skill = lock.get_mut(id).ok_or("unknown skill".to_string())?;
+            skill["name"] = serde_json::json!(name);
+            skill["instructions"] = serde_json::json!(instructions);
+            skill["steps"] = serde_json::json!(steps);
+            Ok(skill.clone())
+        }
+        async fn remove(&self, id: &str) -> bool {
+            self.items.lock().expect("s").remove(id).is_some()
+        }
+    }
+
+    #[tokio::test]
+    async fn skills_crud_roundtrip() {
+        // No backend: 404 so the UI hides the panel.
+        let port = spawn(state(None)).await;
+        let (head, _) = get(port, "/api/skills").await;
+        assert!(head.contains("404"), "{head}");
+
+        let mut st = state(None);
+        st.skills = Some(Arc::new(StubSkills::new()));
+        let port = spawn(st).await;
+        let (_, body) = get(port, "/api/skills").await;
+        let v: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        assert_eq!(v["skills"], serde_json::json!([]));
+
+        // Create validates; empty names are 400.
+        let (head, _) = post(port, "/api/skills", r#"{"name": "", "instructions": "x"}"#).await;
+        assert!(head.contains("400"), "{head}");
+        let (head, body) = post(
+            port,
+            "/api/skills",
+            r#"{"name": "morning screen", "instructions": "1. open it", "steps": [{"say": "hi"}], "source": "demo.mp4"}"#,
+        )
+        .await;
+        assert!(head.contains("200 OK"), "{head}");
+        let v: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        assert!(v["saved"] == true);
+        let id = v["skill"]["id"].as_str().expect("id").to_string();
+        assert_eq!(v["skill"]["steps"].as_array().expect("steps").len(), 1);
+
+        // Get, rename via PUT, unknown ids 404.
+        let (_, body) = get(port, &format!("/api/skills/{id}")).await;
+        let v: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        assert_eq!(v["skill"]["name"], "morning screen");
+        let (head, _) = get(port, "/api/skills/s-missing").await;
+        assert!(head.contains("404"), "{head}");
+        let (head, body) = put(
+            port,
+            &format!("/api/skills/{id}"),
+            r#"{"name": "evening screen", "instructions": "1. open it", "steps": []}"#,
+        )
+        .await;
+        assert!(head.contains("200 OK"), "{head}");
+        let v: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        assert_eq!(v["skill"]["name"], "evening screen");
+
+        // Delete removes; second delete reports false but stays 200.
+        let (head, body) = request(port, "DELETE", &format!("/api/skills/{id}"), None).await;
+        assert!(head.contains("200 OK"), "{head}");
+        let v: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        assert_eq!(v["deleted"], true);
+        let (head, _) = get(port, &format!("/api/skills/{id}")).await;
+        assert!(head.contains("404"), "{head}");
+    }
+
+    #[test]
+    fn skill_doc_renders_lines_not_json() {
+        let skill = serde_json::json!({
+            "id": "s1", "name": "screen",
+            "instructions": "Do the screening.",
+            "source": "demo.mp4",
+            "created_at": "t", "updated_at": "t",
+            "steps": [
+                {"ts": 8, "say": "Open it", "intent": "open the app", "params": "",
+                 "approval": false, "conf": 0.9, "quote": "open now"},
+                {"ts": 20, "say": "Pick month", "intent": "pick month", "params": "month = {{m}}",
+                 "approval": true, "conf": 0.8, "quote": ""}
+            ],
+        });
+        let doc = skill_markdown(&skill);
+        assert!(doc.starts_with("# screen\n\nDo the screening.\n"), "{doc}");
+        assert!(doc.contains("### 1. Open it — open the app"), "{doc}");
+        assert!(doc.contains("Params: `month = {{m}}`"), "{doc}");
+        assert!(doc.contains("Needs approval."), "{doc}");
+        assert!(doc.contains("![step 1](frames/0)"), "{doc}");
+        assert!(doc.contains("![step 2](frames/1)"), "{doc}");
+        assert!(doc.contains("@ 8s"), "{doc}");
+        assert!(!doc.contains("\"intent\""), "{doc}");
+        // No steps: still a valid doc, no image links.
+        let bare = serde_json::json!({
+            "id": "s2", "name": "n", "instructions": "Just do it.",
+            "source": "manual", "created_at": "t", "updated_at": "t", "steps": [],
+        });
+        let bare_doc = skill_markdown(&bare);
+        assert!(bare_doc.contains("Just do it."), "{bare_doc}");
+        assert!(!bare_doc.contains("frames/"), "{bare_doc}");
+    }
+
+    #[test]
+    fn skill_run_goal_pins_full_plan() {
+        let steps = vec![
+            serde_json::json!({"say": "Open it", "intent": "open the app", "params": "", "approval": false}),
+            serde_json::json!({"say": "Set month", "intent": "pick month", "params": "month = {{month}}", "approval": true}),
+        ];
+        let goal = skill_run_goal("morning screen", "Do the screening", &steps);
+        // Instructions lead; the numbered plan follows in full.
+        assert!(goal.starts_with("Do the screening"), "{goal}");
+        assert!(goal.contains("already loaded in full"), "{goal}");
+        assert!(goal.contains("1. Open it"), "{goal}");
+        assert!(goal.contains("month = {{month}}"), "{goal}");
+        assert!(goal.contains("(needs approval)"), "{goal}");
+        // No steps: plain instructions, no plan block to re-read.
+        let bare = skill_run_goal("n", "Just do it", &[]);
+        assert_eq!(bare, "Just do it");
+    }
+
+    struct RecordingRunner {
+        goals: std::sync::Mutex<Vec<String>>,
+    }
+    #[async_trait]
+    impl StepRunner for RecordingRunner {
+        async fn run_step(
+            &self,
+            goal: &str,
+            _force: bool,
+            _auto_approve: bool,
+            _chat_id: Option<&str>,
+            tx: &StepEventSender,
+        ) -> Result<serde_json::Value, String> {
+            self.goals.lock().expect("g").push(goal.to_string());
+            emit(tx, serde_json::json!({"type": "planned", "step": 0}));
+            Ok(step_view("recording runner done", true, false, true))
+        }
+    }
+
+    #[tokio::test]
+    async fn skill_run_starts_with_plan_in_goal() {
+        let mut st = state(None);
+        st.skills = Some(Arc::new(StubSkills::new()));
+        let runner = Arc::new(RecordingRunner {
+            goals: std::sync::Mutex::new(Vec::new()),
+        });
+        st.stepper = Some(runner.clone() as Arc<dyn StepRunner>);
+        let port = spawn(st).await;
+        let (head, _) = post(port, "/api/skills/s-missing/run", "{}").await;
+        assert!(head.contains("404"), "{head}");
+
+        let (head, body) = post(
+            port,
+            "/api/skills",
+            r#"{"name": "screen", "instructions": "Do the screening", "steps": [{"say": "Open it", "intent": "open the app", "params": ""}], "source": "demo.mp4"}"#,
+        )
+        .await;
+        assert!(head.contains("200 OK"), "{head}");
+        let v: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        let id = v["skill"]["id"].as_str().expect("id").to_string();
+
+        let (head, body) = post(port, &format!("/api/skills/{id}/run"), "{}").await;
+        assert!(head.contains("200 OK"), "{head}");
+        assert!(head.contains("x-ndjson"), "{head}");
+        let events = ndjson_events(&dechunk(&body));
+        assert!(events.iter().any(|e| e["type"] == "final"), "{events:?}");
+
+        // The runner received ONE goal carrying instructions + full plan,
+        // so no step ever needs to re-read a plan file from disk.
+        let goals = runner.goals.lock().expect("g");
+        assert_eq!(goals.len(), 1);
+        assert!(goals[0].starts_with("Do the screening"), "{}", goals[0]);
+        assert!(goals[0].contains("1. Open it"), "{}", goals[0]);
+        assert!(goals[0].contains("already loaded in full"), "{}", goals[0]);
+
+        // The doc renders the same skill as markdown lines with frame
+        // links — no raw JSON anywhere a human or model would read.
+        let (head, body) = get(port, &format!("/api/skills/{id}/doc")).await;
+        assert!(head.contains("200 OK"), "{head}");
+        assert!(
+            head.to_ascii_lowercase().contains("text/markdown"),
+            "{head}"
+        );
+        let doc = String::from_utf8_lossy(&body).into_owned();
+        assert!(doc.starts_with("# screen\n\nDo the screening\n"), "{doc}");
+        assert!(doc.contains("### 1. Open it"), "{doc}");
+        assert!(doc.contains("![step 1](frames/0)"), "{doc}");
+        let (head, _) = get(port, "/api/skills/s-missing/doc").await;
+        assert!(head.contains("404"), "{head}");
+
+        // No video backend behind the stub: frames 404 instead of
+        // hanging on ffmpeg.
+        let (head, _) = get(port, &format!("/api/skills/{id}/frames/0")).await;
+        assert!(head.contains("404"), "{head}");
+        let (head, _) = get(port, &format!("/api/skills/{id}/frames/99")).await;
         assert!(head.contains("404"), "{head}");
     }
 }

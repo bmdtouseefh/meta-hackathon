@@ -33,12 +33,8 @@ rm -rf .pkg-stage dist
 
 cp -f "target/$TARGET/release/rosed" .pkg-stage/usr/bin/rosed
 chmod 755 .pkg-stage/usr/bin/rosed
-cp -f deploy/systemd/xvnc.service deploy/systemd/rosed.service deploy/systemd/chrome-cdp.service .pkg-stage/usr/lib/systemd/user/
+cp -f deploy/systemd/xvnc.service deploy/systemd/rosed.service .pkg-stage/usr/lib/systemd/user/
 chmod 644 .pkg-stage/usr/lib/systemd/user/*.service
-# google-chrome wrapper: forces all launches into the shared CDP profile
-# (/usr/local/bin precedes /usr/bin on PATH).
-cp -f deploy/google-chrome-wrapper.sh .pkg-stage/usr/local/bin/google-chrome
-chmod 755 .pkg-stage/usr/local/bin/google-chrome
 cp -f config/rose.example.toml .pkg-stage/usr/share/doc/rose/
 cat > .pkg-stage/usr/share/doc/rose/copyright <<'EOF'
 Rose - AI agent for an Ubuntu VM (XFCE over TigerVNC).

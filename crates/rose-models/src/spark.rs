@@ -6,7 +6,9 @@
 //! retry 429/5xx with backoff, never retry 400.
 
 use base64::Engine;
-use rose_core::{Action, ElementId, MouseButton, Result, RoseError, StepSummary, Target};
+use rose_core::{
+    Action, ElementId, MouseButton, Result, RoseError, StepSummary, Target, VIEWPORT_CENTRE_CELL,
+};
 use serde::Deserialize;
 
 /// The §6 reply: one JSON object, nothing else.
@@ -38,6 +40,12 @@ pub enum ModelReply {
     },
     Done {
         say: String,
+    },
+    /// General chatbot answer: no desktop action, no shell, no screenshot
+    /// needed. Used when the goal is conversation, general knowledge,
+    /// explanations, coding help, etc. Ends the run as a chat reply.
+    Chat {
+        text: String,
     },
     Ask {
         say: String,
@@ -104,6 +112,16 @@ fn to_reply(raw: RawReply) -> Result<ModelReply> {
     let say = raw.say.unwrap_or_default();
     match raw.status.as_str() {
         "done" => Ok(ModelReply::Done { say }),
+        "chat" => {
+            // General chatbot answer: `say` is primary, `text` is fallback.
+            // Both are freeform (may be long), unlike action `say` lines.
+            let text = if !say.is_empty() {
+                say
+            } else {
+                raw.text.unwrap_or_default()
+            };
+            Ok(ModelReply::Chat { text })
+        }
         "ask" => Ok(ModelReply::Ask { say }),
         "fail" => Ok(ModelReply::Fail { say }),
         "act" => {
@@ -154,7 +172,7 @@ fn to_reply(raw: RawReply) -> Result<ModelReply> {
                 }
                 "wait" => Ok(ModelReply::Act {
                     action: Action::Wait {
-                        ms: raw.ms.unwrap_or(1_500).clamp(100, 10_000),
+                        ms: raw.ms.unwrap_or(1_500),
                     },
                     say,
                     enter_after: false,
@@ -182,6 +200,14 @@ fn to_reply(raw: RawReply) -> Result<ModelReply> {
                     None => Err(RoseError::Model("key needs text".to_string())),
                 },
                 "look" => Ok(ModelReply::Look { say }),
+                "chat" => {
+                    let text = if !say.is_empty() {
+                        say
+                    } else {
+                        raw.text.unwrap_or_default()
+                    };
+                    Ok(ModelReply::Chat { text })
+                }
                 "shell" => match raw.text {
                     Some(command) if !command.trim().is_empty() => {
                         Ok(ModelReply::Shell { command, say })
@@ -190,16 +216,37 @@ fn to_reply(raw: RawReply) -> Result<ModelReply> {
                         "shell needs text (the command)".to_string(),
                     )),
                 },
-                "scroll" => Ok(ModelReply::Act {
-                    action: Action::Scroll {
-                        // The §6 format carries no scroll target; centre is
-                        // the sane default and T1.4+ grounds it properly.
-                        target: Target::Point { x: 800, y: 450 },
-                        dy: raw.dy.unwrap_or(-600),
-                    },
-                    say,
-                    enter_after: false,
-                }),
+                "scroll" => {
+                    // Grid-first like clicks: an optional `element`
+                    // (grid cell `g<col>,<row>` or overlay number) aims
+                    // the scroll, so the brain never guesses pixels.
+                    // Bare `{"action":"scroll"}` targets the viewport
+                    // centre — resolved against live geometry at
+                    // dispatch, never a guessed point.
+                    let target = match &raw.element {
+                        Some(v) => {
+                            let s = if let Some(n) = v.as_u64() {
+                                n.to_string()
+                            } else if let Some(s) = v.as_str() {
+                                s.to_string()
+                            } else {
+                                return Err(RoseError::Model(
+                                    "scroll element must be a number or string".to_string(),
+                                ));
+                            };
+                            Target::Element(ElementId(s))
+                        }
+                        None => Target::Element(ElementId(VIEWPORT_CENTRE_CELL.to_string())),
+                    };
+                    Ok(ModelReply::Act {
+                        action: Action::Scroll {
+                            target,
+                            dy: raw.dy.unwrap_or(-600),
+                        },
+                        say,
+                        enter_after: false,
+                    })
+                }
                 other => Err(RoseError::Model(format!("unknown action {other:?}"))),
             }
         }
@@ -232,10 +279,18 @@ impl MuseClient {
             .map_err(|e| RoseError::Model(format!("http client: {e}")))?;
         Ok(Self {
             http,
-            endpoint: endpoint.trim_end_matches('/').to_string(),
+            // Accept both `https://host/v1` and `https://host/v1/chat/completions`
+            // as the base URL; path joining stays correct either way.
+            endpoint: rose_core::ModelsConfig::normalize_base_url(endpoint),
             model: model.to_string(),
             api_key: api_key.to_string(),
         })
+    }
+
+    /// Effective chat-completions URL for this client (Meta default shape:
+    /// `{base}/chat/completions`).
+    pub fn chat_url(&self) -> String {
+        rose_core::ModelsConfig::chat_completions_url(&self.endpoint)
     }
 
     fn history_text(history: &[StepSummary]) -> String {
@@ -244,25 +299,21 @@ impl MuseClient {
         }
         history
             .iter()
-            .rev()
-            .take(10)
-            .rev()
             .map(|s| format!("- step {}: {} ({})", s.idx, s.intent, s.say))
             .collect::<Vec<_>>()
             .join("\n")
     }
 
-    /// Text-only step instructions: no screenshot is attached, so the
-    /// model must not invent pixel actions. Shell-first; `look` is the
-    /// only way to get a screenshot.
+    /// Text-only step instructions: no screenshot is attached.
+    /// The agent can chat or use the computer: answer directly when no desktop/shell is needed.
     const TEXT_MODE: &'static str = "\n\n# This step: TEXT ONLY (no screenshot attached)\n\
-        You cannot see the desktop this step. Do not emit click/double_click/type/key/scroll — you have nothing to aim at.\n\
-        Decide from the goal and history (including shell outputs) alone:\n\
+        You are an AI agent that can chat and operate the computer. If the goal is conversation, a general-knowledge question, an explanation, coding help, writing, math, or anything answerable from knowledge/text alone (no desktop, no files, no apps needed), reply {\"status\":\"chat\",\"say\":\"<your answer>\"} directly — no screenshot, no shell, no look.\n\
+        Otherwise, decide from the goal and history (including shell outputs) alone:\n\
         - If the goal (or its next step) can be done from the shell, reply \"shell\". \
         Opening/launching an app or a URL is ALWAYS a shell step (e.g. setsid google-chrome 'URL' &): never ask to look just to find its icon.\n\
         - If shell output in the history already proves the goal is complete, reply \"done\".\n\
         - Only if the next step genuinely requires seeing and operating the GUI (clicking a control in an already-open app), reply {\"status\":\"act\",\"action\":\"look\",\"say\":\"I need to see the desktop to ...\"} and a screenshot will be taken for your next reply.\n\
-        - If the goal references a recorded video (e.g. \"mail-video\"), its Spark-drafted steps already exist: list ~/.local/share/rose/videos/ to find the id, `cat` that id's steps.json, and follow those steps instead of searching the disk for the video. Never re-derive what steps.json already says.\n";
+        - If the goal is a desktop task, you may also answer brief chat questions about it with \"chat\", but prefer acting when action is needed.\n";
 
     /// Goal + short history + current JPEG + grounded element list ->
     /// one JSON action. The list is the text twin of the annotated image
@@ -338,7 +389,7 @@ impl MuseClient {
             ],
         });
 
-        let url = format!("{}/chat/completions", self.endpoint);
+        let url = self.chat_url();
         let mut last_err = String::new();
         // One attempt + one retry (transient 429/5xx or one bad-JSON reply).
         for attempt in 1..=2 {
@@ -441,6 +492,14 @@ mod tests {
             parse_reply(r#"{"status":"fail","say":"Nope"}"#).unwrap(),
             ModelReply::Fail { .. }
         ));
+        // General chat: long freeform answer, via status or act/chat.
+        let long = "x".repeat(5000);
+        let chat = parse_reply(&format!(r#"{{"status":"chat","say":"{long}"}}"#)).expect("chat");
+        assert!(matches!(chat, ModelReply::Chat { ref text } if text.len() == 5000));
+        assert!(matches!(
+            parse_reply(r#"{"status":"act","action":"chat","say":"hello"}"#).unwrap(),
+            ModelReply::Chat { .. }
+        ));
     }
 
     #[test]
@@ -490,6 +549,42 @@ mod tests {
         // Legacy pixels still parse for fallback runs.
         assert!(parse_reply(r#"{"status":"act","action":"click","x":1,"y":2,"say":"p"}"#).is_ok());
         assert!(parse_reply(r#"{"status":"act","action":"click","say":"no target"}"#).is_err());
+    }
+
+    #[test]
+    fn parses_scroll_with_optional_grid_target() {
+        // Bare scrolls aim the viewport centre sentinel (resolved against
+        // live geometry at dispatch, never guessed pixels).
+        let bare = parse_reply(r#"{"status":"act","action":"scroll","dy":-600,"say":"s"}"#)
+            .expect("bare scroll");
+        if let ModelReply::Act {
+            action: Action::Scroll { target, dy },
+            ..
+        } = bare
+        {
+            assert_eq!(dy, -600);
+            assert_eq!(
+                target,
+                Target::Element(ElementId(VIEWPORT_CENTRE_CELL.to_string()))
+            );
+        } else {
+            panic!("want scroll");
+        }
+        // Grid-cell scrolls survive parsing as elements for the Stepper
+        // to resolve against the frame's grid geometry.
+        let aimed = parse_reply(
+            r#"{"status":"act","action":"scroll","element":"g30,18","dy":-600,"say":"s"}"#,
+        )
+        .expect("grid scroll");
+        if let ModelReply::Act {
+            action: Action::Scroll { target, .. },
+            ..
+        } = aimed
+        {
+            assert_eq!(target, Target::Element(ElementId("g30,18".to_string())));
+        } else {
+            panic!("want scroll");
+        }
     }
 
     #[test]
@@ -643,7 +738,7 @@ mod tests {
     }
 
     #[test]
-    fn history_text_caps_at_ten() {
+    fn history_text_keeps_full_history() {
         let h: Vec<StepSummary> = (0..15)
             .map(|i| StepSummary {
                 idx: i,
@@ -653,6 +748,6 @@ mod tests {
             .collect();
         let text = MuseClient::history_text(&h);
         assert!(text.contains("step 14"));
-        assert!(!text.contains("step 0"), "oldest trimmed");
+        assert!(text.contains("step 0"), "no arbitrary history cap");
     }
 }

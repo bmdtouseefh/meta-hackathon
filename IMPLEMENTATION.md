@@ -108,7 +108,7 @@ meta-hackathon/
 | `rose-core` | `serde`, `serde_json`, `thiserror`, `chrono`, `uuid`. **No Tokio, no I/O, no other rose crate.** |
 | `rose-desktop-x11` | `rose-core`, `x11rb`, `image`, `tokio`, `tracing` |
 | `rose-desktop-cdp` | `rose-core`, `chromiumoxide` (CDP protocol only, not an agent framework), `tokio`, `tracing`, `serde_json`, `futures`, `which`, `chrono` |
-| `rose-grid` | `rose-core`, `image` (constant 64x36 numbered grid overlay; the pixel-side grounding, instant and dependency-light). |
+| `rose-grid` | `rose-core`, `image` (constant 67x39 numbered grid overlay; the pixel-side grounding, instant and dependency-light). |
 | `rose-desktop-auto` | `rose-core`, `rose-desktop-x11`, `rose-desktop-cdp`, `tokio`, `tracing`. Router only: X11 default, CDP when a Chrome window is frontmost. |
 | `rose-desktop-fake` | `rose-core`, `image`, `tokio` |
 | `rose-models` | `rose-core`, `reqwest` (rustls), `serde_json`, `tokio`, `tracing`, `base64` |

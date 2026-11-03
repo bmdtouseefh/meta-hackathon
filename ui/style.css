@@ -39,11 +39,14 @@ body { overflow: hidden; background: var(--bg); color: var(--ink); }
 .thin-scroll::-webkit-scrollbar { width: .45rem; }
 .thin-scroll::-webkit-scrollbar-thumb { background: var(--line); border-radius: 999px; }
 
-/* Sidebar rail mode: collapse to a slim strip, ☰ stays put top-left */
+/* Sidebar rail mode: desktop-only collapse to a slim strip.
+   Scoped to >=768px so the mobile drawer can never hide New chat. */
 #chat-sidebar { transition: width .18s ease; }
-aside#chat-sidebar.rail { width: 3.5rem; }
-#chat-sidebar.rail .rail-hide { display: none; }
-#chat-sidebar.rail .rail-top { padding: .75rem .5rem 0; }
+@media (min-width: 768px) {
+  aside#chat-sidebar.rail { width: 3.5rem; }
+  #chat-sidebar.rail .rail-hide { display: none; }
+  #chat-sidebar.rail .rail-top { padding: .75rem .5rem 0; }
+}
 
 /* Typographic scale: hierarchy through weight, fluid sizes */
 .t-display { font-weight: 700; font-size: clamp(1.05rem, 1rem + .6vw, 1.25rem); line-height: 1.3; letter-spacing: -.01em; }
@@ -54,6 +57,51 @@ aside#chat-sidebar.rail { width: 3.5rem; }
 /* Setup config form + video workflow */
 .cfg-input { width: 100%; border-radius: .5rem; border: 1px solid var(--line); background: transparent; padding: .45rem .6rem; font-size: .85rem; outline: none; color: var(--ink); }
 .cfg-input:focus { border-color: var(--accent); }
+
+/* Minimal monochrome icon system (stroke = currentColor, theme-aware).
+   All chrome icons are 16px inline SVGs below; run-trace status uses
+   small CSS dots (no unicode symbols). */
+.icon { width: 1rem; height: 1rem; flex: none; vertical-align: -0.18em;
+  stroke: currentColor; fill: none; stroke-width: 1.7;
+  stroke-linecap: round; stroke-linejoin: round; }
+.btn-ghost .icon, .btn-accent .icon { pointer-events: none; }
+.avatar-min { width: 1.35rem; height: 1.35rem; border-radius: 9999px; flex: none;
+  display: inline-flex; align-items: center; justify-content: center;
+  background: var(--line); color: var(--muted);
+  font-size: 0.68rem; font-weight: 700; letter-spacing: 0; user-select: none; }
+.log-mark { display: inline-block; min-width: 1.1em; font-weight: 700; }
+/* Long chat answers / shell output must not overflow small screens. */
+.bubble-rose, .bubble-mine { overflow-wrap: anywhere; }
+.bubble-rose { white-space: pre-wrap; }
+
+/* Fallbacks if the Tailwind CDN ever fails (offline mobile browser,
+   content blocker): hiding and the drawer/backdrop keep working on
+   style.css alone; touch taps never double-tap zoom. */
+.hidden { display: none !important; }
+button { touch-action: manipulation; }
+@media (max-width: 767px) {
+  #sidebar-backdrop:not(.hidden) { display: block; position: fixed; inset: 0; z-index: 30; background: rgba(0,0,0,.5); }
+}
+
+/* Mobile layout (<768px): history is an off-canvas drawer, the desktop
+   panel is a full-screen sheet, chat keeps the full width. Desktop
+   (>=768px) is untouched by everything in this block. */
+@media (max-width: 767px) {
+  #chat-sidebar {
+    position: fixed; inset: 0 auto 0 0; z-index: 40;
+    width: min(85vw, 20rem) !important; height: 100dvh;
+    transform: translateX(-105%); transition: transform .2s ease;
+    box-shadow: 0 0 40px rgba(0,0,0,.35);
+  }
+  #chat-sidebar.mobile-open { transform: none; }
+  /* Rail is desktop-only; the drawer always shows its full content. */
+  #desk-panel { position: fixed; inset: 0; z-index: 35; background: var(--card); }
+  /* 16px input text prevents iOS Safari focus-zoom on the composer. */
+  #composer, #chat-search, input, textarea, select { font-size: 16px; }
+  /* Room for the home indicator / notch when the composer is fixed. */
+  .composer-wrap { padding-bottom: calc(.75rem + env(safe-area-inset-bottom)); }
+  header button { min-height: 2.5rem; }
+}
 
 /* Right-rail scroll fix: the desk panel is a flex column AND the scroll
    container. Its frame wrapper and video section both use overflow-hidden

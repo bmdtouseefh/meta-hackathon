@@ -5,11 +5,11 @@ const threadEl = () => document.getElementById("live-tail");
 function bubble(html, mine) {
   const d = document.createElement("div");
   if (mine) {
-    d.className = "bubble-mine self-end max-w-[85%] px-[2%] py-2 rounded-2xl rounded-br-sm";
+    d.className = "bubble-mine self-end max-w-[92%] sm:max-w-[85%] px-[2%] py-2 rounded-2xl rounded-br-sm";
     d.textContent = html;
   } else {
-    d.className = "self-start max-w-[90%] flex gap-2";
-    d.innerHTML = `<span class="flex-none">🌌</span><div class="bubble-rose px-[2%] py-2 rounded-2xl rounded-tl-sm">${html}</div>`;
+    d.className = "self-start max-w-[96%] sm:max-w-[90%] flex gap-2";
+    d.innerHTML = `<span class="avatar-min">R</span><div class="bubble-rose px-[2%] py-2 rounded-2xl rounded-tl-sm">${html}</div>`;
   }
   threadEl().appendChild(d);
   d.scrollIntoView({ block: "nearest" });
@@ -17,8 +17,8 @@ function bubble(html, mine) {
 
 function approvalCard(say, goal, chatId) {
   const d = document.createElement("div");
-  d.className = "self-start w-full max-w-[90%] flex gap-2";
-  d.innerHTML = `<span class="flex-none text-amber-500 font-bold text-lg">●</span>
+  d.className = "self-start w-full max-w-[96%] sm:max-w-[90%] flex gap-2";
+  d.innerHTML = `<span class="flex-none mt-1 inline-block w-2.5 h-2.5 rounded-full bg-amber-500" aria-hidden="true"></span>
     <div class="flex-1 p-[4%] rounded-2xl rounded-tl-sm border-2 border-amber-500 bg-amber-50 dark:bg-amber-950">
       <div class="font-semibold text-sm">Needs approval — ${say}</div>
       <div class="flex flex-wrap gap-2 mt-2">
@@ -64,14 +64,41 @@ function line(parent, text, cls) {
   return d;
 }
 
+/// Trace line with a minimal status dot (no unicode symbols): info =
+/// neutral, accent = in-progress, ok = success, warn = needs attention,
+/// error = failed. Keeps the chat readable while the run streams.
+function mark(parent, tone, text, cls) {
+  const d = document.createElement("div");
+  d.className = "flex gap-2 " + (cls || "text-sm");
+  const dot = document.createElement("span");
+  dot.className =
+    "inline-block w-2 h-2 rounded-full flex-none mt-1.5 " +
+    (tone === "ok"
+      ? "bg-green-600"
+      : tone === "warn"
+        ? "bg-amber-500"
+        : tone === "error"
+          ? "bg-red-600"
+          : tone === "accent"
+            ? "bg-blue-600"
+            : "bg-neutral-400");
+  dot.setAttribute("aria-hidden", "true");
+  const s = document.createElement("span");
+  s.textContent = text;
+  d.append(dot, s);
+  parent.appendChild(d);
+  d.scrollIntoView({ block: "nearest" });
+  return d;
+}
+
 /// Short assistant reply bubble (the concise answer; the run card below
 /// it is only the expandable detail). Text-only: model output is untrusted.
 function sayBubble(text) {
   const d = document.createElement("div");
-  d.className = "self-start max-w-[90%] flex gap-2";
+  d.className = "self-start max-w-[96%] sm:max-w-[90%] flex gap-2";
   const icon = document.createElement("span");
-  icon.className = "flex-none";
-  icon.textContent = "🌌";
+  icon.className = "avatar-min";
+  icon.textContent = "R";
   const body = document.createElement("div");
   body.className =
     "bubble-rose px-[2%] py-2 rounded-2xl rounded-tl-sm";
@@ -88,7 +115,7 @@ function shorten(text, max) {
 
 function createRunCard(goal) {
   const wrap = document.createElement("div");
-  wrap.className = "self-start w-full max-w-[90%] flex gap-2";
+  wrap.className = "self-start w-full max-w-[96%] sm:max-w-[90%] flex gap-2";
   const card = document.createElement("div");
   card.className =
     "bubble-rose flex-1 px-[2%] py-2 rounded-2xl rounded-tl-sm";
@@ -135,7 +162,7 @@ function createRunCard(goal) {
     touched: false,
     setMinimized(min) {
       steps.classList.toggle("hidden", min);
-      toggle.textContent = min ? "▸ Details" : "▾ Details";
+      toggle.textContent = min ? "Show details" : "Hide details";
       toggle.title = min ? "Show step-by-step feedback" : "Hide step-by-step feedback";
       toggle.setAttribute("aria-expanded", String(!min));
     },
@@ -183,41 +210,42 @@ function renderEvent(card, ev) {
   const row = ev.step != null ? card.row(ev.step) : card.stepsEl;
   switch (ev.type) {
     case "run_started":
-      line(row, `▶ Run started — goal: ${ev.goal} (budget ${ev.max_steps} steps)`, "text-sm font-medium");
+      mark(row, "accent", `Run started — goal: ${ev.goal} (budget ${ev.max_steps} steps)`, "text-sm font-medium");
       break;
     case "observing":
-      line(row, "👀 Taking a screenshot…", "text-sm opacity-70");
+      mark(row, "info", "Taking a screenshot…", "text-sm opacity-70");
       break;
     case "observed": {
       const win = ev.active_window ? ` · active window: “${ev.active_window}”` : "";
-      line(row, `👀 Saw ${ev.width}×${ev.height} screenshot (${ev.frame_bytes} bytes)${win} — the gridded copy below is what the brain gets`, "text-sm");
+      mark(row, "info", `Saw ${ev.width}×${ev.height} screenshot (${ev.frame_bytes} bytes)${win} — the gridded copy below is what the brain gets`, "text-sm");
       const hist = ev.history && ev.history.length ? ev.history.join(" → ") : "(empty — first step)";
-      line(row, `↩ Fed back to brain: gridded screenshot + history: ${hist}`, "text-xs opacity-70");
+      mark(row, `Fed back to brain: gridded screenshot + history: ${hist}`, "text-xs opacity-70");
       break;
     }
     case "thinking":
-      line(
+      mark(
         row,
+        "info",
         ev.mode === "text"
-          ? "🧠 Thinking (text/shell step — no screenshot taken or sent)…"
-          : "🧠 Thinking — screenshot + goal + history sent to the brain…",
+          ? "Thinking (text/shell step — no screenshot taken or sent)…"
+          : "Thinking — screenshot + goal + history sent to the brain…",
         "text-sm opacity-70"
       );
       break;
     case "vision_requested":
-      line(row, `👀 Brain needs the desktop for this: ${ev.say} — taking a screenshot…`, "text-sm");
+      mark(row, "info", `Brain needs the desktop for this: ${ev.say} — taking a screenshot…`, "text-sm");
       break;
     case "grounded": {
       const n = ev.elements || 0;
       const ms = ev.ms != null ? ` in ${ev.ms}ms` : "";
       const src = ev.source ? ` via ${ev.source}` : "";
       if (n > 0) {
-        line(row, `🎯 Numbered 64×36 grid applied${ms}${src}, plus ${n} listed element${n === 1 ? "" : "s"} — brain aims by grid cell, element number, or pixels off the axes`, "text-sm");
+        mark(row, "info", `Numbered 67×39 grid applied${ms}${src}, plus ${n} listed element${n === 1 ? "" : "s"} — brain aims by grid cell, element number, or pixels off the axes`, "text-sm");
         if (ev.labels && ev.labels.length) {
           line(row, ev.labels.join(" · "), "text-xs font-mono opacity-80");
         }
       } else {
-        line(row, `🎯 Numbered 64×36 grid applied${ms}${src} — brain aims by grid cell g<col>,<row> or pixels off the axes (no raw screenshot is ever sent)`, "text-sm");
+        mark(row, "info", `Numbered 67×39 grid applied${ms}${src} — brain aims by grid cell g<col>,<row> or pixels off the axes (no raw screenshot is ever sent)`, "text-sm");
       }
       if (ev.frame && ev.run_id) {
         const a = document.createElement("a");
@@ -225,20 +253,20 @@ function renderEvent(card, ev) {
         a.target = "_blank";
         a.rel = "noopener";
         a.className = "text-xs underline opacity-80";
-        a.textContent = "🎯 View the gridded screenshot the brain saw";
+        a.textContent = "View the gridded screenshot the brain saw";
         row.appendChild(a);
       }
       break;
     }
     case "planned":
-      line(row, `🧠 Plan: ${ev.say}`, "text-sm font-medium");
-      line(row, `→ Will do: ${ev.action} (brain took ${ev.brain_ms}ms)`, "text-sm font-mono");
+      mark(row, "accent", `Plan: ${ev.say}`, "text-sm font-medium");
+      line(row, `Will do: ${ev.action} (brain took ${ev.brain_ms}ms)`, "text-sm font-mono");
       break;
     case "acting":
-      line(row, `▶ Doing: ${ev.action}…`, "text-sm");
+      mark(row, "accent", `Doing: ${ev.action}…`, "text-sm");
       break;
     case "acted":
-      line(row, `✓ Done: ${ev.action} dispatched in ${ev.ms}ms — ${ev.note}`, "text-sm text-green-700 dark:text-green-400");
+      mark(row, "ok", `Done: ${ev.action} dispatched in ${ev.ms}ms — ${ev.note}`, "text-sm text-green-700 dark:text-green-400");
       break;
     case "result": {
       const win =
@@ -246,55 +274,57 @@ function renderEvent(card, ev) {
           ? ` · window: “${ev.active_window_before || "none"}” → “${ev.active_window_after || "none"}”`
           : "";
       const settled = ev.settle_ms != null ? ` · settled in ${ev.settle_ms}ms` : "";
-      line(
+      mark(
         row,
-        `${ev.screen_changed ? "🖥 Result: screen changed" : "🖥 Result: screen did NOT change"}${win}${settled}`,
+        ev.screen_changed ? "ok" : "warn",
+        `${ev.screen_changed ? "Result: screen changed" : "Result: screen did NOT change"}${win}${settled}`,
         `text-sm font-medium ${ev.screen_changed ? "" : "text-amber-600 dark:text-amber-400"}`
       );
-      line(row, `↩ Feedback loop: ${ev.feedback}`, "text-xs opacity-70");
+      mark(row, "info", `Feedback loop: ${ev.feedback}`, "text-xs opacity-70");
       break;
     }
     case "shell_result": {
       const status = ev.timed_out
-        ? "⏱ timed out and was killed"
+        ? "timed out and was killed"
         : `exit ${ev.exit_code == null ? "?" : ev.exit_code}`;
-      line(row, `$ ${ev.command} → ${status} (${ev.ms}ms)`, "text-sm font-mono font-medium");
+      mark(row, "info", `$ ${ev.command} → ${status} (${ev.ms}ms)`, "text-sm font-mono font-medium");
       if (ev.stdout) line(row, ev.stdout, "text-xs font-mono whitespace-pre-wrap opacity-80");
       if (ev.stderr) line(row, `stderr: ${ev.stderr}`, "text-xs font-mono whitespace-pre-wrap text-amber-600 dark:text-amber-400");
-      line(row, "↩ Feedback loop: this output is in the history fed back to the brain", "text-xs opacity-70");
+      mark(row, "info", "Feedback loop: this output is in the history fed back to the brain", "text-xs opacity-70");
       break;
     }
     case "stopped":
-      line(row, `⏹ ${ev.say}`, "text-sm font-semibold text-red-600 dark:text-red-400");
+      mark(row, "error", `${ev.say}`, "text-sm font-semibold text-red-600 dark:text-red-400");
       break;
     case "rejected":
-      line(row, `🚫 Rejected repeat: ${ev.action} — ${ev.say}`, "text-sm font-semibold text-amber-600 dark:text-amber-400");
+      mark(row, "warn", `Rejected repeat: ${ev.action} — ${ev.say}`, "text-sm font-semibold text-amber-600 dark:text-amber-400");
       break;
     case "decision":
-      line(row, `🧠 Brain decided “${ev.status}”: ${ev.say} (brain took ${ev.brain_ms}ms)`, "text-sm font-medium");
+      mark(row, "info", `Brain decided “${ev.status}”: ${ev.say} (brain took ${ev.brain_ms}ms)`, "text-sm font-medium");
       break;
     case "approval":
-      line(row, `⚠️ Paused for approval: ${ev.say} — ${ev.action}`, "text-sm font-semibold text-amber-600 dark:text-amber-400");
+      mark(row, "warn", `Paused for approval: ${ev.say} — ${ev.action}`, "text-sm font-semibold text-amber-600 dark:text-amber-400");
       break;
     case "resumed":
-      line(row, `▶ ${ev.say}`, "text-sm font-medium text-green-700 dark:text-green-400");
+      mark(row, "ok", `${ev.say}`, "text-sm font-medium text-green-700 dark:text-green-400");
       break;
     case "auto_approved":
-      line(row, `✅ Auto-approved (don't ask again): ${ev.say} — ${ev.action}`, "text-sm text-green-700 dark:text-green-400");
+      mark(row, "ok", `Auto-approved (don't ask again): ${ev.say} — ${ev.action}`, "text-sm text-green-700 dark:text-green-400");
       break;
     case "lease":
-      line(row, `⏸ ${ev.say}`, "text-sm font-medium text-amber-600 dark:text-amber-400");
+      mark(row, "warn", `${ev.say}`, "text-sm font-medium text-amber-600 dark:text-amber-400");
       break;
     case "verify":
-      line(row, `🔍 Verify: ${ev.say}`, "text-sm font-medium text-amber-600 dark:text-amber-400");
+      mark(row, "warn", `Verify: ${ev.say}`, "text-sm font-medium text-amber-600 dark:text-amber-400");
       break;
     case "stuck":
-      line(row, `⚠️ Stuck: ${ev.say}`, "text-sm font-semibold text-amber-600 dark:text-amber-400");
+      mark(row, "warn", `Stuck: ${ev.say}`, "text-sm font-semibold text-amber-600 dark:text-amber-400");
       break;
     case "failed":
-      line(
+      mark(
         row,
-        `✗ Failed at ${ev.stage}${ev.action ? ` (${ev.action})` : ""}: ${ev.error}`,
+        "error",
+        `Failed at ${ev.stage}${ev.action ? ` (${ev.action})` : ""}: ${ev.error}`,
         "text-sm font-semibold text-red-600 dark:text-red-400"
       );
       break;
@@ -312,21 +342,21 @@ let activeCard = null;
 async function stopRun() {
   const btn = document.getElementById("stop");
   btn.disabled = true;
-  btn.textContent = "■ Stopping…";
+  btn.textContent = "Stopping…";
   try {
     const r = await fetch("/api/stop", { method: "POST" });
     const j = await r.json().catch(() => ({}));
     if (r.ok && j.stopping) {
       if (activeCard) {
-        line(activeCard.stepsEl, "⏹ Stop requested — finishing the current action, then stopping…", "text-sm font-semibold text-red-600 dark:text-red-400");
+        mark(activeCard.stepsEl, "error", "Stop requested — finishing the current action, then stopping…", "text-sm font-semibold text-red-600 dark:text-red-400");
       }
     } else {
       bubble("No run is in progress to stop.");
-      btn.textContent = "■ Stop";
+      btn.textContent = "Stop";
     }
-  } catch (e) {
-    bubble(`⚠️ Stop failed: ${e.message}`);
-    btn.textContent = "■ Stop";
+    } catch (e) {
+      bubble(`Stop failed: ${e.message}`);
+    btn.textContent = "Stop";
     btn.disabled = !running;
   }
 }
@@ -334,12 +364,12 @@ async function stopRun() {
 function setStopButton(active) {
   const btn = document.getElementById("stop");
   btn.disabled = !active;
-  btn.textContent = "■ Stop";
+  btn.textContent = "Stop";
 }
 
 async function runGoal(goal, force, autoApprove, approvalEl, chatId = selectedChat) {
   if (running) {
-    bubble("⏳ A run is already in progress — watch it above, or stop it first.");
+    bubble("… A run is already in progress — watch it above, or stop it first.");
     return;
   }
   running = true;
@@ -383,8 +413,8 @@ async function runGoal(goal, force, autoApprove, approvalEl, chatId = selectedCh
   } catch (e) {
     // Failures keep the trace expanded: the detail is the point there.
     card.finish("Details — run failed", false);
-    line(card.stepsEl, `⚠️ Step failed: ${e.message}`, "text-sm font-semibold text-red-600 dark:text-red-400");
-    sayBubble(`⚠️ Couldn't finish: ${shorten(e.message, 200)}`);
+    mark(card.stepsEl, "error", `Step failed: ${e.message}`, "text-sm font-semibold text-red-600 dark:text-red-400");
+    sayBubble(`Couldn't finish: ${shorten(e.message, 200)}`);
     running = false;
     activeCard = null;
     setStopButton(false);
@@ -408,7 +438,7 @@ async function runGoal(goal, force, autoApprove, approvalEl, chatId = selectedCh
 function presentFinal(card, view, goal, interactive) {
   if (!view) {
     card.finish("Details — run ended without a result", false);
-    sayBubble("⚠️ The run ended without a result — expand Details above for the trace.");
+    sayBubble("The run ended without a result — expand Details above for the trace.");
     return;
   }
   // The concise answer is a normal chat reply; the card is now just the
@@ -417,28 +447,28 @@ function presentFinal(card, view, goal, interactive) {
   if (view.stopped) {
     // Stopped runs keep the trace expanded: where it stopped matters.
     card.finish("Details — stopped by you", false);
-    sayBubble(`⏹ Stopped.${stepsNote}`);
+    sayBubble(`Stopped.${stepsNote}`);
   } else if (view.error) {
     card.finish("Details — run failed", false);
-    line(card.stepsEl, `⚠️ ${view.error}`, "text-sm font-semibold text-red-600 dark:text-red-400");
-    sayBubble(`⚠️ Couldn't finish: ${shorten(view.error, 200)}`);
+    mark(card.stepsEl, "error", `${view.error}`, "text-sm font-semibold text-red-600 dark:text-red-400");
+    sayBubble(`Couldn't finish: ${shorten(view.error, 200)}`);
   } else if (view.approval_needed) {
     card.finish("Details — waiting for approval", true);
     if (!card.touched) card.setMinimized(true);
     if (interactive) approvalCard(view.say, goal, view.chat_id);
-    else sayBubble(`⏸ Paused for approval: ${shorten(view.say, 200)}`);
+    else sayBubble(`Paused for approval: ${view.say}`);
   } else if (view.done) {
     card.finish("Details — done", true);
     if (!card.touched) card.setMinimized(true);
-    sayBubble(`✅ ${shorten(view.say, 240) || "Done."}${stepsNote}`);
+    sayBubble(`${view.say || "Done."}${stepsNote}`);
   } else if (view.acted) {
     card.finish("Details — finished", true);
     if (!card.touched) card.setMinimized(true);
-    sayBubble(`${shorten(view.say, 240)}${stepsNote}`);
+    sayBubble(`${view.say}${stepsNote}`);
   } else {
     card.finish("Details — finished", true);
     if (!card.touched) card.setMinimized(true);
-    sayBubble(shorten(view.say, 240));
+    sayBubble(view.say);
   }
 }
 
@@ -446,13 +476,13 @@ function presentFinal(card, view, goal, interactive) {
 
 let selectedChat = null;
 
-const STATE_ICON = {
-  done: "✅",
-  finished: "✅",
-  failed: "⚠️",
-  stopped: "⏹",
-  waiting_approval: "⏸",
-  running: "▶️",
+const STATE_DOT = {
+  done: "bg-green-600",
+  finished: "bg-green-600",
+  failed: "bg-red-600",
+  stopped: "bg-red-600",
+  waiting_approval: "bg-amber-500",
+  running: "bg-blue-600",
 };
 
 /// Fill the left sidebar from persisted chats, most recently
@@ -471,7 +501,7 @@ async function refreshChats() {
     if (!chats.length) {
       line(
         list,
-        query ? "No chats match your search." : "No chats yet — start one with ＋ New chat.",
+        query ? "No chats match your search." : "No chats yet — start one with + New chat.",
         "text-xs text-neutral-500"
       );
       return chats;
@@ -490,8 +520,15 @@ async function refreshChats() {
       main.type = "button";
       main.className = "flex-1 text-left flex flex-col gap-0.5 min-w-0";
       const title = document.createElement("span");
-      title.className = "font-medium text-sm leading-snug";
-      title.textContent = `${STATE_ICON[chat.state] || "•"} ${shorten(chat.title, 70)}`;
+      title.className = "font-medium text-sm leading-snug flex items-center gap-1.5";
+      const dot = document.createElement("span");
+      dot.className =
+        "inline-block w-2 h-2 rounded-full flex-none " +
+        (STATE_DOT[chat.state] || "bg-neutral-400");
+      dot.setAttribute("aria-hidden", "true");
+      const label = document.createElement("span");
+      label.textContent = shorten(chat.title, 70);
+      title.append(dot, label);
       const meta = document.createElement("span");
       meta.className = "text-xs " + (active ? "text-white/75" : "text-neutral-500");
       const when = chat.updated_at ? new Date(chat.updated_at).toLocaleString() : "";
@@ -500,7 +537,7 @@ async function refreshChats() {
       main.onclick = () => openChat(chat.chat_id);
       const rename = document.createElement("button");
       rename.type = "button";
-      rename.textContent = "✎";
+      rename.innerHTML = `<svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 20l4-1 11-11a2.1 2.1 0 0 0-3-3L5 16z"/><path d="M13.5 6.5l3 3"/></svg>`;
       rename.title = "Rename chat";
       rename.className =
         "px-1 py-0.5 rounded text-xs flex-none " +
@@ -518,7 +555,7 @@ async function refreshChats() {
       };
       const del = document.createElement("button");
       del.type = "button";
-      del.textContent = "🗑";
+      del.innerHTML = `<svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16M9 7V5a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2M6 7l1 13a1 1 0 0 0 1 1h8a1 1 0 0 0 1-1l1-13"/></svg>`;
       del.title = "Delete chat";
       del.className =
         "px-1 py-0.5 rounded text-xs flex-none " +
@@ -565,7 +602,7 @@ async function replayRun(runId) {
 /// message, the (minimized) trace card, and Rose's reply.
 async function openChat(chatId) {
   if (running) {
-    bubble("⏳ A run is already in progress — wait for it to finish before switching chats.");
+    bubble("… A run is already in progress — wait for it to finish before switching chats.");
     return;
   }
   let runs;
@@ -574,10 +611,11 @@ async function openChat(chatId) {
     if (!r.ok) throw new Error(`HTTP ${r.status}`);
     runs = (await r.json()).runs || [];
   } catch (e) {
-    bubble(`⚠️ Could not load that chat: ${e.message}`);
+    bubble(`Could not load that chat: ${e.message}`);
     return;
   }
   selectedChat = chatId;
+  if (window.toggleSidebarMobile && matchMedia("(max-width: 767px)").matches) toggleSidebarMobile(false);
   threadEl().replaceChildren();
   for (const run of runs) {
     bubble(run.goal, true);
@@ -589,10 +627,11 @@ async function openChat(chatId) {
 /// Start a fresh chat: clear the pane, nothing selected.
 function newChat() {
   if (running) {
-    bubble("⏳ A run is already in progress — wait for it to finish before starting a new chat.");
+    bubble("… A run is already in progress — wait for it to finish before starting a new chat.");
     return;
   }
   selectedChat = null;
+  if (window.toggleSidebarMobile && matchMedia("(max-width: 767px)").matches) toggleSidebarMobile(false);
   threadEl().replaceChildren();
   refreshChats();
   document.getElementById("composer").focus();
@@ -620,6 +659,7 @@ async function refreshStatus() {
     document.getElementById("backend-text").textContent =
       `backend=${s.backend} · ${s.version}`;
     document.getElementById("display-name").textContent = s.display ? `· ${s.display}` : "";
+    document.getElementById("display-name-max").textContent = s.display ? `· ${s.display}` : "";
     dot.className = DOT + "bg-neutral-400";
     setControlUI(s.lease === "human");
   } catch (e) {
@@ -632,6 +672,14 @@ async function refreshStatus() {
     const st = document.getElementById("key-state");
     st.textContent = k.set ? `set (${k.source})` : "missing";
     st.className = k.set ? "text-green-600 font-semibold" : "text-red-500 font-semibold";
+    const vst = document.getElementById("video-key-state");
+    if (vst) {
+      const src = k.video_source || "none";
+      vst.textContent = k.video_set
+        ? (src === "brain" ? "follows Muse key" : `set (${src})`)
+        : "missing";
+      vst.className = k.video_set ? "text-green-600 font-semibold" : "text-red-500 font-semibold";
+    }
   } catch (e) { /* status already shows reachability */ }
 }
 
@@ -641,10 +689,65 @@ async function refreshFrame() {
     if (!r.ok) return;
     const blob = await r.blob();
     const img = document.getElementById("frame");
-    img.src = URL.createObjectURL(blob);
+    // Revoke the previous blob URL: one fetch per second would
+    // otherwise leak an object URL per second for the whole session.
+    if (img.dataset.objUrl) URL.revokeObjectURL(img.dataset.objUrl);
+    const url = URL.createObjectURL(blob);
+    img.dataset.objUrl = url;
+    img.src = url;
     img.classList.remove("hidden");
-    document.getElementById("frame-note").style.display = "none";
+    const popped = !document.getElementById("frame-modal").classList.contains("hidden");
+    const note = document.getElementById("frame-note");
+    if (popped) {
+      // The img is docked in the popup: keep a hint in the panel.
+      note.textContent = "Live view popped out — close the popup to dock it back.";
+      note.style.display = "";
+    } else {
+      note.style.display = "none";
+    }
+    document.getElementById("frame-max-note").style.display = "none";
   } catch (e) { /* backend not up yet */ }
+}
+
+// ---- maximized live view -------------------------------------------------
+// The popup hosts the SAME #frame node (moved, not cloned): no second
+// fetch, and Take Control clicks/wheel keep their listeners and correct
+// coordinates wherever the node lives. Close docks it back home.
+let frameHome = null;
+
+function frameModalOpen() {
+  return !document.getElementById("frame-modal").classList.contains("hidden");
+}
+
+function toggleFrameModal(show) {
+  const modal = document.getElementById("frame-modal");
+  const slot = document.getElementById("frame-max-slot");
+  const img = document.getElementById("frame");
+  const want = show === undefined ? !frameModalOpen() : !!show;
+  if (want === frameModalOpen()) return;
+  if (want) {
+    frameHome = { parent: img.parentNode, next: img.nextSibling };
+    slot.appendChild(img);
+    modal.classList.remove("hidden");
+    syncFrameNotes();
+  } else {
+    if (frameHome && frameHome.parent) {
+      frameHome.parent.insertBefore(img, frameHome.next);
+    }
+    frameHome = null;
+    modal.classList.add("hidden");
+    // Restore the panel note to its idle state (hidden once frames flow).
+    const note = document.getElementById("frame-note");
+    note.textContent = "waiting for backend frames…";
+    note.style.display = img.classList.contains("hidden") ? "" : "none";
+  }
+}
+
+function syncFrameNotes() {
+  // While popped out with no frames yet, the popup shows the waiting
+  // note instead of an empty black box.
+  const loaded = !document.getElementById("frame").classList.contains("hidden");
+  document.getElementById("frame-max-note").style.display = loaded ? "none" : "";
 }
 
 // ---- takeover: you drive, Rose pauses (never killed) -----------------------
@@ -659,6 +762,8 @@ function setControlUI(held) {
   controlling = held;
   const btn = document.getElementById("take-control");
   const badge = document.getElementById("control-badge");
+  const btnMax = document.getElementById("take-control-max");
+  const badgeMax = document.getElementById("control-badge-max");
   const img = document.getElementById("frame");
   const hint = document.getElementById("control-hint");
   btn.textContent = held ? "Hand Back" : "Take Control";
@@ -668,6 +773,12 @@ function setControlUI(held) {
   badge.textContent = held ? "YOU CONTROL" : "VIEW-ONLY";
   badge.className = "rounded px-2 py-0.5 text-xs font-semibold text-white " +
     (held ? "bg-green-600" : "bg-red-600");
+  if (btnMax) btnMax.textContent = held ? "Hand Back" : "Take Control";
+  if (badgeMax) {
+    badgeMax.textContent = held ? "YOU CONTROL" : "VIEW-ONLY";
+    badgeMax.className = "rounded px-2 py-0.5 text-xs font-semibold text-white " +
+      (held ? "bg-green-600" : "bg-red-600");
+  }
   img.style.cursor = held ? "crosshair" : "";
   hint.textContent = held
     ? "You hold the desktop: click to click, double-click to double-click, wheel to scroll, type to type. Hand Back to resume Rose."
@@ -681,7 +792,7 @@ async function toggleControl() {
     const j = await checked(r);
     setControlUI(j.holder === "human");
   } catch (e) {
-    bubble(`⚠️ Takeover failed: ${e.message}`);
+    bubble(`Takeover failed: ${e.message}`);
   }
 }
 
@@ -706,7 +817,7 @@ async function sendClick(kind, e) {
   try {
     await postInput({ kind, x, y });
   } catch (err) {
-    bubble(`⚠️ ${kind === "click" ? "Click" : "Double-click"} not delivered: ${err.message}`);
+    bubble(`${kind === "click" ? "Click" : "Double-click"} not delivered: ${err.message}`);
   }
 }
 
@@ -733,7 +844,7 @@ document.getElementById("frame").addEventListener("wheel", async (e) => {
   try {
     await postInput({ kind: "scroll", x, y, dy: e.deltaY / rect.height });
   } catch (err) {
-    bubble(`⚠️ Scroll not delivered: ${err.message}`);
+    bubble(`Scroll not delivered: ${err.message}`);
   }
 }, { passive: false });
 
@@ -745,6 +856,12 @@ const TAKEOVER_KEYMAP = {
 };
 
 document.addEventListener("keydown", async (e) => {
+  // Esc closes the maximized live view (and never leaks to the VM).
+  if (e.key === "Escape" && frameModalOpen()) {
+    e.preventDefault();
+    toggleFrameModal(false);
+    return;
+  }
   if (!controlling) return;
   // Never hijack typing in the composer, search, key field, or dialogs.
   const t = e.target;
@@ -767,26 +884,31 @@ document.addEventListener("keydown", async (e) => {
       await postInput({ kind: "key", keys });
     }
   } catch (err) {
-    bubble(`⚠️ Key not delivered: ${err.message}`);
+    bubble(`Key not delivered: ${err.message}`);
   }
 });
 
 function saveKey() {
   const v = document.getElementById("api-key").value.trim();
-  if (!v) return;
+  const vv = document.getElementById("video-api-key").value.trim();
+  if (!v && !vv) return;
+  const body = {};
+  if (v) body.muse_api_key = v;
+  if (vv) body.video_api_key = vv;
   fetch("/api/keys", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ muse_api_key: v }),
+    body: JSON.stringify(body),
   }).then(async (r) => {
     document.getElementById("api-key").value = "";
+    document.getElementById("video-api-key").value = "";
     toggleSetup(false);
     if (r.ok) {
       bubble("API key saved for this session — server memory only, nothing written to disk.");
       refreshStatus();
     } else {
       const j = await r.json().catch(() => ({}));
-      bubble(`⚠️ Key not saved: ${j.error || r.status}`);
+      bubble(`Key not saved: ${j.error || r.status}`);
     }
   });
 }
@@ -794,6 +916,7 @@ function saveKey() {
 function clearKey() {
   fetch("/api/keys", { method: "DELETE" }).then(() => {
     document.getElementById("api-key").value = "";
+    document.getElementById("video-api-key").value = "";
     refreshStatus();
   });
 }
@@ -802,10 +925,13 @@ document.getElementById("composer").addEventListener("keydown", (e) => {
   if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); }
 });
 document.addEventListener("keydown", (e) => {
-  if (e.key === "Escape") toggleSetup(false);
+  if (e.key === "Escape") { toggleSetup(false); toggleVideoSkill(false); }
 });
 document.getElementById("setup-modal").addEventListener("click", (e) => {
   if (e.target.id === "setup-modal") toggleSetup(false);
+});
+document.getElementById("video-skill-modal").addEventListener("click", (e) => {
+  if (e.target.id === "video-skill-modal") toggleVideoSkill(false);
 });
 
 // ---- setup tabs -------------------------------------------------------------
@@ -826,7 +952,7 @@ function setupTab(which) {
 }
 
 // ---- config management ------------------------------------------------------
-const CFG_FIELDS = ["cfg-bind","cfg-backend","cfg-display","cfg-width","cfg-height","cfg-cdp","cfg-launch","cfg-brain","cfg-model","cfg-endpoint","cfg-steps","cfg-minutes","cfg-calls","cfg-approvals","cfg-datadir"];
+const CFG_FIELDS = ["cfg-bind","cfg-backend","cfg-display","cfg-width","cfg-height","cfg-brain","cfg-model","cfg-endpoint","cfg-video-model","cfg-video-endpoint","cfg-steps","cfg-minutes","cfg-calls","cfg-approvals","cfg-datadir"];
 const CFG_DEFAULTS = {};
 function snapshotConfig() {
   const o = {};
@@ -861,7 +987,17 @@ function syncBrainNote() {
   document.getElementById("brain-note").innerHTML =
     b === "fake"
       ? "fake brain needs no key — good for offline drafts."
-      : 'muse brain reads the key from Setup → Keys or <span class="font-mono">ROSE_MUSE_API_KEY</span>.';
+      : 'muse brain reads the key from Setup → Keys or <span class="font-mono">ROSE_MUSE_API_KEY</span>. Override the base URL with <span class="font-mono">ROSE_MODELS_ENDPOINT</span> / <span class="font-mono">OPENAI_BASE_URL</span> or here (Meta is the default).';
+}
+function useSameModelAsBrain() {
+  const brainModel = document.getElementById("cfg-model");
+  const brainEndpoint = document.getElementById("cfg-endpoint");
+  const videoModel = document.getElementById("cfg-video-model");
+  const videoEndpoint = document.getElementById("cfg-video-endpoint");
+  if (!brainModel || !videoModel) return;
+  videoModel.value = brainModel.value.trim();
+  if (brainEndpoint && videoEndpoint) videoEndpoint.value = brainEndpoint.value.trim();
+  markDirty();
 }
 function collectConfig() {
   const v = (id) => document.getElementById(id).value.trim();
@@ -869,8 +1005,7 @@ function collectConfig() {
   return {
     server: { bind: v("cfg-bind"), allow_remote: c("cfg-allow-remote") },
     desktop: { backend: v("cfg-backend"), display: v("cfg-display"), width: +v("cfg-width"), height: +v("cfg-height") },
-    cdp: { endpoint: v("cfg-cdp"), launch_if_missing: c("cfg-launch") },
-    models: { brain: v("cfg-brain"), endpoint: v("cfg-endpoint"), model: v("cfg-model") },
+    models: { brain: v("cfg-brain"), endpoint: v("cfg-endpoint"), model: v("cfg-model"), video_model: v("cfg-video-model"), video_endpoint: v("cfg-video-endpoint") },
     policy: { max_steps: +v("cfg-steps"), max_minutes: +v("cfg-minutes"), max_model_calls: +v("cfg-calls"), require_approval_for: v("cfg-approvals").split(",").map((s) => s.trim()).filter(Boolean) },
     data: { dir: v("cfg-datadir") },
   };
@@ -882,8 +1017,7 @@ function configFromBackend(j) {
   const o = {};
   if (j.server) { if (j.server.bind) o["cfg-bind"] = j.server.bind; if (j.server.allow_remote !== undefined) o["cfg-allow-remote"] = j.server.allow_remote; }
   if (j.desktop) { if (j.desktop.backend) o["cfg-backend"] = j.desktop.backend; if (j.desktop.display) o["cfg-display"] = j.desktop.display; if (j.desktop.width) o["cfg-width"] = String(j.desktop.width); if (j.desktop.height) o["cfg-height"] = String(j.desktop.height); }
-  if (j.cdp) { if (j.cdp.endpoint) o["cfg-cdp"] = j.cdp.endpoint; if (j.cdp.launch_if_missing !== undefined) o["cfg-launch"] = j.cdp.launch_if_missing; }
-  if (j.models) { if (j.models.brain) o["cfg-brain"] = j.models.brain; if (j.models.model) o["cfg-model"] = j.models.model; if (j.models.endpoint) o["cfg-endpoint"] = j.models.endpoint; }
+  if (j.models) { if (j.models.brain) o["cfg-brain"] = j.models.brain; if (j.models.model) o["cfg-model"] = j.models.model; if (j.models.video_model !== undefined) o["cfg-video-model"] = j.models.video_model; else if (j.models.videoModel !== undefined) o["cfg-video-model"] = j.models.videoModel; if (j.models.video_endpoint !== undefined) o["cfg-video-endpoint"] = j.models.video_endpoint; else if (j.models.video_base_url !== undefined) o["cfg-video-endpoint"] = j.models.video_base_url; else if (j.models.videoBaseUrl !== undefined) o["cfg-video-endpoint"] = j.models.videoBaseUrl; if (j.models.endpoint) o["cfg-endpoint"] = j.models.endpoint; else if (j.models.base_url) o["cfg-endpoint"] = j.models.base_url; else if (j.models.baseUrl) o["cfg-endpoint"] = j.models.baseUrl; }
   if (j.policy) { if (j.policy.max_steps) o["cfg-steps"] = String(j.policy.max_steps); if (j.policy.max_minutes) o["cfg-minutes"] = String(j.policy.max_minutes); if (j.policy.max_model_calls) o["cfg-calls"] = String(j.policy.max_model_calls); if (j.policy.require_approval_for) o["cfg-approvals"] = (Array.isArray(j.policy.require_approval_for) ? j.policy.require_approval_for : [j.policy.require_approval_for]).join(", "); }
   if (j.data && j.data.dir) o["cfg-datadir"] = j.data.dir;
   return Object.keys(o).length ? o : null;
@@ -923,9 +1057,12 @@ async function saveConfig() {
   const errs = [];
   if (!/^\S+:\d+$/.test(cfg.server.bind)) errs.push("bind must be host:port");
   if (!(cfg.desktop.width >= 640 && cfg.desktop.height >= 360)) errs.push("desktop size looks too small");
+  if (!cfg.models.endpoint || !(cfg.models.endpoint.startsWith("http://") || cfg.models.endpoint.startsWith("https://"))) errs.push("base URL must start with http:// or https:// (Meta default: https://api.meta.ai/v1)");
+  if (!cfg.models.model) errs.push("model must not be empty");
+  if (cfg.models.video_endpoint && !(cfg.models.video_endpoint.startsWith("http://") || cfg.models.video_endpoint.startsWith("https://"))) errs.push("video base URL must start with http:// or https:// (or stay empty to follow Brain)");
   if (!(cfg.policy.max_steps >= 1 && cfg.policy.max_steps <= 200)) errs.push("max_steps 1..200");
   if (errs.length) {
-    document.getElementById("config-msg").textContent = "⚠️ " + errs.join(" · ");
+    document.getElementById("config-msg").textContent = "! " + errs.join(" · ");
     return;
   }
   try {
@@ -942,10 +1079,10 @@ async function saveConfig() {
         if (flat) applyConfig(flat);
       }
       if (j.restart_needed) {
-        markClean("✓ Applied — policy + brain hot-reloaded; backend/display/bind/data need a `rosed` restart.");
+        markClean("Applied — policy + brain hot-reloaded; backend/display/bind/data need a `rosed` restart.");
         bubble(`Config applied: backend=<strong>${cfg.desktop.backend}</strong>, brain=<strong>${cfg.models.brain}</strong>, budget=<strong>${cfg.policy.max_steps} steps / ${cfg.policy.max_minutes} min</strong>. Backend/display/bind changes need a <span class="font-mono">rosed</span> restart.`);
       } else {
-        markClean("✓ Applied — policy + brain hot-reloaded into the next run.");
+        markClean("Applied — policy + brain hot-reloaded into the next run.");
         bubble(`Config applied: backend=<strong>${cfg.desktop.backend}</strong>, brain=<strong>${cfg.models.brain}</strong>, budget=<strong>${cfg.policy.max_steps} steps / ${cfg.policy.max_minutes} min</strong>.`);
       }
       refreshStatus();
@@ -953,7 +1090,7 @@ async function saveConfig() {
     }
     const msg = (j && j.error) || `HTTP ${r.status}`;
     if (r.status === 404) throw new Error("no /api/config yet");
-    document.getElementById("config-msg").textContent = "⚠️ " + msg;
+    document.getElementById("config-msg").textContent = "! " + msg;
     return;
   } catch (e) {
     if (String(e.message || e).includes("no /api/config")) {
@@ -962,7 +1099,7 @@ async function saveConfig() {
       markClean("Saved locally — rosed has no /api/config yet, so nothing was hot-reloaded.");
       bubble(`Config saved locally (rosed has no <span class="font-mono">/api/config</span> yet): backend=<strong>${cfg.desktop.backend}</strong>, brain=<strong>${cfg.models.brain}</strong>.`);
     } else {
-      document.getElementById("config-msg").textContent = "⚠️ " + (e.message || e);
+      document.getElementById("config-msg").textContent = "! " + (e.message || e);
     }
   }
 }
@@ -977,8 +1114,7 @@ function exportConfig() {
   const toml =
     `[server]\nbind = "${cfg.server.bind}"\nallow_remote = ${cfg.server.allow_remote}\n\n` +
     `[desktop]\nbackend = "${cfg.desktop.backend}"\ndisplay = "${cfg.desktop.display}"\nwidth = ${cfg.desktop.width}\nheight = ${cfg.desktop.height}\n\n` +
-    `[cdp]\nendpoint = "${cfg.cdp.endpoint}"\nlaunch_if_missing = ${cfg.cdp.launch_if_missing}\n\n` +
-    `[models]\nbrain = "${cfg.models.brain}"\nendpoint = "${cfg.models.endpoint}"\nmodel = "${cfg.models.model}"\n\n` +
+    `[models]\nbrain = "${cfg.models.brain}"\nendpoint = "${cfg.models.endpoint}"\nmodel = "${cfg.models.model}"\nvideo_model = "${cfg.models.video_model}"\nvideo_endpoint = "${cfg.models.video_endpoint}"\n\n` +
     `[policy]\nmax_steps = ${cfg.policy.max_steps}\nmax_minutes = ${cfg.policy.max_minutes}\nmax_model_calls = ${cfg.policy.max_model_calls}\n` +
     `require_approval_for = [${cfg.policy.require_approval_for.map((s) => `"${s}"`).join(", ")}]\n\n` +
     `[data]\ndir = "${cfg.data.dir}"\n`;
@@ -1013,14 +1149,15 @@ function dropVideos(e) {
   if (e.dataTransfer?.files?.length) addFiles([...e.dataTransfer.files]);
 }
 async function probeVideoBackend() {
+  const el = document.getElementById("video-backend");
   try {
     const r = await fetch("/api/videos", { method: "GET", cache: "no-store" });
     if (r.ok) {
-      document.getElementById("video-backend").textContent = "rosed (/api/videos)";
+      if (el) el.textContent = "rosed (/api/videos)";
       return true;
     }
   } catch (e) {}
-  document.getElementById("video-backend").textContent = "local only";
+  if (el) el.textContent = "local only";
   return false;
 }
 async function uploadOne(file) {
@@ -1087,13 +1224,13 @@ async function addFiles(files) {
       const reason = String((e && e.message) || e).slice(0, 160);
       entry.status = "queued";
       entry.stage = `Upload failed: ${reason} — press Generate to retry`;
-      bubble(`⚠️ Upload of <strong>${entry.name.replace(/</g, "&lt;")}</strong> failed: ${reason.replace(/</g, "&lt;")}. Press Generate to retry.`);
+      bubble(`Upload of <strong>${entry.name.replace(/</g, "&lt;")}</strong> failed: ${reason.replace(/</g, "&lt;")}. Press Generate to retry.`);
     }
     renderVideos();
     if (selectedId === entry.id) selectVideo(entry.id);
     updateVideoActions();
   }
-  if (backendOk) document.getElementById("video-backend").textContent = "rosed (/api/videos)";
+  if (backendOk) { const el = document.getElementById("video-backend"); if (el) el.textContent = "rosed (/api/videos)"; }
   probeVideoBackend();
 }
 async function refreshServerVideos() {
@@ -1121,8 +1258,10 @@ function selectedVideo() { return videos.find((v) => v.id === selectedId) || nul
 function renderVideos() {
   const list = document.getElementById("video-list");
   if (!list) return;
-  document.getElementById("video-count").textContent = videos.length;
-  document.getElementById("video-empty").style.display = videos.length ? "none" : "";
+  const count = document.getElementById("video-count");
+  if (count) count.textContent = videos.length;
+  const empty = document.getElementById("video-empty");
+  if (empty) empty.style.display = videos.length ? "none" : "";
   list.replaceChildren();
   videos.forEach((v) => {
     const row = document.createElement("div");
@@ -1142,7 +1281,7 @@ function renderVideos() {
     meta.append(n, s);
     const del = document.createElement("button");
     del.className = "t-caption rounded px-1.5 py-0.5 text-neutral-400 hover:text-red-600";
-    del.textContent = "✕";
+    del.innerHTML = `<svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6L6 18"/></svg>`;
     del.title = "Remove video";
     del.onclick = (e) => { e.stopPropagation(); removeVideo(v.id); };
     row.append(dot, meta, del);
@@ -1212,7 +1351,7 @@ async function runPipeline(v) {
       v.stage = "No backend copy and no local file — upload the video again";
       setPipeline(v.stage, 0, v.log.join("\n"));
       renderVideos(); updateVideoActions();
-      bubble("⚠️ rosed has no copy of that video and the local file is gone — upload it again, then Generate.");
+      bubble("! rosed has no copy of that video and the local file is gone — upload it again, then Generate.");
       return;
     }
     if (backend && v._file) {
@@ -1226,14 +1365,14 @@ async function runPipeline(v) {
         v.name = meta.name || v.name;
         v.size = meta.size || v.size;
         v.url = `/api/videos/${encodeURIComponent(meta.id)}/file`;
-        document.getElementById("video-backend").textContent = "rosed (/api/videos)";
+        const be2 = document.getElementById("video-backend"); if (be2) be2.textContent = "rosed (/api/videos)";
       } catch (e) {
         const reason = String((e && e.message) || e).slice(0, 200);
         v.status = "queued"; v.stage = `Upload failed: ${reason} — fix and retry`;
         setPipeline(v.stage, 0, v.log.concat([reason]).slice(-4).join("\n"));
         setStatusBadge("queued");
         renderVideos(); updateVideoActions();
-        bubble(`⚠️ Upload failed: ${reason.replace(/</g, "&lt;")}. Nothing drafted — fix and retry.`);
+        bubble(`Upload failed: ${reason.replace(/</g, "&lt;")}. Nothing drafted — fix and retry.`);
         return;
       }
     }
@@ -1258,7 +1397,7 @@ async function runPipeline(v) {
       if (!v.steps.length) throw new Error("Spark found no task steps in this video");
       v.status = "ready"; v.progress = 100; v.stage = "Draft ready — review below";
       v.log.push("spark watched the video (frames + narration)");
-      setPipeline(v.stage, 100, v.log.slice(-4).join("\n") + "\nsteps.json saved ✓");
+      setPipeline(v.stage, 100, v.log.slice(-4).join("\n") + "\nsteps.json saved");
       setStatusBadge("ready");
       renderVideos(); renderSteps(); updateVideoActions();
       bubble(`Video <strong>${v.name.replace(/</g, "&lt;")}</strong> → draft ready: <strong>${v.steps.length} steps</strong> from Spark. Review under the desktop, then send to Rose.`);
@@ -1270,7 +1409,7 @@ async function runPipeline(v) {
       setPipeline(v.stage, 0, v.log.slice(-4).join("\n"));
       setStatusBadge("queued");
       renderVideos(); updateVideoActions();
-      bubble(`⚠️ Spark could not read that video: ${msg}. Nothing drafted — fix and retry.`);
+      bubble(`Spark could not read that video: ${msg}. Nothing drafted — fix and retry.`);
       return;
     }
   }
@@ -1333,7 +1472,7 @@ function renderSteps() {
     head.className = "flex w-full items-center gap-2 text-left";
     const mm = String(Math.floor(s.ts / 60)).padStart(2, "0"), ss = String(s.ts % 60).padStart(2, "0");
     const confCls = s.conf >= 0.8 ? "text-green-700 dark:text-green-400" : s.conf >= 0.65 ? "text-amber-600 dark:text-amber-400" : "text-red-600";
-    head.innerHTML = `<span class="t-caption rounded px-1.5 py-0.5 font-mono" style="background:var(--line)">▶ ${mm}:${ss}</span><span class="t-caption flex-1 font-semibold"></span><span class="t-caption font-semibold ${confCls}"></span>`;
+    head.innerHTML = `<span class="t-caption rounded px-1.5 py-0.5 font-mono" style="background:var(--line)">${mm}:${ss}</span><span class="t-caption flex-1 font-semibold"></span><span class="t-caption font-semibold ${confCls}"></span>`;
     head.children[1].textContent = `Step ${idx + 1} · ${s.say}`;
     head.children[2].textContent = Math.round(s.conf * 100) + "%";
     head.title = "Seek video to this moment";
@@ -1361,7 +1500,7 @@ function renderSteps() {
     ap.append(cb, document.createTextNode("needs approval"));
     const rm = document.createElement("button");
     rm.className = "t-caption flex-none rounded px-1.5 py-0.5 text-neutral-400 hover:text-red-600";
-    rm.textContent = "✕"; rm.title = "Delete step";
+    rm.innerHTML = `<svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6L6 18"/></svg>`; rm.title = "Delete step";
     rm.onclick = () => { v.steps.splice(idx, 1); renderSteps(); renderVideos(); updateVideoActions(); };
     foot.append(q, ap, rm);
     card.append(head, intent, params, foot);
@@ -1396,7 +1535,7 @@ async function saveDraft() {
         return;
       }
       const j = await r.json().catch(() => ({}));
-      showSaved("⚠️ Save failed: " + (j.error || `HTTP ${r.status}`));
+      showSaved("! Save failed: " + (j.error || `HTTP ${r.status}`));
       return;
     } catch (e) {}
   }
@@ -1410,6 +1549,477 @@ function useInChat() {
   document.getElementById("composer").value = text;
   document.getElementById("composer").focus();
   bubble(`Draft from <strong>${v.name.replace(/</g, "&lt;")}</strong> loaded into the composer — review, then hit Run. Low-confidence steps will pause for approval at replay.`);
+}
+
+function toggleVideoSkill(open) {
+  const m = document.getElementById("video-skill-modal");
+  if (!m) return;
+  const willOpen = open === undefined ? m.classList.contains("hidden") : open;
+  m.classList.toggle("hidden", !willOpen);
+  if (willOpen) {
+    const f = document.getElementById("video-file");
+    if (f) f.value = "";
+    const name = document.getElementById("vs-skill-name");
+    if (name && !name.value) {
+      const v = (typeof selectedVideo === "function") ? selectedVideo() : null;
+      if (v && v.name) name.value = v.name.replace(/\.[^.]+$/, "");
+    }
+  }
+}
+
+/// Open the popup for a hand-written skill: empty name/doc, no video
+/// draft involved. Saving stores instructions-only (no steps).
+function videoSkillNew() {
+  const name = document.getElementById("vs-skill-name");
+  if (name) name.value = "";
+  const doc = document.getElementById("vs-skill-doc");
+  if (doc) doc.value = "";
+  const msg = document.getElementById("vs-skill-msg");
+  if (msg) msg.textContent = "Write the skill doc below, then Save skill.";
+  toggleVideoSkill(true);
+}
+
+/// Fill the popup's editable skill doc from the current video draft
+/// (generalized instructions, user wording retained).
+function videoSkillUseDraft() {
+  const v = (typeof selectedVideo === "function") ? selectedVideo() : null;
+  if (!v || !v.steps || !v.steps.length) {
+    const msg = document.getElementById("vs-skill-msg");
+    if (msg) msg.textContent = "Generate instructions first — the draft is empty.";
+    return;
+  }
+  const name = document.getElementById("vs-skill-name");
+  if (name && !name.value.trim()) name.value = v.name.replace(/\.[^.]+$/, "");
+  const doc = document.getElementById("vs-skill-doc");
+  if (doc) doc.value = (typeof draftInstructionsText === "function") ? draftInstructionsText(v) : "";
+  const msg = document.getElementById("vs-skill-msg");
+  if (msg) msg.textContent = "Draft loaded below — edit freely, then Save skill.";
+}
+
+/// Save the popup's edited skill doc as a skill (steps travel along when
+/// a video draft is selected, otherwise instructions-only).
+async function videoSkillSave() {
+  const msg = document.getElementById("vs-skill-msg");
+  const nameEl = document.getElementById("vs-skill-name");
+  const docEl = document.getElementById("vs-skill-doc");
+  const name = (nameEl ? nameEl.value : "").trim();
+  const instructions = (docEl ? docEl.value : "").trim();
+  if (!name || !instructions) {
+    if (msg) msg.textContent = "Skill name and skill doc are both required.";
+    return;
+  }
+  const v = (typeof selectedVideo === "function") ? selectedVideo() : null;
+  const steps = (v && v.steps) ? v.steps : [];
+  const source = (v && v.name) ? v.name : "manual";
+  try {
+    if (msg) msg.textContent = "Saving…";
+    const r = await fetch("/api/skills", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name, instructions, steps, source }),
+    });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) {
+      if (msg) msg.textContent = "! " + (j.error || `HTTP ${r.status}`);
+      return;
+    }
+    try { await loadSkills(); } catch (e) {}
+    if (msg) msg.textContent = "Saved.";
+    bubble(`Skill <strong>${esc(name)}</strong> saved — run it any time.`);
+  } catch (e) {
+    if (msg) msg.textContent = "! " + (e.message || e);
+  }
+}
+
+// ---- MCP client (video.* / skill.* tools over POST /mcp) -------------------
+// The skill panel and video->skill.md run on the same MCP tools external
+// agents use; the chat loop itself also dispatches every desktop/shell
+// action through those tools server-side.
+async function mcpCall(name, args) {
+  const r = await fetch("/mcp", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      jsonrpc: "2.0",
+      id: Date.now(),
+      method: "tools/call",
+      params: { name, arguments: args || {} },
+    }),
+  });
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok || j.error) throw new Error((j.error && j.error.message) || `HTTP ${r.status}`);
+  const res = j.result || {};
+  const text = (res.content && res.content[0] && res.content[0].text) || "";
+  if (res.isError) throw new Error(text.replace(/^error:\s*/, "") || `MCP ${name} failed`);
+  return text;
+}
+
+/// Video -> skill.md via MCP `video.to_skill`: Spark drafts generalized
+/// instructions (user narration retained), rosed saves the skill and
+/// writes skill.md, then the skill panel refreshes from `skill.list`.
+async function videoToSkillMcp() {
+  const v = selectedVideo();
+  if (!v) { bubble("Select a video first."); return; }
+  if (!v.serverId) { bubble("Upload the video to rosed first — Generate retries the upload."); return; }
+  bubble(`Drafting skill.md from <strong>${esc(v.name)}</strong> via MCP video.to_skill…`);
+  try {
+    const text = await mcpCall("video.to_skill", { video_id: v.serverId });
+    const out = JSON.parse(text);
+    // Show the result in this same popup's editable doc below.
+    const nameEl = document.getElementById("vs-skill-name");
+    if (nameEl && out.name) nameEl.value = out.name;
+    const docEl = document.getElementById("vs-skill-doc");
+    if (docEl) docEl.value = out.skill_md || out.instructions || "";
+    const msg = document.getElementById("vs-skill-msg");
+    if (msg) msg.textContent = "Draft ready below — edit freely, then Save skill.";
+    await loadSkills();
+    bubble(`Skill <strong>${esc(out.name || "skill")}</strong> saved from video — edited copy stays below (${(out.steps || []).length} steps, your narration retained).`);
+  } catch (e) {
+    bubble(`Video → skill failed: ${esc(e.message || String(e))}`);
+  }
+}
+
+// ---- skills & workflows -----------------------------------------------------
+// Named, reusable instruction sets (SQLite on rosed, so they survive
+// restarts). Running a skill loads its instructions into the composer as
+// a normal run — same loop, same approvals, nothing special.
+let skills = [];
+function esc(s) { return String(s ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;"); }
+
+async function loadSkills() {
+  try {
+    const j = JSON.parse(await mcpCall("skill.list", {}));
+    skills = j.skills || [];
+    const be = document.getElementById("skill-backend");
+    if (be) be.textContent = "rosed MCP (skill.list)";
+  } catch (e) {
+    skills = [];
+    const be = document.getElementById("skill-backend");
+    if (be) be.textContent = "local only";
+  }
+  renderSkills();
+}
+
+function renderSkills() {
+  // The old Skills & workflows rail section was removed (replaced by the
+  // Video to skill popup). Keep the data loaded for runSkill/openSkillDoc,
+  // but only render when the legacy list DOM exists.
+  const box = document.getElementById("skill-list");
+  if (!box) return;
+  const count = document.getElementById("skill-count");
+  if (count) count.textContent = skills.length;
+  const empty = document.getElementById("skill-empty");
+  if (empty) empty.style.display = skills.length ? "none" : "";
+  box.replaceChildren();
+  skills.forEach((s) => {
+    const card = document.createElement("div");
+    card.className = "rounded-lg border p-2";
+    card.style.borderColor = "var(--line)";
+    const steps = Array.isArray(s.steps) ? s.steps : [];
+    const head = document.createElement("div");
+    head.className = "flex items-center gap-2";
+    head.innerHTML = `<span class="t-caption flex-1 font-semibold"></span><span class="muted t-caption"></span>`;
+    head.children[0].textContent = s.name;
+    head.children[1].textContent = `${steps.length} step${steps.length === 1 ? "" : "s"} · ${s.source || "manual"}`;
+    const prev = document.createElement("details");
+    prev.className = "mt-1";
+    const sum = document.createElement("summary");
+    sum.className = "t-caption cursor-pointer";
+    sum.style.color = "var(--accent)";
+    sum.textContent = "Preview instructions";
+    const ol = document.createElement("ol");
+    ol.className = "muted t-caption mt-1 list-decimal pl-5";
+    steps.slice(0, 20).forEach((st) => {
+      const li = document.createElement("li");
+      li.textContent = st.say || st.intent || "(empty step)";
+      ol.appendChild(li);
+    });
+    if (!steps.length) {
+      const li = document.createElement("li");
+      li.textContent = "(runs the instruction text below)";
+      ol.appendChild(li);
+    }
+    if (steps.length > 20) {
+      const li = document.createElement("li");
+      li.textContent = `… and ${steps.length - 20} more (open to edit in a run)`;
+      ol.appendChild(li);
+    }
+    const inst = document.createElement("p");
+    inst.className = "muted t-caption mt-1 whitespace-pre-wrap font-mono";
+    inst.textContent = s.instructions;
+    prev.append(sum, ol, inst);
+    const row = document.createElement("div");
+    row.className = "mt-2 flex flex-wrap gap-2";
+    row.innerHTML =
+      `<button class="t-caption rounded-lg bg-green-700 px-3 py-1 font-semibold text-white"><svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 12h15M13 6l6 6-6 6"/></svg> Run</button>` +
+      `<button class="btn-ghost t-caption rounded-lg px-3 py-1"><svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M6 3h9l4 4v14H6z"/><path d="M15 3v4h4"/></svg> Doc</button>` +
+      `<button class="btn-ghost t-caption rounded-lg px-3 py-1">Rename</button>` +
+      `<button class="t-caption rounded-lg px-3 py-1 text-neutral-400 hover:text-red-600">Delete</button>`;
+    row.children[0].onclick = () => runSkill(s.id);
+    row.children[1].onclick = () => openSkillDoc(s.id);
+    row.children[2].onclick = () => renameSkill(s.id);
+    row.children[3].onclick = () => deleteSkill(s.id);
+    card.append(head, prev, row);
+    box.appendChild(card);
+  });
+}
+
+function toggleSkillForm(show) {
+  // Legacy rail form was removed with the Skills section (now the Video to
+  // skill popup owns skill editing). Keep a no-op for old callers.
+  const f = document.getElementById("skill-form");
+  if (!f) return;
+  const want = show === undefined ? f.classList.contains("hidden") : show;
+  if (!f) return;
+  f.classList.toggle("hidden", !want);
+  f.classList.toggle("flex", want);
+  const m = document.getElementById("skill-form-msg");
+  if (m) m.textContent = "";
+  const n = document.getElementById("skill-name");
+  if (want && n) n.focus();
+}
+
+function draftInstructionsText(v) {
+  // Generalized instructions, user's own wording retained (intent +
+  // verbatim quote per step) — only {{slots}} change between runs.
+  return `Generalized from the user's narrated recording "${v.name}". Do this task for any new values of its {{parameters}}:\n` +
+    v.steps.map((s, i) => `${i + 1}. ${s.intent} [${s.params}]${s.approval ? " (needs approval)" : ""}${s.quote ? `\n   User said: "${s.quote}"` : ""}`).join("\n");
+}
+
+function saveDraftAsSkill() {
+  // Legacy rail button removed — route through the popup editor instead.
+  const v = selectedVideo();
+  if (!v || !v.steps.length) { bubble("Generate instructions first — the draft is empty."); return; }
+  toggleVideoSkill(true);
+  videoSkillUseDraft();
+}
+
+async function createSkill() {
+  // Legacy rail form removed — the Video to skill popup is the editor now.
+  toggleVideoSkill(true);
+  videoSkillUseDraft();
+  return;
+  const name = document.getElementById("skill-name").value.trim();
+  const instructions = document.getElementById("skill-instructions").value.trim();
+  const msg = document.getElementById("skill-form-msg");
+  if (!name || !instructions) { msg.textContent = "Name and instructions are both required."; return; }
+  const steps = toggleSkillForm._steps || [];
+  const source = toggleSkillForm._source || "manual";
+  try {
+    const r = await fetch("/api/skills", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name, instructions, steps, source }),
+    });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) { msg.textContent = "! " + (j.error || `HTTP ${r.status}`); return; }
+    toggleSkillForm._steps = null;
+    toggleSkillForm._source = null;
+    document.getElementById("skill-name").value = "";
+    document.getElementById("skill-instructions").value = "";
+    toggleSkillForm(false);
+    await loadSkills();
+    bubble(`Skill <strong>${esc(name)}</strong> saved — run it any time from Skills &amp; workflows.`);
+  } catch (e) {
+    msg.textContent = "! " + (e.message || e);
+  }
+}
+
+async function runSkill(id) {
+  const s = skills.find((k) => k.id === id);
+  if (!s) return;
+  // Runs server-side with the full plan pinned in context (the goal
+  // carries every step, re-sent on each brain call) — no file reads.
+  bubble(`Starting skill <strong>${esc(s.name)}</strong> — watch the run.`);
+  try {
+    const r = await fetch(`/api/skills/${encodeURIComponent(id)}/run`, { method: "POST" });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) bubble(`Skill run failed to start: ${j.error || `HTTP ${r.status}`}`);
+  } catch (e) {
+    bubble(`Skill run failed to start: ${e.message || e}`);
+  }
+  refreshChats();
+}
+
+function toggleSkillDoc(show) {
+  document.getElementById("skill-doc-modal").classList.toggle("hidden", !show);
+}
+
+let skillDocText = "";
+let skillDocId = null;
+let skillDocSkill = null;
+async function openSkillDoc(id) {
+  const s = skills.find((k) => k.id === id);
+  if (!s) return;
+  skillDocId = id;
+  skillDocSkill = null;
+  cancelSkillDocEdit(true);
+  document.getElementById("skill-doc-title").textContent = s.name;
+  const box = document.getElementById("skill-doc-body");
+  box.replaceChildren();
+  const loading = document.createElement("p");
+  loading.className = "muted t-caption";
+  loading.textContent = "Loading doc…";
+  box.appendChild(loading);
+  toggleSkillDoc(true);
+  try {
+    skillDocText = await mcpCall("skill.doc", { skill_id: id });
+  } catch (e) {
+    loading.textContent = "! Could not load doc: " + (e.message || e);
+    skillDocText = "";
+    return;
+  }
+  box.replaceChildren();
+  // Keep the structured skill for the Edit form (falls back to the
+  // already-loaded list entry when skill.get is unavailable).
+  try {
+    skillDocSkill = JSON.parse(await mcpCall("skill.get", { skill_id: id }));
+  } catch (e) {
+    skillDocSkill = skills.find((k) => k.id === id) || null;
+  }
+  // Minimal renderer for the server's known doc shape: headings,
+  // plain lines, `code`, and ![step N](frames/M) snips.
+  const imgBase = `/api/skills/${encodeURIComponent(id)}/`;
+  skillDocText.split("\n").forEach((raw) => {
+    const line = raw.trimEnd();
+    if (!line.trim()) return;
+    let m;
+    if ((m = line.match(/^###\s+(.*)$/))) {
+      const h = document.createElement("div");
+      h.className = "t-title mt-2";
+      h.textContent = m[1];
+      box.appendChild(h);
+    } else if ((m = line.match(/^##\s+(.*)$/))) {
+      const h = document.createElement("div");
+      h.className = "t-title mt-3";
+      h.textContent = m[1];
+      box.appendChild(h);
+    } else if ((m = line.match(/^#\s+(.*)$/))) {
+      document.getElementById("skill-doc-title").textContent = m[1];
+    } else if ((m = line.match(/^!\[(.*?)\]\((.*?)\)$/))) {
+      const img = document.createElement("img");
+      img.src = m[2].startsWith("http") || m[2].startsWith("/") ? m[2] : imgBase + m[2];
+      img.alt = m[1];
+      img.className = "w-full rounded-lg border";
+      img.style.borderColor = "var(--line)";
+      img.loading = "lazy";
+      box.appendChild(img);
+    } else {
+      const p = document.createElement("div");
+      const code = line.match(/^Params: `(.*)`$/);
+      if (code) {
+        p.className = "t-caption font-mono";
+        p.textContent = "Params: " + code[1];
+      } else if (/^_(.*)_$/.test(line) || /^(Needs approval|Evidence):/.test(line)) {
+        p.className = "muted t-caption";
+        p.textContent = line.replace(/^_(.*)_$/, "$1");
+      } else {
+        p.className = "t-body";
+        p.textContent = line;
+      }
+      box.appendChild(p);
+    }
+  });
+}
+
+async function copySkillDoc() {
+  if (!skillDocText) return;
+  try {
+    await navigator.clipboard.writeText(skillDocText);
+    bubble("Skill doc copied as markdown.");
+  } catch (e) {
+    bubble("! Copy failed: " + (e.message || e));
+  }
+}
+
+/// Show the Edit form for the open skill doc (name + instructions;
+/// steps travel along unchanged). Previously the doc modal was
+/// read-only — the only way to fix a doc was recreating the skill.
+function editSkillDoc() {
+  if (!skillDocId) return;
+  const s = skillDocSkill || skills.find((k) => k.id === skillDocId);
+  if (!s) { bubble("! Could not load skill for editing."); return; }
+  document.getElementById("skill-doc-name").value = s.name || "";
+  document.getElementById("skill-doc-text").value = s.instructions || "";
+  document.getElementById("skill-doc-msg").textContent = "";
+  document.getElementById("skill-doc-body").classList.add("hidden");
+  const form = document.getElementById("skill-doc-edit");
+  form.classList.remove("hidden");
+  form.classList.add("flex");
+}
+
+function cancelSkillDocEdit(silent) {
+  const form = document.getElementById("skill-doc-edit");
+  if (form) { form.classList.add("hidden"); form.classList.remove("flex"); }
+  const body = document.getElementById("skill-doc-body");
+  if (body) body.classList.remove("hidden");
+  if (!silent) {
+    const m = document.getElementById("skill-doc-msg");
+    if (m) m.textContent = "";
+  }
+}
+
+/// Save the Edit form via PUT /api/skills/:id (steps preserved), then
+/// re-render the doc and refresh the skill list.
+async function saveSkillDoc() {
+  if (!skillDocId) return;
+  const msg = document.getElementById("skill-doc-msg");
+  const name = document.getElementById("skill-doc-name").value.trim();
+  const instructions = document.getElementById("skill-doc-text").value.trim();
+  if (!name || !instructions) {
+    if (msg) msg.textContent = "Name and instructions are both required.";
+    return;
+  }
+  const s = skillDocSkill || skills.find((k) => k.id === skillDocId) || {};
+  try {
+    if (msg) msg.textContent = "Saving…";
+    const r = await fetch(`/api/skills/${encodeURIComponent(skillDocId)}`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name, instructions, steps: s.steps || [] }),
+    });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) {
+      if (msg) msg.textContent = "! " + (j.error || `HTTP ${r.status}`);
+      return;
+    }
+    await loadSkills();
+    await openSkillDoc(skillDocId);
+    bubble(`Skill <strong>${esc(name)}</strong> updated.`);
+  } catch (e) {
+    if (msg) msg.textContent = "! " + (e.message || e);
+  }
+}
+
+async function renameSkill(id) {
+  const s = skills.find((k) => k.id === id);
+  if (!s) return;
+  const name = prompt("Rename skill:", s.name);
+  if (name === null || name.trim() === "" || name.trim() === s.name) return;
+  try {
+    const r = await fetch(`/api/skills/${encodeURIComponent(id)}`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name: name.trim(), instructions: s.instructions, steps: s.steps || [] }),
+    });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) { bubble("! Rename failed: " + (j.error || `HTTP ${r.status}`)); return; }
+    await loadSkills();
+  } catch (e) {
+    bubble("! Rename failed: " + (e.message || e));
+  }
+}
+
+async function deleteSkill(id) {
+  const s = skills.find((k) => k.id === id);
+  if (!s) return;
+  if (!confirm(`Delete skill “${s.name}”?`)) return;
+  try {
+    await fetch(`/api/skills/${encodeURIComponent(id)}`, { method: "DELETE" });
+    await loadSkills();
+  } catch (e) {
+    bubble("! Delete failed: " + (e.message || e));
+  }
 }
 
 /// On page load: fill the sidebar chat list and open the most
@@ -1432,6 +2042,7 @@ async function restoreHistory() {
   syncBrainNote();
   renderVideos();
   probeVideoBackend().then((ok) => { if (ok) refreshServerVideos(); });
+  loadSkills();
 })();
 
 setInterval(refreshStatus, 2000);

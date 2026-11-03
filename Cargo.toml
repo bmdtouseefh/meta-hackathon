@@ -4,18 +4,17 @@ members = [
   "apps/rosed",
   "crates/rose-agent",
   "crates/rose-core",
-  "crates/rose-desktop-cdp",
-  "crates/rose-desktop-auto",
   "crates/rose-desktop-fake",
   "crates/rose-desktop-x11",
   "crates/rose-governor",
   "crates/rose-grid",
+  "crates/rose-mcp",
   "crates/rose-models",
   "crates/rose-store",
   "crates/rose-web",
 ]
 
 [workspace.package]
-version = "0.1.49"
+version = "0.1.63"
 edition = "2021"
 license = "MIT OR Apache-2.0"

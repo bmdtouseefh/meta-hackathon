@@ -69,7 +69,7 @@ mod tests {
                 height: h,
             },
             confidence: 1.0,
-            source: ElementSource::Cdp,
+            source: ElementSource::Grid,
         }
     }
 

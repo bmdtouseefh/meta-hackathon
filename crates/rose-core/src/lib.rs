@@ -110,6 +110,11 @@ pub enum Target {
     Element(ElementId),
 }
 
+/// Sentinel grid "cell" meaning the viewport centre, resolved against
+/// live geometry at dispatch — the only non-grid way to aim a scroll
+/// (bare `{"action":"scroll"}` with no element). Never guessed pixels.
+pub const VIEWPORT_CENTRE_CELL: &str = "centre";
+
 /// Exactly ONE atomic action per `act()` call. No batching.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Action {
@@ -197,7 +202,6 @@ pub struct DomOverlay {
 pub enum ElementSource {
     Vision,
     Sam,
-    Cdp,
     Grid,
 }
 
@@ -468,8 +472,7 @@ pub struct ServerConfig {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DesktopConfig {
-    /// "x11" (full desktop) | "cdp" (browser only) | "auto" (x11, CDP when
-    /// a Chrome window is frontmost) | "fake".
+    /// "x11" (full desktop via grid clicking) | "fake" (tests / offline dev).
     pub backend: String,
     pub display: String,
     pub width: u32,
@@ -480,20 +483,207 @@ pub struct DesktopConfig {
 pub struct ModelsConfig {
     /// "muse" | "fake".
     pub brain: String,
-    /// Meta Model API base URL (OpenAI-compatible). Override for tests/proxies.
-    #[serde(default = "default_muse_endpoint")]
+    /// Model API base URL (OpenAI-compatible). Meta is the default; set a
+    /// different base URL here (or via env, see `apply_env_overrides`) for
+    /// OpenAI-compatible proxies/gateways (Ollama, LM Studio, OpenRouter…).
+    /// Accepts `base_url` / `baseUrl` / `url` as TOML/JSON aliases so
+    /// configs copied from the OpenAI ecosystem just work.
+    #[serde(
+        default = "default_muse_endpoint",
+        alias = "base_url",
+        alias = "baseUrl",
+        alias = "url"
+    )]
     pub endpoint: String,
     /// e.g. "muse-spark-1.3-contributor" (Contributor tier, Phase 1).
     #[serde(default = "default_muse_model")]
     pub model: String,
+    /// Separate model for video → instructions (Skill Studio). Empty means
+    /// "follow `model`" (the default, preserving old behaviour where video
+    /// reused the brain model). Set it to pin video drafting to a different
+    /// model.
+    #[serde(default, alias = "videoModel")]
+    pub video_model: String,
+    /// Separate base URL for video → instructions. Empty means "follow
+    /// `endpoint`" (the default). Set it (or the env below) to point video
+    /// drafting at a different OpenAI-compatible provider than the brain.
+    #[serde(
+        default,
+        alias = "video_base_url",
+        alias = "videoBaseUrl",
+        alias = "video_url",
+        alias = "videoBaseURL"
+    )]
+    pub video_endpoint: String,
 }
 
+/// Meta is the default base URL for AI models.
+pub const DEFAULT_BASE_URL: &str = "https://api.meta.ai/v1";
+
 fn default_muse_endpoint() -> String {
-    "https://api.meta.ai/v1".to_string()
+    DEFAULT_BASE_URL.to_string()
 }
 
 fn default_muse_model() -> String {
     "muse-spark-1.3-contributor".to_string()
+}
+
+impl ModelsConfig {
+    /// Env vars that override `endpoint`, in priority order. `OPENAI_BASE_URL`
+    /// is honoured last so existing OpenAI-ecosystem setups just work.
+    pub const ENDPOINT_ENV_VARS: &'static [&'static str] = &[
+        "ROSE_MODELS_ENDPOINT",
+        "ROSE_MUSE_ENDPOINT",
+        "ROSE_MODELS_BASE_URL",
+        "OPENAI_BASE_URL",
+    ];
+
+    /// Env vars that override `model`, in priority order.
+    pub const MODEL_ENV_VARS: &'static [&'static str] =
+        &["ROSE_MODELS_MODEL", "ROSE_MUSE_MODEL", "OPENAI_MODEL"];
+
+    /// Env vars that override `video_model`, in priority order. When set,
+    /// video drafting pins to this model instead of following `model`.
+    pub const VIDEO_MODEL_ENV_VARS: &'static [&'static str] = &[
+        "ROSE_MODELS_VIDEO_MODEL",
+        "ROSE_MUSE_VIDEO_MODEL",
+        "OPENAI_VIDEO_MODEL",
+    ];
+
+    /// Env vars that override `video_endpoint`, in priority order. When set,
+    /// video drafting talks to this base URL instead of following `endpoint`.
+    pub const VIDEO_ENDPOINT_ENV_VARS: &'static [&'static str] = &[
+        "ROSE_MODELS_VIDEO_ENDPOINT",
+        "ROSE_MUSE_VIDEO_ENDPOINT",
+        "ROSE_MODELS_VIDEO_BASE_URL",
+        "OPENAI_VIDEO_BASE_URL",
+    ];
+
+    /// First non-empty env override for the base URL, if any.
+    pub fn endpoint_env_override() -> Option<String> {
+        Self::ENDPOINT_ENV_VARS
+            .iter()
+            .filter_map(|k| std::env::var(k).ok())
+            .map(|v| v.trim().to_string())
+            .find(|v| !v.is_empty())
+    }
+
+    /// First non-empty env override for the model, if any.
+    pub fn model_env_override() -> Option<String> {
+        Self::MODEL_ENV_VARS
+            .iter()
+            .filter_map(|k| std::env::var(k).ok())
+            .map(|v| v.trim().to_string())
+            .find(|v| !v.is_empty())
+    }
+
+    /// First non-empty env override for the video model, if any.
+    pub fn video_model_env_override() -> Option<String> {
+        Self::VIDEO_MODEL_ENV_VARS
+            .iter()
+            .filter_map(|k| std::env::var(k).ok())
+            .map(|v| v.trim().to_string())
+            .find(|v| !v.is_empty())
+    }
+
+    /// First non-empty env override for the video base URL, if any.
+    pub fn video_endpoint_env_override() -> Option<String> {
+        Self::VIDEO_ENDPOINT_ENV_VARS
+            .iter()
+            .filter_map(|k| std::env::var(k).ok())
+            .map(|v| v.trim().to_string())
+            .find(|v| !v.is_empty())
+    }
+
+    /// Apply env overrides on top of file/default values. Env wins so a
+    /// different base URL can be injected without editing the config file
+    /// (containers, per-shell proxies, tests). No-op when no env var is set.
+    pub fn apply_env_overrides(&mut self) {
+        if let Some(ep) = Self::endpoint_env_override() {
+            self.endpoint = ep;
+        }
+        if let Some(m) = Self::model_env_override() {
+            self.model = m;
+        }
+        if let Some(vm) = Self::video_model_env_override() {
+            self.video_model = vm;
+        }
+        if let Some(vep) = Self::video_endpoint_env_override() {
+            self.video_endpoint = vep;
+        }
+    }
+
+    /// Effective base URL: env override if set, else the configured value,
+    /// else the Meta default. Never empty.
+    pub fn resolved_endpoint(&self) -> String {
+        Self::endpoint_env_override()
+            .filter(|v| !v.is_empty())
+            .or_else(|| {
+                let v = self.endpoint.trim().to_string();
+                (!v.is_empty()).then_some(v)
+            })
+            .unwrap_or_else(|| DEFAULT_BASE_URL.to_string())
+    }
+
+    /// Effective model: env override if set, else the configured value,
+    /// else the Muse default. Never empty.
+    pub fn resolved_model(&self) -> String {
+        Self::model_env_override()
+            .filter(|v| !v.is_empty())
+            .or_else(|| {
+                let v = self.model.trim().to_string();
+                (!v.is_empty()).then_some(v)
+            })
+            .unwrap_or_else(default_muse_model)
+    }
+
+    /// Effective video model: `ROSE_MODELS_VIDEO_MODEL` (etc.) if set, else
+    /// `video_model` when non-empty, else follows the brain model. Never
+    /// empty.
+    pub fn resolved_video_model(&self) -> String {
+        Self::video_model_env_override()
+            .filter(|v| !v.is_empty())
+            .or_else(|| {
+                let v = self.video_model.trim().to_string();
+                (!v.is_empty()).then_some(v)
+            })
+            .unwrap_or_else(|| self.resolved_model())
+    }
+
+    /// Effective video base URL: `ROSE_MODELS_VIDEO_ENDPOINT` (etc.) if set,
+    /// else `video_endpoint` when non-empty, else follows the brain base URL.
+    /// Never empty.
+    pub fn resolved_video_endpoint(&self) -> String {
+        Self::video_endpoint_env_override()
+            .filter(|v| !v.is_empty())
+            .or_else(|| {
+                let v = self.video_endpoint.trim().to_string();
+                (!v.is_empty()).then_some(v)
+            })
+            .unwrap_or_else(|| self.resolved_endpoint())
+    }
+
+    /// Strip trailing slashes and a trailing `/chat/completions` suffix so
+    /// both `https://host/v1` and `https://host/v1/chat/completions` work
+    /// as a base URL for path joining.
+    pub fn normalize_base_url(endpoint: &str) -> String {
+        let mut base = endpoint.trim().trim_end_matches('/').to_string();
+        if let Some(stripped) = base.strip_suffix("/chat/completions") {
+            base = stripped.trim_end_matches('/').to_string();
+        }
+        base
+    }
+
+    /// Full `POST` URL for OpenAI-compatible chat completions. Idempotent:
+    /// a base URL that already ends in `/chat/completions` is used as-is.
+    pub fn chat_completions_url(endpoint: &str) -> String {
+        let trimmed = endpoint.trim().trim_end_matches('/');
+        if trimmed.ends_with("/chat/completions") {
+            trimmed.to_string()
+        } else {
+            format!("{}/chat/completions", Self::normalize_base_url(endpoint))
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -501,46 +691,14 @@ pub struct DataConfig {
     pub dir: String,
 }
 
-fn default_cdp_endpoint() -> String {
-    "http://127.0.0.1:9222".to_string()
-}
-
-/// CDP connection to the VM's existing Chrome (google-chrome-stable with
-/// `--remote-debugging-port`). No Chromium install: chromiumoxide speaks
-/// CDP to any recent Chrome. `launch_if_missing` spawns the detected
-/// chrome binary headed (X11 :1, 1600x900) only when the endpoint refuses.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CdpConfig {
-    #[serde(default = "default_cdp_endpoint")]
-    pub endpoint: String,
-    #[serde(default)]
-    pub launch_if_missing: bool,
-    /// Override chrome binary auto-detect
-    /// (`google-chrome-stable` | `google-chrome` | `chromium-browser` | ...).
-    #[serde(default)]
-    pub chrome_binary: String,
-}
-
-impl Default for CdpConfig {
-    fn default() -> Self {
-        Self {
-            endpoint: default_cdp_endpoint(),
-            launch_if_missing: false,
-            chrome_binary: String::new(),
-        }
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RoseConfig {
     pub server: ServerConfig,
     pub desktop: DesktopConfig,
     pub models: ModelsConfig,
-    // No grounding config: vision grounding is fixed — DOM/AX element
-    // list when the backend has one, numbered grid on the screenshot
-    // otherwise (and always under it). Nothing to tune, no raw mode.
-    #[serde(default)]
-    pub cdp: CdpConfig,
+    // No grounding config: vision grounding is fixed — the constant
+    // axis-numbered 67x39 grid on every screenshot. Raw screenshots are
+    // never sent; a frame that cannot be gridded fails the step instead.
     pub policy: Policy,
     pub data: DataConfig,
 }
@@ -562,8 +720,11 @@ impl Default for RoseConfig {
                 brain: "muse".to_string(),
                 endpoint: default_muse_endpoint(),
                 model: default_muse_model(),
+                // Empty = follow `model` / `endpoint`; keeps one knob until
+                // the user pins video drafting to a different model / URL.
+                video_model: String::new(),
+                video_endpoint: String::new(),
             },
-            cdp: CdpConfig::default(),
             policy: Policy::default(),
             data: DataConfig {
                 dir: "~/.local/share/rose".to_string(),

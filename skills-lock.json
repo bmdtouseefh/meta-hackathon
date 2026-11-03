@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "skills": {
+    "obviously-awesome": {
+      "source": "wondelai/skills",
+      "sourceType": "github",
+      "skillPath": "obviously-awesome/SKILL.md",
+      "computedHash": "202d49e9f9654df91bafd2b83a94b259ce9097b3b06f21350e92cdf719f8c1d1"
+    }
+  }
+}
