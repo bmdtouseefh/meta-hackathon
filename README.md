@@ -8,6 +8,14 @@ Built for the Meta Global AI Developer Hackathon (Indie Developer track, *Build 
 
 > Rose is built for private workflow automation: it supports open models — Muse Spark Open for video → instructions and Muse Glimmer for live execution (point `endpoint`/`model` and `video_endpoint`/`video_model` at any OpenAI-compatible provider). For this demo we use hosted Muse Spark 1.3 throughout.
 
+## Demo
+
+Watch Rose in action:
+
+[![Rose demo](https://img.youtube.com/vi/ehAVQfn9i4s/hqdefault.jpg)](https://youtu.be/ehAVQfn9i4s)
+
+> [Watch on YouTube](https://youtu.be/ehAVQfn9i4s)
+
 ## Why Rose exists
 
 Cloud screen-control bots work — until the workflow is one you can't upload. A trading screen with your strategy on it. An ops console behind VPN login. Anything where the recording itself is the secret. Your choices were: hand it to a third-party SaaS anyway, write brittle pixel-coordinate scripts, buy a heavyweight RPA suite, or just keep doing it by hand every morning.
@@ -113,6 +121,11 @@ ui/                    # index.html + app.js + style.css (embedded in binary)
 ```
 
 `backend = "x11" | "fake"`. `brain = "muse" | "fake"`. Policy (`require_approval_for`), budgets, and keys come from config/env; typed secrets are never written to traces.
+
+## Next actions
+
+1. Enable OS testing features for Windows and macOS
+2. Automate agent deployment through terraform
 
 ## Status
 
